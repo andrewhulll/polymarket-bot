@@ -12,6 +12,9 @@ browse the three views, which all read precomputed tables from that DB:
 2. Pricing & quoting -- V1 fair price, quoted buy/sell, size, expected edge,
    and a human-readable explanation of each pricing adjustment.
 3. Performance -- paper/shadow backtest metrics over the fixture dataset.
+4. NFL correlation -- offline same-game combo backtest and correlation
+   explorer over historical NFL closing lines (``dashboard/nfl_tab.py``);
+   independent of the simulation button.
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from combo_mm import PipelineConfig, fixtures, paper_backtest  # noqa: E402
+from dashboard import nfl_tab  # noqa: E402
 
 st.set_page_config(page_title="combo_mm dashboard (paper)", layout="wide")
 
@@ -61,22 +65,26 @@ if st.button("Run simulation", type="primary"):
         st.session_state["sim"] = _run_simulation()
     st.success("Simulation complete.")
 
+view = st.tabs(["RFQs", "Pricing & quoting", "Performance", "NFL correlation"])
+
+# The NFL correlation view reads offline backtest files and does not need the
+# RFQ simulation.
+with view[3]:
+    nfl_tab.render()
+
 sim = st.session_state.get("sim")
 if sim is None:
-    st.info('Press "Run simulation" to replay the scripted session and populate the views.')
-    st.stop()
+    for tab in view[:3]:
+        with tab:
+            st.info('Press "Run simulation" to replay the scripted session and populate this view.')
 
-
-# In bare mode (``python -c "import dashboard.app"``) st.stop() is a
-# no-op, so the sim-dependent views below are guarded: a real Streamlit
-# run always has ``sim`` set by the button above.
+# The sim-dependent views are guarded: they render once the button above has
+# populated ``sim`` (and stay inert in bare mode, ``python -c "import dashboard.app"``).
 if sim is not None:
     db_path: str = sim["db_path"]
     result = sim["result"]
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-
-    view = st.tabs(["RFQs", "Pricing & quoting", "Performance"])
 
     # ---------------------------------------------------------------------------
     # View 1: RFQs

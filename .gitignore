@@ -1,2 +1,11 @@
 # Secrets / API keys
 polymarket.keys*
+
+# NFL pipeline: raw nflverse pulls and backtest outputs are regenerated locally
+data/
+results/
+params/.staging/
+
+# Python
+__pycache__/
+.pytest_cache/

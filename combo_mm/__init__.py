@@ -8,8 +8,13 @@ fill reconciliation, auth structure (RS256 Private Key JWT -> Auth0), the V1
 independent-leg pricer, shadow quoting (paper only), paper metrics, and the
 Streamlit dashboard.
 
-Parked (not implemented here): correlation model, inventory/risk engine,
-production quoting, formal backtest.
+``combo_mm.nfl`` (not imported here) holds the offline NFL historical data
+pipeline for the correlation engine: nflverse ingestion, walk-forward score
+covariance estimation, weekly params files, the same-game joint probability
+engine and the synthetic-combo backtest (issue #6).
+
+Parked (not implemented here): wiring the correlation model into the live
+pricer, inventory/risk engine, production quoting, formal RFQ backtest.
 """
 
 from combo_mm.events import (

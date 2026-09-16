@@ -1,0 +1,9 @@
+# Offline NFL correlation pipeline (combo_mm/nfl, scripts/refresh_params.py,
+# scripts/nfl_backtest.py) and the dashboard's "NFL correlation" tab.
+# The core RFQ pipeline and combo_mm/nfl/params_io.py stay stdlib-only.
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1
+streamlit>=1.40
+altair>=5
+pytest>=8
