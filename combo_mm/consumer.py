@@ -132,6 +132,8 @@ class StreamConsumer:
         self._dispatch_thread: Optional[threading.Thread] = None
         self._pump_thread: Optional[threading.Thread] = None
         self._attempts = 0
+        #: True once the current stream generation delivered an item.
+        self._stream_delivered = False
         self._last_stream_open = 0.0
         self.events_seen = 0
         self.events_applied = 0
@@ -222,8 +224,10 @@ class StreamConsumer:
             if kind != "event":
                 log.warning("unknown stream item kind %r", kind)
                 return
-            raw = dict(item["raw"])
-            raw.setdefault("event_id", f"stream:{stats['seen']}")
+            # No synthetic event_id: real stream messages carry none, and
+            # normalize() then derives a content-hash key, which is what
+            # makes redeliveries dedupe (a counter-based id would not).
+            raw = item["raw"]
             try:
                 event = normalize(raw, now=_now_for(item))
             except NormalizeError:
@@ -241,13 +245,17 @@ class StreamConsumer:
 
         reconnects = 0
         while True:
+            # Contract order: open the stream FIRST, then the durable reads,
+            # then apply stream events.
+            self._set_state(StreamState.CONNECTING)
+            stream = self._transport.stream_rfq_events()
             self._set_state(StreamState.RECOVERING)
             self.recovery_log.append(
                 recovery_sync(self._transport, self._store))
             stats["recoveries"] += 1
             self._set_state(StreamState.STREAMING)
             try:
-                for item in self._iter_stream(cfg.watchdog_silence_s):
+                for item in self._iter_stream(stream, cfg.watchdog_silence_s):
                     _handle(item)
             except StreamDisconnected as exc:
                 log.warning("stream disconnected: %s", exc)
@@ -265,14 +273,14 @@ class StreamConsumer:
         self.events_applied = stats["applied"]
         return stats
 
-    def _iter_stream(self, silence_s: float) -> Iterator[Dict[str, Any]]:
+    def _iter_stream(self, stream: Iterator[Dict[str, Any]],
+                     silence_s: float) -> Iterator[Dict[str, Any]]:
         """Yield stream items; :class:`StreamDisconnected` on watchdog silence.
 
         The generator runs in a daemon pump thread so a hanging stream
         (neither yields nor raises) cannot block the caller: the queue
         timeout turns silence into a reconnect.
         """
-        stream = self._transport.stream_rfq_events()
         pump_queue: "queue.Queue[Any]" = queue.Queue()
 
         def _pump() -> None:
@@ -344,9 +352,15 @@ class StreamConsumer:
                 log.info("recovery complete: %s", report)
                 self._set_state(StreamState.STREAMING)
                 self.reconnects += 1
+                self._stream_delivered = False
                 self._pump_stream(stream)
             except StreamDisconnected as exc:
                 log.warning("stream disconnected (attempt %d): %s", attempt, exc)
+                if self._stream_delivered:
+                    # A healthy session ended: this is a fresh outage, so
+                    # backoff and the max_reconnects budget start over
+                    # instead of accumulating across the process lifetime.
+                    self._attempts = attempt = 1
                 self._sleep_backoff(attempt)
             except Exception:
                 log.exception("reader loop error (attempt %d)", attempt)
@@ -410,6 +424,7 @@ class StreamConsumer:
                     break
                 if kind == "item":
                     self._queue.put(payload)
+                    self._stream_delivered = True
                     last_item = self._config.clock()
                 elif kind == "disconnect":
                     raise payload
@@ -453,7 +468,6 @@ class StreamConsumer:
                 on_item=cfg.on_event,
                 now=datetime.now(timezone.utc),
                 source="stream",
-                default_event_id=f"stream:{self.events_seen}",
             )
         except Exception:
             log.exception("dispatch error")
@@ -469,7 +483,6 @@ def _dispatch_source_item(
     on_item: Optional[Callable[[Dict[str, Any]], None]],
     now: datetime,
     source: str,
-    default_event_id: str,
 ) -> str:
     """Apply one stream/EventSource item; shared by both consumers.
 
@@ -487,9 +500,12 @@ def _dispatch_source_item(
             item.get("seq", 0), item.get("ts"))
         status = "book"
     elif kind == "event":
-        raw = dict(item["raw"])
-        if "event_id" not in raw:
-            raw["event_id"] = default_event_id
+        # Items without their own event_id get normalize()'s content-hash
+        # key. Never substitute a counter/position-based id here: it would
+        # defeat redelivery dedup and, since counters restart with the
+        # process, collide with keys already in a persistent DB (silently
+        # dropping genuinely new events as "duplicates").
+        raw = item["raw"]
         try:
             event = normalize(raw, now=now)
         except NormalizeError:
@@ -561,7 +577,6 @@ class PollingConsumer:
                 on_item=self._on_event,
                 now=now,
                 source=self._source_label,
-                default_event_id=f"poller:{self.polls}:{count}",
             )
             if status == "applied":
                 self.items_applied += 1

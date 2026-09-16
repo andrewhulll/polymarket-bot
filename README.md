@@ -202,8 +202,9 @@ session into a SQLite DB, then browse:
    quote and execution rates, expected vs realized P&L, max downswing/upswing, inventory/exposure
    over time.
 
-A data-source selector offers **Simulated feed** (default) vs **Retail live** (activates only when
-both retail env vars are set; otherwise it says so and stays simulated).
+The dashboard currently replays the **simulated feed only**. A Retail-live data-source selector is
+planned but not yet wired into `dashboard/app.py`; to exercise the Retail path today, drive
+`RetailPollingSource` through `PollingConsumer` directly (see below).
 
 ## Retail live data
 
@@ -246,14 +247,11 @@ Rules (enforced by tests):
 - The Secure Vault cannot store this key/secret scheme — env vars are the
   only supported route.
 
-### Streamlit toggle
+### Streamlit toggle (not yet implemented)
 
-The dashboard offers a data-source selector:
-
-- **Simulated feed** (default)
-- **Retail live** — activates only if *both* env vars are set. Otherwise the
-  dashboard says so plainly, asks you to set the two env vars, and stays on
-  the simulated feed. Credential values are never displayed.
+Planned: a dashboard data-source selector — **Simulated feed** (default) vs **Retail live**, the
+latter activating only when *both* env vars are set and never displaying credential values. It is
+**not** in `dashboard/app.py` yet; today the dashboard always runs the simulated replay.
 
 ### How live polling works
 
@@ -320,7 +318,12 @@ pick up the RFQ beta on the next successful poll.
 export POLYMARKET_US_KEY_ID="..."
 export POLYMARKET_US_SECRET_KEY="..."
 pip install polymarket-us
-# run the dashboard / poller with "Retail live" selected
+python3 -c "
+from combo_mm import EventStore, PollingConsumer, RetailPollingSource
+store = EventStore('retail.db')
+PollingConsumer(RetailPollingSource(), store).poll_once()
+print(store.get_rfq_stats(), store.get_book_stats())
+"
 ```
 
 Tests are all mocked (no network, no real credentials):

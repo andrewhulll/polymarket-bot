@@ -17,12 +17,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 import tempfile
 from pathlib import Path
 
 import streamlit as st
 
-from combo_mm import PipelineConfig, fixtures, paper_backtest
+# ``streamlit run dashboard/app.py`` puts dashboard/ (not the repo root) on
+# sys.path, so make the combo_mm package importable without installing it.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from combo_mm import PipelineConfig, fixtures, paper_backtest  # noqa: E402
 
 st.set_page_config(page_title="combo_mm dashboard (paper)", layout="wide")
 
