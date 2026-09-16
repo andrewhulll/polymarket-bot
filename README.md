@@ -87,8 +87,10 @@ Sensitivity to correlation.
 
 **Parked for later**
 
-- **Step 2 (full)** — correlation model beyond the V1 independent-leg baseline (same-game
-  dependence, estimation methodology).
+- **Step 2 (full)** — wiring the NFL same-game correlation model into the live pricer / shadow
+  quoter. The estimation methodology, weekly params files, joint-probability engine and historical
+  backtest now exist offline — see [NFL correlation pipeline](#nfl-correlation-pipeline-issue-6)
+  and `docs/correlation-model.md`.
 - **Step 3** — inventory & risk management on $50k capital (widen/skew/reduce/reject as inventory
   grows; hard limits; kill switch).
 - **Step 5 (full)** — formal backtest report (results by market type and combo size, sensitivity to
@@ -201,10 +203,58 @@ session into a SQLite DB, then browse:
 3. **Performance** — paper/shadow replay metrics: RFQs received/quoted/rejected/expired/executed,
    quote and execution rates, expected vs realized P&L, max downswing/upswing, inventory/exposure
    over time.
+4. **NFL correlation** — independent of the simulation button; see
+   [NFL correlation pipeline](#nfl-correlation-pipeline-issue-6).
 
 The dashboard currently replays the **simulated feed only**. A Retail-live data-source selector is
 planned but not yet wired into `dashboard/app.py`; to exercise the Retail path today, drive
 `RetailPollingSource` through `PollingConsumer` directly (see below).
+
+## NFL correlation pipeline (issue #6)
+
+Offline historical data pipeline for the same-game correlation engine (#2): **history for shape,
+market for location**. NFL only, Phase A legs (moneyline / spread / total / team totals). Never in
+the RFQ hot path — the pricer reads a weekly params file. Full method and results:
+[`docs/correlation-model.md`](docs/correlation-model.md).
+
+```bash
+pip install -r requirements-nfl.txt              # numpy / scipy / pandas (offline only)
+
+# Walk-forward backtest over every same-game combo, 2010-2025 (~1.5 min on 8 cores)
+python scripts/nfl_backtest.py --pull            # --pull fetches nflverse games.csv into data/raw/
+
+# Weekly params refresh (Wednesdays): estimate -> gates -> params/nfl_<season>_w<ww>.json
+python scripts/refresh_params.py --pull
+
+# NFL tests (synthetic data, no network)
+python -m pytest tests/test_nfl_*.py -q
+```
+
+- **Data** — nflverse `games.csv` (scores, OT, closing spread/total/moneyline prices since 2006),
+  cached immutably under `data/raw/nflverse_<pulldate>/` with a SHA-256 manifest; validated on
+  ingest (duplicates, team twice in a week, implausible scores/lines, missing lines).
+- **Estimation** — residuals vs closing-line implied points; recency-weighted trailing window with
+  a strict `as_of` cutoff; `σ²(μ) = a + b·μ` (default), league constant, or shrunk team factors;
+  league-wide within-game `ρ`.
+- **Params files** — canonical, versioned JSON with data vintage; stdlib-only loader
+  (`combo_mm.nfl.params_io`); gates: range sanity, no regression vs the previous file, determinism.
+  Offseason freezes the last file. `params/nfl_2026_w02.json` is the current promoted file.
+- **Joint engine** (`combo_mm.nfl.joint`) — any same-game leg set as a Gaussian polygon probability
+  on the scores, push-conditioned, with the market-implied mean solver.
+- **Backtest** (`scripts/nfl_backtest.py`) — all 17 same-game combos (one side of 2-3 of ML /
+  spread / total) per game vs naive product vs realized; Brier/log loss with game-clustered SEs,
+  calibration, results by combo / family / size / favorite size, correlation structure, sensitivity
+  to correlation, stylized edge P&L.
+
+**Headline (4,358 games, 2010–2025):** the model beats the naive product by 4.5% Brier skill
+(t −22.6), driven by legs sharing the margin (ML × spread: 13.3%); spread × total ties naive
+(NFL margin/total dependence is small except for 10+ point favorites); ML × total is slightly worse
+because the normal margin misses NFL key numbers. Next steps are in the doc (§4.4).
+
+The dashboard's **NFL correlation** tab has seven views: overview, combo pricing, calibration,
+correlation structure, sensitivity & P&L, an interactive same-game combo explorer (any team's
+ML / spread / total, team or opponent side, historical or hypothetical game, with the score
+distribution), and params & data (refresh buttons, gate report).
 
 ## Retail live data
 
