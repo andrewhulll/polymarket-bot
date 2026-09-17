@@ -164,7 +164,13 @@ def _compute_metrics(store: EventStore) -> BacktestResult:
     for d in latest.values():
         if d["decision"] == QUOTED_OK:
             r = rfq_by_id.get(d["rfq_id"]) or {}
-            qty = r.get("qty_decimal") or 0
+            qty = r.get("qty_decimal")
+            if not qty:
+                # Cash-sized RFQs have no qty_decimal: use the smaller live
+                # quoted side size (conservative; "0" means side unquoted).
+                sides = [Decimal(str(s)) for s in (d.get("buy_qty"), d.get("sell_qty"))
+                         if s and Decimal(str(s)) > 0]
+                qty = min(sides) if sides else 0
             expected += (Decimal(str(d["spread_bps"] or 0)) / Decimal(10000)
                          * Decimal(str(qty)))
     res.expected_pnl = float(expected)

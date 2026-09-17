@@ -102,8 +102,7 @@ class DropCopyStub(DropCopyTransport):
 
 def _record_to_event_raw(record: Dict[str, Any]) -> Dict[str, Any]:
     """Adapt a Drop Copy execution report to the normalize envelope."""
-    return {
-        "event_id": f"dropcopy:{record.get('resume_token') or record.get('dropCopySeq')}",
+    raw: Dict[str, Any] = {
         "event_type": "drop_copy_fill",
         "rfq_id": record.get("rfqId"),
         "quote_id": record.get("quoteId"),
@@ -118,6 +117,12 @@ def _record_to_event_raw(record: Dict[str, Any]) -> Dict[str, Any]:
             "executedTime": record.get("executedTime"),
         },
     }
+    record_ref = record.get("resume_token") or record.get("dropCopySeq")
+    if record_ref:
+        raw["event_id"] = f"dropcopy:{record_ref}"
+    # else: normalize() keys the event on its content incl. fillId, instead
+    # of every unidentified record collapsing onto "dropcopy:None".
+    return raw
 
 
 def drain_drop_copy(transport: DropCopyTransport, store: Any,
