@@ -102,7 +102,7 @@ Sensitivity to correlation.
 |---|---|
 | `events.py` | Canonical event model + RFQ/quote state machines, mirroring the Polymarket US gRPC contract (`polymarket.v1`). Exact wire field names (`qtyDecimal`, `buyPrice`, …). |
 | `normalize.py` | Pure validation/coercion of raw messages into `NormalizedEvent`s. Idempotency key = `event_id` when present, else a stable hash of the payload. |
-| `store.py` | Append-only SQLite store: raw events first, then normalized projections. Tables: `raw_events`, `rfq`, `rfq_legs`, `quotes`, `fills`, `dropcopy_state`, `books`, `shadow_decisions`. Exposes `state_digest()` (SHA-256 over the canonical read model) for determinism checks. |
+| `store.py` | Append-only SQLite store: raw events first, then normalized projections. Tables: `raw_events`, `rfq`, `rfq_legs`, `quotes`, `fills`, `dropcopy_state`, `books`, `shadow_decisions`, `rfq_screen` (live-feed screen per RFQ). Exposes `state_digest()` (SHA-256 over the canonical read model) for determinism checks. |
 | `stream.py` | `RfqTransport` interface mirroring `RFQAPI` (`StreamRFQEvents` with EMPTY request, `GetRFQs`, `GetQuotes`, `GetCombos`); `SimulatedTransport` (scripted sessions, injectable disconnects); `GrpcTransport` stub (`NotImplementedError` until creds + protos exist). |
 | `consumer.py` | Stream consumer: non-blocking dispatch, watchdog (force reconnect when silent), exponential-backoff reconnect with jitter. |
 | `recovery.py` | Reconnect recovery in contract order: reopen stream → `GetRFQs(open)` → `GetQuotes(self)` → idempotent apply keyed by entity ID + `updatedTime`. |
@@ -122,6 +122,9 @@ Sensitivity to correlation.
 | `paper_backtest.py` | Replay-based paper backtest over fixture/simulated sessions: counts, rates, expected vs realized P&L, swings, exposure over time. No future information (books filtered to `updated_at <= event time`). |
 | `fixtures.py` | Scripted sessions: full lifecycle flows, cancelled/expired RFQs, the `rfq_closed` race, duplicate + out-of-order deliveries, a mid-stream disconnect, and a missed `rfq_closed` only recovery can catch. |
 | `replay.py` | Deterministic replay harness (virtual clock) producing state digests for byte-for-byte comparison. |
+| `combo_markets.py` | `ComboMarketCatalog`: resolves gateway leg position ids to markets (title, outcome, price, tags, game key) from the public `combos-rfq-api` combo-markets catalog; background crawl + JSON cache. |
+| `rfq_screen.py` | Pure quotable-RFQ screen: an NFL game with 2+ legs, no other game with 2+ legs, every leg resolved. |
+| `quote_selections.py` | `QuoteSelectionStore`: durable SQLite of RFQs picked for quoting and the accepted quote (`RFQ_TRADE`) for picked RFQs only. |
 | `config.py` | `PipelineConfig`: paper mode (default true, with startup banner), staleness, reconnect, retail polling, and V1 pricer knobs. Unknown fields are fatal. |
 
 ## Event lifecycle
@@ -270,9 +273,12 @@ The dashboard opens with a PAPER/SHADOW banner and two controls at the top:
 
 Views (all read the active run):
 
-1. **RFQs** — the Week 1 historical RFQs or the live feed: filterable table (game, status) with
-   combo, size, requester side, naive vs model fair, our trade price, result and P&L; per-RFQ
-   detail with legs, settlement values, our quote vs the naive maker's, and lifecycle events.
+1. **RFQs** — the Week 1 historical RFQs or the live feed. Backtest: filterable table (game,
+   status) with combo, size, requester side, naive vs model fair, our trade price, result and
+   P&L; per-RFQ detail with legs, settlement values, our quote vs the naive maker's, and lifecycle
+   events. Live: readable legs, a **Markets** filter defaulting to *Quotable NFL first*, a
+   **Quote this RFQ** button, and the durable **Selected to quote** list with accepted quotes (see
+   [Picking RFQs to quote](#picking-rfqs-to-quote)).
 2. **Pricing & quoting** — every shadow decision: naive product vs model fair, correlation
    adjustment, quoted bid/offer, size, expected edge, and each spread component.
 3. **Performance** — RFQs received/quoted/executed, win rate vs the naive maker, expected (model
@@ -547,6 +553,42 @@ and every received RFQ flows through `LiveMonitor` into the store and shadow
 engine, so it appears on the RFQs, Pricing, Performance and Engine status
 tabs. **Stop live monitor** closes the websocket.
 
+### Leg markets (combo catalog)
+
+`RFQ_REQUEST` names legs only by on-chain position id. The public catalog
+`GET https://combos-rfq-api.polymarket.com/v1/rfq/combo-markets?limit=100&cursor=…`
+(no auth; it returns 403 without a browser/curl-like `User-Agent`) lists every
+combo-able market with `position_ids` / `outcomes` / `outcome_prices` aligned by
+index (`[0]` YES, `[1]` NO), plus `slug`, `title` and `tags`.
+`ComboMarketCatalog` crawls it in a background thread (merging page by page,
+tens of thousands of markets, several minutes on the first run), keeps entries
+for markets that later close, and caches the index to
+`data/live/combo_markets.json` (checkpointed every 200 pages) so restarts
+resolve legs immediately. Sports game markets are tagged `games`; the slug up
+to its date (`nfl-sea-ari-2026-09-20`) is the game key.
+
+### Picking RFQs to quote
+
+Each live RFQ is screened on arrival (`combo_mm/rfq_screen.py`, stored in
+`rfq_screen`) and re-screened as the catalog resolves more legs:
+
+| Screen | Meaning |
+|---|---|
+| `QUOTABLE` | Some NFL game has 2+ legs (the correlated block the NFL model prices) and no other game — any sport — has 2+ legs. Other legs (single legs from other games, non-game markets) are independent and multiply in. |
+| `OTHER_SAME_GAME` | Another game (e.g. soccer) has 2+ legs: no correlation model for it yet. |
+| `UNRESOLVED` | A leg is not in the catalog yet (could hide a second same-game leg). |
+| `NO_NFL_SAME_GAME` | No NFL game with 2+ legs. |
+
+The RFQs tab defaults to **Quotable NFL first** (then RFQs with any NFL leg,
+then the rest, newest first within each); **Quotable NFL only** and
+**All, newest first** are one click away. **Quote this RFQ** adds the RFQ to
+`data/live/quote_selections.db` with a snapshot (direction, size, deadline,
+resolved legs). When a picked RFQ trades, its `RFQ_TRADE` broadcast — the
+accepted blended price, matched size and execution time — is stored as the
+accepted quote; trades for RFQs not picked are never stored. Picking an RFQ
+after it already traded still records it (recent trades are kept in memory).
+This records intent only: nothing is sent to the gateway.
+
 ### Mapping notes
 
 - `requested_size.unit == "notional"` → `cashOrderQty`; `"shares"` →
@@ -554,7 +596,9 @@ tabs. **Stop live monitor** closes the websocket.
 - Legs carry on-chain **position ids** as `symbol` and inherit the
   combo-level YES/NO `side` — the gateway provides no per-leg market symbol
   or side. The RFQ `symbol` is the combo `condition_id`.
-- `RFQ_TRADE` (confirmed trade broadcast) → `rfq_closed`: "stop quoting".
+- `RFQ_TRADE` (confirmed trade broadcast) → `rfq_closed`: "stop quoting". The
+  accepted `price_e6` / `size_e6` / `executed_at` ride along as raw `price` /
+  `size` / `executed_at` extras for the accepted-quote record.
 
 ## Going live — Exchange gRPC checklist (later)
 

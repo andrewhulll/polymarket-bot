@@ -25,7 +25,9 @@ from the repo root. Two controls at the top pick the data behind the views:
 Views 1-4 read the active run's SQLite DB:
 
 1. RFQs -- the week's historical RFQs or the live feed, filterable, with full
-   detail (legs, settlement, lifecycle events) per RFQ.
+   detail (legs, settlement, lifecycle events) per RFQ. Live: legs resolved
+   from the combo catalog, quotable NFL same-game RFQs first, a button to
+   pick RFQs to quote, and the durable picked list with accepted quotes.
 2. Pricing & quoting -- fair price (model vs naive), quoted buy/sell, size,
    expected edge, and each pricing adjustment.
 3. Performance -- quote/fill counts, expected vs realized P&L, swings,
@@ -41,6 +43,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -54,6 +57,7 @@ sys.path.insert(0, str(REPO))
 
 from combo_mm import PipelineConfig  # noqa: E402
 from combo_mm.auth import CredentialsNotConfigured  # noqa: E402
+from combo_mm.combo_markets import ComboMarketCatalog, LegMarket  # noqa: E402
 from combo_mm.intl_gateway import (  # noqa: E402
     GATEWAY_ENV_VARS,
     GatewayCredentials,
@@ -63,13 +67,23 @@ from combo_mm.intl_gateway import (  # noqa: E402
 from combo_mm.live_monitor import LiveMonitor  # noqa: E402
 from combo_mm.nfl import week_backtest  # noqa: E402
 from combo_mm.paper_backtest import BacktestResult  # noqa: E402
+from combo_mm.quote_selections import QuoteSelectionStore  # noqa: E402
 from combo_mm.retail import KEY_ID_ENV, SECRET_ENV, RetailPollingSource  # noqa: E402
+from combo_mm.rfq_screen import QUOTABLE, UNRESOLVED  # noqa: E402
 from combo_mm.store import EventStore  # noqa: E402
 from dashboard import nfl_tab  # noqa: E402
 
 # The live quoter gateway broadcasts ~200 RFQs/s, so live views show the newest
 # rows only and take counts from SQL aggregates (the backtest shows everything).
 LIVE_ROW_LIMIT = 500
+
+# Durable live-mode state (data/ is gitignored): the combo leg catalog cache and
+# the RFQs picked for quoting with their accepted quotes.
+LIVE_DATA = REPO / "data" / "live"
+MARKETS_QUOTABLE_FIRST = "Quotable NFL first"
+MARKETS_QUOTABLE_ONLY = "Quotable NFL only"
+MARKETS_ALL = "All, newest first"
+MARKET_FILTERS = (MARKETS_QUOTABLE_FIRST, MARKETS_QUOTABLE_ONLY, MARKETS_ALL)
 
 RAW_ROOT = REPO / "data" / "raw"
 ESTIMATOR_PATH = REPO / "params" / "estimator.json"
@@ -130,6 +144,17 @@ def _live_source(config: PipelineConfig):
     return None, None
 
 
+@st.cache_resource
+def _combo_catalog() -> ComboMarketCatalog:
+    """One process-wide leg catalog: loads the disk cache, then crawls in the background."""
+    return ComboMarketCatalog(LIVE_DATA / "combo_markets.json").start()
+
+
+@st.cache_resource
+def _quote_selections() -> QuoteSelectionStore:
+    return QuoteSelectionStore(LIVE_DATA / "quote_selections.db")
+
+
 def _start_live() -> Dict[str, Any]:
     config = PipelineConfig(paper_mode=True)
     run: Dict[str, Any] = {"mode": "live", "db_path": None, "monitor": None,
@@ -149,7 +174,8 @@ def _start_live() -> Dict[str, Any]:
     db_path = _new_db("combo_mm_live_")
     run.update(db_path=db_path, polling=True, source=label,
                monitor=LiveMonitor(source, EventStore(db_path, synchronous="NORMAL"), config,
-                                   source_label=label))
+                                   source_label=label, catalog=_combo_catalog(),
+                                   selections=_quote_selections()))
     return run
 
 
@@ -245,6 +271,13 @@ def _live_status() -> None:
         pricing_note = "V1 independent-leg pricer (live symbols are not mapped to the NFL model yet)"
     st.caption(f"Source: {run['source']} (receive-only) · last poll: {monitor.last_poll_at} · "
                f"every {run['poll_interval_s']:.0f}s · {pricing_note}.")
+    catalog = monitor.catalog
+    if catalog is not None:
+        state = ("crawling" if catalog.refreshing else
+                 f"refreshed {catalog.last_refresh_at}" if catalog.last_refresh_at else "idle")
+        err = f" · last error `{catalog.last_error}`" if catalog.last_error else ""
+        st.caption(f"Leg catalog (combos-rfq-api combo-markets): {len(catalog):,} positions · "
+                   f"{state}{err} · accepted quotes stored this run: {monitor.accepted_recorded}.")
 
 
 if run is not None and run["mode"] == "live" and run.get("monitor") is not None:
@@ -271,21 +304,153 @@ def _trades_by_rfq(r: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 # View 1: RFQs
 # ---------------------------------------------------------------------------
 
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (name,)).fetchone() is not None
+
+
+def _live_rfqs(conn: sqlite3.Connection, market_filter: str) -> list:
+    """Newest live RFQs for the chosen market filter, screened ones via the (rank, seq) index."""
+    screened = _table_exists(conn, "rfq_screen")
+    cols = ("r.*, s.direction, s.side AS combo_side, s.submission_deadline, s.screen, "
+            "s.n_nfl_legs, s.n_resolved")
+    if screened and market_filter != MARKETS_ALL:
+        ranks = (0,) if market_filter == MARKETS_QUOTABLE_ONLY else (0, 1, 2)
+        out: list = []
+        for rank in ranks:
+            out += [dict(x) for x in conn.execute(
+                f"SELECT {cols} FROM rfq_screen s JOIN rfq r ON r.rfq_id = s.rfq_id "
+                "WHERE s.rank = ? ORDER BY s.seq DESC LIMIT ?", (rank, LIVE_ROW_LIMIT - len(out)))]
+            if len(out) >= LIVE_ROW_LIMIT:
+                break
+        if out or market_filter == MARKETS_QUOTABLE_ONLY:
+            return out
+    join = "LEFT JOIN rfq_screen s ON s.rfq_id = r.rfq_id" if screened else ""
+    select = cols if screened else "r.*"
+    return [dict(x) for x in conn.execute(
+        f"SELECT {select} FROM rfq r {join} ORDER BY r.rowid DESC LIMIT ?", (LIVE_ROW_LIMIT,))]
+
+
+def _leg_label(pid: str, market: Optional[LegMarket]) -> str:
+    if market is None:
+        return f"? {pid[:12]}…"
+    price = f" @{market.price:.3f}" if market.price is not None else ""
+    return f"{market.title} → {market.outcome}{price}"
+
+
+def _ms_to_iso(value: Any) -> Optional[str]:
+    try:
+        return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _selected_view(selections: QuoteSelectionStore) -> None:
+    st.subheader("Selected to quote")
+    chosen = selections.list_selected()
+    st.caption("RFQs picked on this page (kept across restarts in `data/live/quote_selections.db`). "
+               "The accepted quote is the gateway's confirmed trade broadcast for that RFQ: accepted "
+               "blended price and matched size. Trades for RFQs not picked are never stored.")
+    if not chosen:
+        st.write("(none selected yet)")
+        return
+    st.dataframe(pd.DataFrame([{
+        "rfq_id": s["rfq_id"], "selected at": s["selected_at"], "screen": s["screen"],
+        "legs": " | ".join(leg.get("label", "") for leg in s["legs"]),
+        "direction": s["direction"], "side": s["side"],
+        "size": s["size"], "unit": s["size_unit"],
+        "accepted price": s["accepted_price"], "accepted size": s["accepted_size"],
+        "executed at": s["accepted_executed_at"],
+    } for s in chosen]), width="stretch", hide_index=True,
+        column_config={"accepted price": st.column_config.NumberColumn(format="%.4f")})
+
+
+def _live_rfq_detail(x: Dict[str, Any], legs: list, markets: list,
+                     monitor: Optional[LiveMonitor], conn: sqlite3.Connection) -> None:
+    rfq_id = x["rfq_id"]
+    size_val = x["qty_decimal"] if x["qty_decimal"] is not None else x["cash_order_qty"]
+    unit = "shares" if x["qty_decimal"] is not None else "notional"
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Request**")
+        st.write(f"Screen: `{x.get('screen') or '-'}`")
+        st.write(f"Requester `{x.get('direction') or '?'}` · combo side `{x.get('combo_side') or '?'}` "
+                 f"· size `{size_val}` {unit}")
+        st.write(f"Combo condition: `{x['symbol']}`")
+        st.write(f"Status: `{x['status']}`")
+    with c2:
+        st.markdown("**Timestamps**")
+        st.write(f"Received: `{x['created_time']}`")
+        st.write(f"Quote submission deadline: `{_ms_to_iso(x.get('submission_deadline')) or '-'}`")
+        trade = monitor.recent_trades.get(rfq_id) if monitor is not None else None
+        if trade:
+            st.write(f"Traded: `{trade.get('size')}` shares @ `{trade.get('price')}` "
+                     f"(executed `{trade.get('executed_at')}`)")
+
+    leg_rows = []
+    for leg, m in zip(legs, markets):
+        leg_rows.append({
+            "market": m.title if m else "(not in combo catalog yet)",
+            "outcome": m.outcome if m else leg["side"],
+            "price": m.price if m else None,
+            "league": m.league if m else None,
+            "game": m.game if m else None,
+            "NFL": bool(m and m.is_nfl),
+            "position id": leg["symbol"],
+        })
+    st.markdown("**Legs**")
+    st.dataframe(pd.DataFrame(leg_rows), width="stretch", hide_index=True,
+                 column_config={"price": st.column_config.NumberColumn(format="%.3f")})
+
+    selections = monitor.selections if monitor is not None else None
+    if selections is not None:
+        if selections.is_selected(rfq_id):
+            st.success("On the quoting list. Its accepted quote is stored when the RFQ trades.")
+            if st.button("Remove from quoting list", key=f"unselect_{rfq_id}"):
+                selections.unselect(rfq_id)
+                st.rerun()
+        elif st.button("Quote this RFQ", type="primary", key=f"select_{rfq_id}"):
+            monitor.select(rfq_id, {
+                "direction": x.get("direction"), "side": x.get("combo_side"), "size": size_val,
+                "size_unit": unit, "submission_deadline": _ms_to_iso(x.get("submission_deadline")),
+                "condition_id": x["symbol"], "created_time": x["created_time"],
+                "screen": x.get("screen"),
+                "legs": [{**row, "label": _leg_label(row["position id"], m)}
+                         for row, m in zip(leg_rows, markets)],
+            })
+            st.rerun()
+
+    st.markdown("**Lifecycle events**")
+    events = conn.execute(
+        "SELECT event_type, source, client_derived, recorded_at FROM raw_events "
+        "WHERE rfq_id = ? ORDER BY id", (rfq_id,)).fetchall()
+    st.table([{"event": e["event_type"], "source": e["source"],
+               "client-derived": bool(e["client_derived"]), "recorded at": e["recorded_at"]}
+              for e in events])
+
+
 @st.fragment(run_every=every)
 def _rfq_view(r: Dict[str, Any]) -> None:
     conn = _connect(r["db_path"])
     try:
         backtest = r["mode"] == "backtest"
+        monitor: Optional[LiveMonitor] = r.get("monitor")
+        catalog = monitor.catalog if monitor is not None else None
+        market_filter = MARKETS_QUOTABLE_FIRST
         if backtest:
             rfqs = [dict(x) for x in conn.execute("SELECT * FROM rfq ORDER BY created_time, rowid")]
             leg_rows = conn.execute("SELECT rfq_id, symbol, side, settlement_price FROM rfq_legs "
                                     "ORDER BY rowid")
         else:
-            rfqs = [dict(x) for x in conn.execute("SELECT * FROM rfq ORDER BY rowid DESC LIMIT ?",
-                                                  (LIVE_ROW_LIMIT,))]
+            market_filter = st.radio(
+                "Markets", MARKET_FILTERS, horizontal=True, key="rfq_market_filter",
+                help="Quotable = at least two legs from the same NFL game and no other game "
+                     "(any sport) contributing two or more legs. Other legs are independent.")
+            rfqs = _live_rfqs(conn, market_filter)
+            ids = [x["rfq_id"] for x in rfqs]
             leg_rows = conn.execute(
-                "SELECT rfq_id, symbol, side, settlement_price FROM rfq_legs WHERE rfq_id IN "
-                "(SELECT rfq_id FROM rfq ORDER BY rowid DESC LIMIT ?) ORDER BY rowid", (LIVE_ROW_LIMIT,))
+                f"SELECT rfq_id, symbol, side, settlement_price FROM rfq_legs WHERE rfq_id IN "
+                f"({','.join('?' * len(ids))}) ORDER BY rowid", ids) if ids else []
         legs_by_rfq: Dict[str, list] = {}
         for leg in leg_rows:
             legs_by_rfq.setdefault(leg["rfq_id"], []).append(dict(leg))
@@ -305,25 +470,42 @@ def _rfq_view(r: Dict[str, Any]) -> None:
         else:
             st.header("Live RFQ feed")
             st.caption("RFQs observed on the live feed since the monitor started "
-                       "(auto-refreshing while polling).")
+                       "(auto-refreshing while polling). Legs are resolved from the public combo "
+                       "catalog; pick an RFQ below to add it to the quoting list.")
 
+        selections = monitor.selections if monitor is not None else None
         if not rfqs:
-            st.info("No RFQs yet." if not backtest else "The backtest produced no RFQs.")
+            st.info("The backtest produced no RFQs." if backtest else
+                    "No quotable NFL RFQs yet." if market_filter == MARKETS_QUOTABLE_ONLY else
+                    "No RFQs yet.")
+            if selections is not None:
+                _selected_view(selections)
             return
 
         total = sum(status_counts.values())
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("RFQs", f"{total:,}")
-        c2.metric("Executed (we traded)", f"{status_counts.get('EXECUTED', 0):,}")
-        c3.metric("Closed (no trade)", f"{status_counts.get('CLOSED', 0):,}")
-        c4.metric("Open / quoted", f"{sum(n for s, n in status_counts.items() if s not in ('EXECUTED', 'CLOSED', 'CANCELLED', 'EXPIRED')):,}")
-        if not backtest and total > len(rfqs):
-            st.caption(f"Table shows the newest {len(rfqs):,} of {total:,} RFQs.")
+        if backtest:
+            c2.metric("Executed (we traded)", f"{status_counts.get('EXECUTED', 0):,}")
+            c3.metric("Closed (no trade)", f"{status_counts.get('CLOSED', 0):,}")
+            c4.metric("Open / quoted", f"{sum(n for s, n in status_counts.items() if s not in ('EXECUTED', 'CLOSED', 'CANCELLED', 'EXPIRED')):,}")
+        else:
+            screens = ({x["screen"]: x["n"] for x in conn.execute(
+                "SELECT screen, COUNT(*) AS n FROM rfq_screen GROUP BY screen")}
+                if _table_exists(conn, "rfq_screen") else {})
+            c2.metric("Quotable (NFL same game)", f"{screens.get(QUOTABLE, 0):,}")
+            c3.metric("Traded (closed)", f"{status_counts.get('CLOSED', 0):,}")
+            c4.metric("Legs not yet resolved", f"{screens.get(UNRESOLVED, 0):,} RFQs")
+            if total > len(rfqs):
+                st.caption(f"Table shows {len(rfqs):,} of {total:,} RFQs ({market_filter.lower()}).")
 
+        chosen_ids = selections.selected_ids() if selections is not None else set()
+        markets_by_rfq: Dict[str, list] = {}
         rows = []
         for x in rfqs:
             t = trades.get(x["rfq_id"], {})
             size = x["qty_decimal"] if x["qty_decimal"] is not None else x["cash_order_qty"]
+            leg_ids = [leg["symbol"] for leg in legs_by_rfq.get(x["rfq_id"], [])]
             row = {
                 "rfq_id": x["rfq_id"],
                 "combo": t.get("combo_label") or x["symbol"],
@@ -331,8 +513,27 @@ def _rfq_view(r: Dict[str, Any]) -> None:
                 "size": size,
                 "created": x["created_time"],
                 "requester": x["creator_user_id"],
-                "legs": len(legs_by_rfq.get(x["rfq_id"], [])),
+                "legs": len(leg_ids),
             }
+            if not backtest:
+                markets = catalog.resolve(leg_ids) if catalog is not None else [None] * len(leg_ids)
+                markets_by_rfq[x["rfq_id"]] = markets
+                nfl_games = sorted({m.game for m in markets if m is not None and m.is_nfl and m.game})
+                row = {
+                    "quoting": x["rfq_id"] in chosen_ids,
+                    "screen": x.get("screen") or "-",
+                    "legs": " | ".join(_leg_label(pid, m) for pid, m in zip(leg_ids, markets)),
+                    "n legs": len(leg_ids),
+                    "NFL games": ", ".join(nfl_games),
+                    "direction": x.get("direction"),
+                    "side": x.get("combo_side"),
+                    "size": size,
+                    "unit": "shares" if x["qty_decimal"] is not None else "notional",
+                    "status": x["status"],
+                    "received": x["created_time"],
+                    "quote by": _ms_to_iso(x.get("submission_deadline")),
+                    "rfq_id": x["rfq_id"],
+                }
             if backtest:
                 row.update({
                     "game": t.get("game"),
@@ -368,10 +569,23 @@ def _rfq_view(r: Dict[str, Any]) -> None:
                      })
 
         st.subheader("RFQ detail")
-        choice = st.selectbox("RFQ", list(df["rfq_id"]), key="rfq_detail_pick")
+        labels = {x["rfq_id"]: x.get("screen") for x in rfqs}
+        choice = st.selectbox(
+            "RFQ", list(df["rfq_id"]), key="rfq_detail_pick",
+            format_func=(lambda i: i) if backtest else
+            (lambda i: f"{'★ ' if i in chosen_ids else ''}{i} · {labels.get(i) or '-'} · "
+                       + " | ".join(_leg_label("", m) for m in markets_by_rfq.get(i, []))[:140]))
         if choice is None:
+            if selections is not None:
+                _selected_view(selections)
             return
         x = next(r_ for r_ in rfqs if r_["rfq_id"] == choice)
+        if not backtest:
+            _live_rfq_detail(x, legs_by_rfq.get(choice, []), markets_by_rfq.get(choice, []),
+                             monitor, conn)
+            if selections is not None:
+                _selected_view(selections)
+            return
         size_mode = "qtyDecimal" if x["qty_decimal"] is not None else "cashOrderQty"
         size_val = x["qty_decimal"] if x["qty_decimal"] is not None else x["cash_order_qty"]
         c1, c2 = st.columns(2)

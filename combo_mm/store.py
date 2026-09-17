@@ -228,6 +228,28 @@ class EventStore:
                     components_json TEXT,
                     ts TEXT NOT NULL
                 );
+
+                -- Live-feed screen per RFQ (combo_mm.rfq_screen): gateway
+                -- extras normalize() drops, plus the NFL same-game screen.
+                -- seq is the rfq row's rowid (arrival order); (rank, seq)
+                -- serves "quotable first, newest first" without a sort.
+                CREATE TABLE IF NOT EXISTS rfq_screen (
+                    rfq_id TEXT PRIMARY KEY,
+                    seq INTEGER NOT NULL,
+                    direction TEXT,
+                    side TEXT,
+                    condition_id TEXT,
+                    submission_deadline TEXT,
+                    n_legs INTEGER NOT NULL,
+                    n_resolved INTEGER NOT NULL,
+                    n_nfl_legs INTEGER NOT NULL,
+                    screen TEXT NOT NULL,
+                    rank INTEGER NOT NULL,
+                    catalog_version INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_screen_rank_seq ON rfq_screen(rank, seq);
+                CREATE INDEX IF NOT EXISTS idx_screen_unresolved
+                    ON rfq_screen(catalog_version) WHERE n_resolved < n_legs;
                 """
             )
             # Migration for DBs created before the shadow-engine columns
@@ -1043,6 +1065,58 @@ class EventStore:
                 "SELECT decision, COUNT(*) AS n FROM shadow_decisions "
                 "GROUP BY decision").fetchall()
             return {r["decision"]: r["n"] for r in rows}
+
+    # -- live RFQ screen -------------------------------------------------------
+    def upsert_rfq_screen(self, rfq_id: str, *, n_legs: int, n_resolved: int,
+                          n_nfl_legs: int, screen: str, rank: int, catalog_version: int,
+                          direction: Optional[str] = None, side: Optional[str] = None,
+                          condition_id: Optional[str] = None,
+                          submission_deadline: Optional[str] = None) -> None:
+        """Insert an RFQ's screen, or refresh the screen columns of an existing row.
+
+        Gateway extras (direction, deadline, ...) are kept from the first
+        insert when a re-screen passes None.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO rfq_screen (rfq_id, seq, direction, side, condition_id,
+                    submission_deadline, n_legs, n_resolved, n_nfl_legs, screen, rank,
+                    catalog_version)
+                VALUES (?1, COALESCE((SELECT rowid FROM rfq WHERE rfq_id = ?1), 0),
+                        ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT(rfq_id) DO UPDATE SET
+                    direction = COALESCE(excluded.direction, direction),
+                    side = COALESCE(excluded.side, side),
+                    condition_id = COALESCE(excluded.condition_id, condition_id),
+                    submission_deadline = COALESCE(excluded.submission_deadline,
+                                                   submission_deadline),
+                    n_legs = excluded.n_legs, n_resolved = excluded.n_resolved,
+                    n_nfl_legs = excluded.n_nfl_legs, screen = excluded.screen,
+                    rank = excluded.rank, catalog_version = excluded.catalog_version
+                """,
+                (rfq_id, direction, side, condition_id, submission_deadline, n_legs,
+                 n_resolved, n_nfl_legs, screen, rank, catalog_version))
+
+    def unresolved_screen_rfqs(self, catalog_version: int, limit: int = 5000
+                               ) -> List[Dict[str, Any]]:
+        """RFQs with unresolved legs screened before ``catalog_version``, with leg symbols."""
+        with self._lock:
+            ids = [r["rfq_id"] for r in self._conn.execute(
+                "SELECT rfq_id FROM rfq_screen WHERE n_resolved < n_legs "
+                "AND catalog_version < ? LIMIT ?", (catalog_version, limit))]
+            out = []
+            for rfq_id in ids:
+                legs = [r["symbol"] for r in self._conn.execute(
+                    "SELECT symbol FROM rfq_legs WHERE rfq_id = ? ORDER BY rowid", (rfq_id,))]
+                out.append({"rfq_id": rfq_id, "legs": legs})
+            return out
+
+    def get_rfq_screen(self, rfq_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM rfq_screen WHERE rfq_id = ?", (rfq_id,)).fetchone()
+            return dict(row) if row else None
 
     # -- read model ----------------------------------------------------------
     def get_rfq(self, rfq_id: str) -> Optional[Dict[str, Any]]:
