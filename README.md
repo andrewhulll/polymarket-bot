@@ -220,10 +220,13 @@ the RFQ hot path — the pricer reads a weekly params file. Full method and resu
 ```bash
 pip install -r requirements-nfl.txt              # numpy / scipy / pandas (offline only)
 
-# Walk-forward backtest over every same-game combo, 2010-2025 (~1.5 min on 8 cores)
-python scripts/nfl_backtest.py --pull            # --pull fetches nflverse games.csv into data/raw/
+# 1. Tune estimator settings on the TRAIN seasons (2006-2021) only -> params/estimator.json (~15 min)
+python scripts/nfl_tune.py --pull                # --pull fetches nflverse games.csv into data/raw/
 
-# Weekly params refresh (Wednesdays): estimate -> gates -> params/nfl_<season>_w<ww>.json
+# 2. Walk-forward backtest, every same-game combo: train 2006-2021 / test 2022-2025 (~1 min)
+python scripts/nfl_backtest.py
+
+# Weekly params refresh (Wednesdays): tuned estimator -> gates -> params/nfl_<season>_w<ww>.json
 python scripts/refresh_params.py --pull
 
 # NFL tests (synthetic data, no network)
@@ -234,8 +237,13 @@ python -m pytest tests/test_nfl_*.py -q
   cached immutably under `data/raw/nflverse_<pulldate>/` with a SHA-256 manifest; validated on
   ingest (duplicates, team twice in a week, implausible scores/lines, missing lines).
 - **Estimation** — residuals vs closing-line implied points; recency-weighted trailing window with
-  a strict `as_of` cutoff; `σ²(μ) = a + b·μ` (default), league constant, or shrunk team factors;
-  league-wide within-game `ρ`.
+  a strict `as_of` cutoff; league constant, `σ²(μ) = a + b·μ`, or shrunk team factors;
+  league-wide within-game `ρ`. Settings (variance model, window, half-life, shrinkage) are
+  grid-searched on the train seasons only and frozen in `params/estimator.json`
+  (currently `league_constant`, 4-season window, 1-season half-life).
+- **Train/test split** — chronological 80/20 by games: train 2006–2021, test 2022–2025, scored once
+  with the frozen settings. 1999–2005 (no closing prices) are estimation history only. Walk-forward
+  in both periods.
 - **Params files** — canonical, versioned JSON with data vintage; stdlib-only loader
   (`combo_mm.nfl.params_io`); gates: range sanity, no regression vs the previous file, determinism.
   Offseason freezes the last file. `params/nfl_2026_w02.json` is the current promoted file.
@@ -246,15 +254,18 @@ python -m pytest tests/test_nfl_*.py -q
   calibration, results by combo / family / size / favorite size, correlation structure, sensitivity
   to correlation, stylized edge P&L.
 
-**Headline (4,358 games, 2010–2025):** the model beats the naive product by 4.5% Brier skill
-(t −22.6), driven by legs sharing the margin (ML × spread: 13.3%); spread × total ties naive
-(NFL margin/total dependence is small except for 10+ point favorites); ML × total is slightly worse
-because the normal margin misses NFL key numbers. Next steps are in the doc (§4.4).
+**Headline, out of sample (test 2022–2025, 1,139 games):** the model beats the naive product by
+4.52% Brier skill (t −11.9), vs 4.53% on train, so there is no sign of overfitting. The gain comes from
+legs sharing the margin (ML × spread: 13.2% test). Spread × total ties naive, because NFL margin/total
+dependence is small except for 10+ point favorites. Inflating the modeled correlation degrades scores
+gradually in both periods. Next steps (key-number margin shape, moneyline calibration) are in the doc
+(§4.4).
 
-The dashboard's **NFL correlation** tab has seven views: overview, combo pricing, calibration,
-correlation structure, sensitivity & P&L, an interactive same-game combo explorer (any team's
-ML / spread / total, team or opponent side, historical or hypothetical game, with the score
-distribution), and params & data (refresh buttons, gate report).
+The dashboard's **NFL correlation** tab has a Test / Train / All sample selector (default Test) and
+seven views: overview (with a train-vs-test table), combo pricing, calibration, correlation structure,
+sensitivity & P&L, an interactive same-game combo explorer (any team's ML / spread / total, team or
+opponent side, historical or hypothetical game, with the score distribution), and params & data
+(tuning grid, frozen estimator, refresh buttons, gate report).
 
 ## Retail live data
 

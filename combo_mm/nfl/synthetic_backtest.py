@@ -131,6 +131,8 @@ SPREAD_BUCKETS = ((0.0, 3.0, "0-2.5"), (3.0, 7.0, "3-6.5"), (7.0, 10.0, "7-9.5")
 
 DEFAULT_SCALES = (0.0, 0.5, 1.0, 1.5, 2.0)
 
+TRAIN, TEST = "train", "test"
+
 
 def _pd():
     import pandas as pd  # offline dependency, imported lazily
@@ -144,20 +146,53 @@ def _np():
 
 @dataclass(frozen=True)
 class BacktestConfig:
-    first_season: int = 2010
+    """Walk-forward backtest settings.
+
+    Chronological 80/20 split: seasons ``first_season..train_last_season`` are
+    the **train** period (hyperparameters are tuned there only, see
+    :mod:`combo_mm.nfl.tuning`); later seasons up to ``last_season`` are the
+    **test** period, scored once with the frozen configuration. Default 2006
+    (first season with closing prices) - 2021 train (79% of games) and
+    2022-2025 test (21%). Weekly params are always estimated walk-forward from
+    every game before that week -- 1999-2005 serve as estimation history only.
+    """
+
+    first_season: int = 2006
     last_season: int = 2025
+    train_last_season: int = 2021
     variance_models: Tuple[str, ...] = VARIANCE_MODELS
     primary_model: str = "mean_linear"
+    # Model whose correlation is scaled for the sensitivity report (default: primary).
+    # league_constant has no margin/total dependence to scale, so the CLI uses mean_linear.
+    sensitivity_model: Optional[str] = None
     corr_scales: Tuple[float, ...] = DEFAULT_SCALES
     edge_threshold: float = 0.01
     include_playoffs: bool = True
+    structure: bool = True           # per-game structure rows (off for fast tuning runs)
     estimator: EstimatorConfig = field(default_factory=EstimatorConfig)
 
     def __post_init__(self) -> None:
         if self.primary_model not in self.variance_models:
             raise ValueError("primary_model must be one of variance_models")
+        if self.sensitivity_model is not None and self.sensitivity_model not in self.variance_models:
+            raise ValueError("sensitivity_model must be one of variance_models")
         if 1.0 not in self.corr_scales:
             raise ValueError("corr_scales must include 1.0 (the fitted model)")
+        if self.first_season > self.last_season:
+            raise ValueError("first_season must be <= last_season")
+
+    @property
+    def scaled_model(self) -> str:
+        return self.sensitivity_model or self.primary_model
+
+    def split_of(self, season: int) -> str:
+        return TRAIN if season <= self.train_last_season else TEST
+
+    def split_summary(self) -> Dict[str, Any]:
+        return {
+            "train": [self.first_season, min(self.train_last_season, self.last_season)],
+            "test": [self.train_last_season + 1, self.last_season] if self.last_season > self.train_last_season else None,
+        }
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -255,7 +290,7 @@ def _price_game(game: Game, params_by_model: Dict[str, Dict[str, Any]],
     fh = mkt.fav_is_home
 
     variants: List[Tuple[str, str, float]] = [(model_col(m), m, 1.0) for m in config.variance_models]
-    variants += [(scale_col(c), config.primary_model, c) for c in config.corr_scales if c != 1.0]
+    variants += [(scale_col(c), config.scaled_model, c) for c in config.corr_scales if c != 1.0]
 
     calibrated = {}
     for col, model, scale in variants:
@@ -269,7 +304,8 @@ def _price_game(game: Game, params_by_model: Dict[str, Dict[str, Any]],
     models = {col: GameModel((cal.mu_home, cal.mu_away), cal.cov) for col, cal in calibrated.items()}
 
     base = {
-        "season": game.season, "week": game.week, "game_type": game.game_type,
+        "season": game.season, "split": config.split_of(game.season),
+        "week": game.week, "game_type": game.game_type,
         "gameday": game.gameday, "game_id": game.game_id,
         "home": game.home, "away": game.away,
         "fav": game.home if fh else game.away, "dog": game.away if fh else game.home,
@@ -291,6 +327,8 @@ def _price_game(game: Game, params_by_model: Dict[str, Dict[str, Any]],
             for col, gm in models.items():
                 row[col] = gm.joint(leg_objs)
         combo_rows.append(row)
+    if not config.structure:
+        return combo_rows, None
 
     # Structure row (primary model, corr_scale 1).
     prim = calibrated[model_col(config.primary_model)]
@@ -380,7 +418,8 @@ def _run_season(games: Sequence[Game], season: int, config: BacktestConfig) -> D
         for g in weeks[week]:
             rows, g_row = _price_game(g, params_by_model, config)
             out["combos"].extend(rows)
-            out["games"].append(g_row)
+            if g_row is not None:
+                out["games"].append(g_row)
     return out
 
 
@@ -398,7 +437,8 @@ def run_backtest(games: Sequence[Game], config: Optional[BacktestConfig] = None,
     started = time.time()
     games = list(games)
     seasons = sorted({g.season for g in _target_games(games, config)})
-    workers = workers or max(1, min(len(seasons), (os.cpu_count() or 2) - 1))
+    # Capped at 4: each worker holds the full game list and its season's rows.
+    workers = workers or max(1, min(len(seasons), (os.cpu_count() or 2) - 1, 4))
 
     results: Dict[int, Dict[str, List[Any]]] = {}
     if workers <= 1 or len(seasons) <= 1:
@@ -425,7 +465,8 @@ def run_backtest(games: Sequence[Game], config: Optional[BacktestConfig] = None,
         "config": config.to_dict(),
         "data_vintage": dict(data_vintage or {}),
         "seasons": seasons,
-        "n_games": sum(len(results[s]["games"]) for s in seasons),
+        "split": config.split_summary(),
+        "n_games": int(combos["game_id"].nunique()) if len(combos) else 0,
         "n_pickem_skipped": n_pickem,
         "n_combo_rows": int(len(combos)),
         "n_pushed": int(combos["pushed"].sum()) if len(combos) else 0,
