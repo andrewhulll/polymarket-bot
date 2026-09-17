@@ -132,14 +132,10 @@ def _normalize_legs(value: Any) -> list:
 
 
 def _event_key(event_id: Optional[str], event_type: str, rfq_id: Optional[str],
-               quote_id: Optional[str], event_at: str,
-               discriminator: str = "") -> str:
+               quote_id: Optional[str], event_at: str) -> str:
     if event_id:
         return str(event_id)
-    # ``discriminator`` separates distinct records that share the entity ids
-    # and timestamp (e.g. two Drop Copy fills of one quote in the same ms).
-    basis = "|".join([event_type, rfq_id or "", quote_id or "", event_at,
-                      discriminator])
+    basis = "|".join([event_type, rfq_id or "", quote_id or "", event_at])
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
@@ -170,11 +166,7 @@ def normalize(raw: Dict[str, Any], *, now: Optional[datetime] = None) -> Normali
     }
     payload.update(nested)
 
-    rfq_id = raw.get("rfq_id") or payload.get("rfqId")
-    if not rfq_id and event_type.startswith("rfq_"):
-        # Only an RFQ payload's ``id`` is the RFQ id; on quote/fill payloads
-        # ``id`` is the quote/fill id and must never be mistaken for it.
-        rfq_id = payload.get("id")
+    rfq_id = raw.get("rfq_id") or payload.get("rfqId") or payload.get("id")
     if not rfq_id:
         raise NormalizeError(f"{event_type} requires rfq_id")
     rfq_id = str(rfq_id)
@@ -296,12 +288,8 @@ def normalize(raw: Dict[str, Any], *, now: Optional[datetime] = None) -> Normali
         if exec_time is not None:
             coerced["executedTime"] = _coerce_ts(exec_time)
 
-    discriminator = ""
-    if event_type == "drop_copy_fill":
-        discriminator = coerced.get("fillId") or coerced.get("dropCopySeq") or ""
     key = _event_key(
-        raw.get("event_id"), event_type, rfq_id, quote_id, event_at,
-        discriminator,
+        raw.get("event_id"), event_type, rfq_id, quote_id, event_at
     )
     return NormalizedEvent(
         event_key=key,

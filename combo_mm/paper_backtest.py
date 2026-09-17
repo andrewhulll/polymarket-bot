@@ -30,11 +30,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from combo_mm.books import LegBookCache
 from combo_mm.config import PipelineConfig
 from combo_mm.dropcopy import SimulatedDropCopyTransport, drain_drop_copy
+from combo_mm.engine import ShadowQuotingEngine
 from combo_mm.fixtures import BASE_TS, SELF_USER_ID
 from combo_mm.normalize import normalize
 from combo_mm.pricing import QUOTED_OK
 from combo_mm.reference import ReferenceCache
-from combo_mm.shadow import ShadowQuoter
 from combo_mm.store import EventStore
 from combo_mm.stream import SimulatedTransport
 
@@ -96,7 +96,8 @@ def run_backtest(session: List[Dict[str, Any]],
     transport = SimulatedTransport(session, self_user_id, combos)
     books = LegBookCache(staleness_ms=config.staleness_ms)
     reference = ReferenceCache(transport, ttl_s=config.reference_ttl_s)
-    quoter = ShadowQuoter(store, books, reference, config)
+    engine = ShadowQuotingEngine(store, books, reference, config,
+                                 params_version=config.params_version)
 
     last_t = -1
     for item in sorted(session, key=lambda i: i.get("t", 0)):
@@ -124,7 +125,7 @@ def run_backtest(session: List[Dict[str, Any]],
         now = BASE_TS + timedelta(milliseconds=t)
         event = normalize(item["raw"], now=now)
         if store.apply(event) and event.event_type in ("rfq_created", "rfq_updated"):
-            quoter.maybe_quote(event)
+            engine.maybe_quote(event)
 
     # Fills reconcile exclusively through Drop Copy.
     drain_drop_copy(SimulatedDropCopyTransport(drop_copy_records), store,
@@ -163,13 +164,7 @@ def _compute_metrics(store: EventStore) -> BacktestResult:
     for d in latest.values():
         if d["decision"] == QUOTED_OK:
             r = rfq_by_id.get(d["rfq_id"]) or {}
-            qty = r.get("qty_decimal")
-            if not qty:
-                # Cash-sized RFQs have no qty_decimal: use the smaller live
-                # quoted side size (conservative; "0" means side unquoted).
-                sides = [Decimal(str(s)) for s in (d.get("buy_qty"), d.get("sell_qty"))
-                         if s and Decimal(str(s)) > 0]
-                qty = min(sides) if sides else 0
+            qty = r.get("qty_decimal") or 0
             expected += (Decimal(str(d["spread_bps"] or 0)) / Decimal(10000)
                          * Decimal(str(qty)))
     res.expected_pnl = float(expected)
