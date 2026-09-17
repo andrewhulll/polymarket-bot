@@ -155,6 +155,7 @@ def price_combo(
     price_max: float = 0.999,
     min_qty: float = 1.0,
     fair_override: Optional[float] = None,
+    extra_spread_bps: Optional[Dict[str, float]] = None,
 ) -> QuoteDecision:
     """Price one combo RFQ. Pure function -- no I/O.
 
@@ -166,6 +167,10 @@ def price_combo(
     model) supply the combo fair while reusing this function's leg checks,
     spread, tick rounding and sizing. The independent-leg product is still
     computed and recorded as ``components["naive_fair"]``.
+
+    ``extra_spread_bps`` adds named spread components on top of the V1 stack
+    (e.g. the NFL pricer's model-risk haircuts); each is recorded in
+    ``components`` under its own name.
     """
     leg_inputs = [
         {
@@ -286,12 +291,14 @@ def price_combo(
     )
     depth_impact_bps = depth_slope_bps * float(ref_qty) / max(total_top_size, _EPS)
     depth_impact_bps = min(depth_impact_bps, 500.0)  # cap: never quote absurd wide
+    extras = {k: float(v) for k, v in (extra_spread_bps or {}).items()}
     total_bps = (
         base_edge_bps
         + model_uncertainty_bps
         + depth_impact_bps
         + event_risk_bps
         + operational_buffer_bps
+        + sum(extras.values())
     )
     half_spread = total_bps / 10000.0  # absolute price units
 
@@ -364,6 +371,9 @@ def price_combo(
         "valid_sell": valid_sell,
         "size_mode": "qty" if qty_decimal is not None else "cash",
     }
+    if extras:
+        components.update(extras)
+        components["extra_spread_bps"] = sorted(extras)
     return QuoteDecision(
         rfq_id=rfq_id,
         model_version=model_version,
