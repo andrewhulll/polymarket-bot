@@ -62,10 +62,14 @@ from combo_mm.intl_gateway import (  # noqa: E402
 )
 from combo_mm.live_monitor import LiveMonitor  # noqa: E402
 from combo_mm.nfl import week_backtest  # noqa: E402
-from combo_mm.paper_backtest import compute_metrics  # noqa: E402
+from combo_mm.paper_backtest import BacktestResult  # noqa: E402
 from combo_mm.retail import KEY_ID_ENV, SECRET_ENV, RetailPollingSource  # noqa: E402
 from combo_mm.store import EventStore  # noqa: E402
 from dashboard import nfl_tab  # noqa: E402
+
+# The live quoter gateway broadcasts ~200 RFQs/s, so live views show the newest
+# rows only and take counts from SQL aggregates (the backtest shows everything).
+LIVE_ROW_LIMIT = 500
 
 RAW_ROOT = REPO / "data" / "raw"
 ESTIMATOR_PATH = REPO / "params" / "estimator.json"
@@ -144,7 +148,8 @@ def _start_live() -> Dict[str, Any]:
         return run
     db_path = _new_db("combo_mm_live_")
     run.update(db_path=db_path, polling=True, source=label,
-               monitor=LiveMonitor(source, EventStore(db_path), config, source_label=label))
+               monitor=LiveMonitor(source, EventStore(db_path, synchronous="NORMAL"), config,
+                                   source_label=label))
     return run
 
 
@@ -211,10 +216,16 @@ def _live_status() -> None:
     if isinstance(source, InternationalQuoterGatewayAdapter):
         stats = source.stats()
         c1.metric("Gateway", "connected" if source.connected else "reconnecting")
-        c2.metric("RFQs seen", stats["rfqs_seen"])
-        c3.metric("Trades seen", stats["trades_seen"])
-        c4.metric("Reconnects", stats["reconnects"])
-        c5.metric("RFQ events applied", monitor.events_applied)
+        c2.metric("RFQs seen", f"{stats['rfqs_seen']:,}")
+        c3.metric("Trades seen", f"{stats['trades_seen']:,}")
+        c4.metric("Key auth", stats["auth"])
+        c5.metric("Reconnects", stats["reconnects"])
+        if stats["auth"] == "rejected":
+            st.warning(f"The gateway rejected these API keys (`{stats['auth_error']}`). The RFQ "
+                       "broadcast is public, so the feed keeps streaming; key auth only matters for "
+                       "quoting, which this receive-only monitor never does.")
+        if stats.get("buffer_drops"):
+            st.caption(f"{stats['buffer_drops']:,} RFQs dropped by the adapter buffer (feed outpaced polling).")
         if stats.get("last_error"):
             st.caption(f"Last gateway error: `{stats['last_error']}`")
         pricing_note = ("gateway legs are on-chain position ids with no leg books, so the shadow "
@@ -264,12 +275,23 @@ def _trades_by_rfq(r: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 def _rfq_view(r: Dict[str, Any]) -> None:
     conn = _connect(r["db_path"])
     try:
-        rfqs = [dict(x) for x in conn.execute("SELECT * FROM rfq ORDER BY created_time, rowid")]
-        legs_by_rfq: Dict[str, list] = {}
-        for leg in conn.execute("SELECT rfq_id, symbol, side, settlement_price FROM rfq_legs ORDER BY rowid"):
-            legs_by_rfq.setdefault(leg["rfq_id"], []).append(dict(leg))
-        trades = _trades_by_rfq(r)
         backtest = r["mode"] == "backtest"
+        if backtest:
+            rfqs = [dict(x) for x in conn.execute("SELECT * FROM rfq ORDER BY created_time, rowid")]
+            leg_rows = conn.execute("SELECT rfq_id, symbol, side, settlement_price FROM rfq_legs "
+                                    "ORDER BY rowid")
+        else:
+            rfqs = [dict(x) for x in conn.execute("SELECT * FROM rfq ORDER BY rowid DESC LIMIT ?",
+                                                  (LIVE_ROW_LIMIT,))]
+            leg_rows = conn.execute(
+                "SELECT rfq_id, symbol, side, settlement_price FROM rfq_legs WHERE rfq_id IN "
+                "(SELECT rfq_id FROM rfq ORDER BY rowid DESC LIMIT ?) ORDER BY rowid", (LIVE_ROW_LIMIT,))
+        legs_by_rfq: Dict[str, list] = {}
+        for leg in leg_rows:
+            legs_by_rfq.setdefault(leg["rfq_id"], []).append(dict(leg))
+        status_counts = {x["status"]: x["n"] for x in conn.execute(
+            "SELECT status, COUNT(*) AS n FROM rfq GROUP BY status")}
+        trades = _trades_by_rfq(r)
 
         if backtest:
             st.header(f"Historical RFQs -- {BACKTEST_LABEL}")
@@ -289,13 +311,14 @@ def _rfq_view(r: Dict[str, Any]) -> None:
             st.info("No RFQs yet." if not backtest else "The backtest produced no RFQs.")
             return
 
-        statuses = [x["status"] for x in rfqs]
+        total = sum(status_counts.values())
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("RFQs", len(rfqs))
-        c2.metric("Executed (we traded)", statuses.count("EXECUTED"))
-        c3.metric("Closed (no trade)", statuses.count("CLOSED"))
-        c4.metric("Open / quoted", sum(x not in ("EXECUTED", "CLOSED", "CANCELLED", "EXPIRED")
-                                         for x in statuses))
+        c1.metric("RFQs", f"{total:,}")
+        c2.metric("Executed (we traded)", f"{status_counts.get('EXECUTED', 0):,}")
+        c3.metric("Closed (no trade)", f"{status_counts.get('CLOSED', 0):,}")
+        c4.metric("Open / quoted", f"{sum(n for s, n in status_counts.items() if s not in ('EXECUTED', 'CLOSED', 'CANCELLED', 'EXPIRED')):,}")
+        if not backtest and total > len(rfqs):
+            st.caption(f"Table shows the newest {len(rfqs):,} of {total:,} RFQs.")
 
         rows = []
         for x in rfqs:
@@ -332,7 +355,7 @@ def _rfq_view(r: Dict[str, Any]) -> None:
                 if pick:
                     df = df[df["game"].isin(pick)]
         with f2:
-            status_pick = st.multiselect("Status", sorted(set(statuses)), key="rfq_filter_status")
+            status_pick = st.multiselect("Status", sorted(status_counts), key="rfq_filter_status")
             if status_pick:
                 df = df[df["status"].isin(status_pick)]
 
@@ -400,12 +423,17 @@ def _pricing_view(r: Dict[str, Any]) -> None:
     conn = _connect(r["db_path"])
     try:
         st.header("Pricing & quoting (shadow pricer)")
-        decisions = [dict(d) for d in conn.execute(
-            "SELECT d.*, r.symbol AS combo_symbol, r.status AS rfq_status "
-            "FROM shadow_decisions d JOIN rfq r ON r.rfq_id = d.rfq_id ORDER BY d.id")]
+        backtest = r["mode"] == "backtest"
+        query = ("SELECT d.*, r.symbol AS combo_symbol, r.status AS rfq_status "
+                 "FROM shadow_decisions d JOIN rfq r ON r.rfq_id = d.rfq_id ")
+        decisions = [dict(d) for d in (
+            conn.execute(query + "ORDER BY d.id") if backtest
+            else conn.execute(query + "ORDER BY d.id DESC LIMIT ?", (LIVE_ROW_LIMIT,)))]
+        total = conn.execute("SELECT COUNT(*) AS n FROM shadow_decisions").fetchone()["n"]
         model = ("NFL joint model (bivariate-normal scores, walk-forward params)"
-                 if r["mode"] == "backtest" else "V1 independent-leg product")
-        st.caption(f"{len(decisions)} shadow decisions · pricer: {model}. Every quote and decline "
+                 if backtest else "V1 independent-leg product")
+        shown = "" if total == len(decisions) else f" (newest {len(decisions):,} shown)"
+        st.caption(f"{total:,} shadow decisions{shown} · pricer: {model}. Every quote and decline "
                    "carries a reason code and its spread components.")
         if not decisions:
             st.info("No pricing decisions yet.")
@@ -486,17 +514,34 @@ def _group(trades: pd.DataFrame, by: str) -> pd.DataFrame:
     return out
 
 
+def _live_metrics(db_path: str) -> BacktestResult:
+    """Live counts from SQL aggregates: compute_metrics does per-RFQ reads, too slow at ~200 RFQs/s."""
+    conn = _connect(db_path)
+    try:
+        def one(sql: str) -> int:
+            return conn.execute(sql).fetchone()["n"]
+
+        res = BacktestResult(
+            rfqs_received=one("SELECT COUNT(*) AS n FROM rfq"),
+            rfqs_quoted=one("SELECT COUNT(DISTINCT rfq_id) AS n FROM shadow_decisions "
+                            "WHERE decision = 'QUOTED_OK'"),
+            rfqs_expired=one("SELECT COUNT(*) AS n FROM rfq WHERE status = 'EXPIRED'"),
+            rfqs_executed=one("SELECT COUNT(DISTINCT rfq_id) AS n FROM quotes WHERE status = 'EXECUTED'"),
+            n_fills=one("SELECT COUNT(*) AS n FROM fills"),
+        )
+        decided = one("SELECT COUNT(DISTINCT rfq_id) AS n FROM shadow_decisions")
+        res.rfqs_rejected = decided - res.rfqs_quoted
+        res.quote_rate = res.rfqs_quoted / res.rfqs_received if res.rfqs_received else 0.0
+        res.execution_rate = res.rfqs_executed / res.rfqs_quoted if res.rfqs_quoted else 0.0
+        return res
+    finally:
+        conn.close()
+
+
 @st.fragment(run_every=every)
 def _performance_view(r: Dict[str, Any]) -> None:
     backtest = r["mode"] == "backtest"
-    if backtest:
-        result = r["result"]
-    else:
-        store = EventStore(r["db_path"])
-        try:
-            result = compute_metrics(store)
-        finally:
-            store.close()
+    result = r["result"] if backtest else _live_metrics(r["db_path"])
     st.header(f"Performance -- {'backtest, ' + BACKTEST_LABEL if backtest else 'live feed (paper)'}")
     if backtest:
         st.caption(
@@ -504,8 +549,9 @@ def _performance_view(r: Dict[str, Any]) -> None:
             "Week 1, books only closing lines. Expected P&L = model edge on what traded; realized "
             "P&L = fills settled on final scores. Combos with a pushed leg are void (no P&L).")
     else:
-        st.caption("Live counts from the shadow engine. Fills and P&L need Exchange Drop Copy, "
-                   "which the Retail path does not provide -- expect zero fills here.")
+        st.caption("Live counts from the shadow engine. Fills and P&L need our own executions "
+                   "(Exchange Drop Copy); the receive-only live feeds provide none, so expect "
+                   "zero fills here.")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("RFQs received", result.rfqs_received)
     c1.metric("RFQs quoted", result.rfqs_quoted)
@@ -595,7 +641,8 @@ def _engine_view(r: Dict[str, Any]) -> None:
         drafts = conn.execute(
             "SELECT quote_id, rfq_id, buy_price, sell_price, buy_qty_decimal, sell_qty_decimal, "
             "model_version, params_version, decided_by, created_time, input_snapshot_json "
-            "FROM quotes WHERE status = 'shadow' ORDER BY rowid").fetchall()
+            "FROM quotes WHERE status = 'shadow' ORDER BY rowid DESC LIMIT ?",
+            (LIVE_ROW_LIMIT if r["mode"] == "live" else -1,)).fetchall()
 
         def fair(q) -> Optional[float]:
             try:

@@ -209,3 +209,15 @@ def test_unknown_config_fields_are_fatal():
 
     with pytest.raises(TypeError, match="unknown config fields"):
         PipelineConfig.from_dict({"paper_mode": True, "bogus_knob": 1})
+
+
+def test_synchronous_mode_is_configurable_and_validated(tmp_path):
+    import pytest
+
+    def mode(store):
+        return store._conn.execute("PRAGMA synchronous").fetchone()[0]
+
+    assert mode(EventStore(str(tmp_path / "full.db"))) == 2          # FULL (default)
+    assert mode(EventStore(str(tmp_path / "normal.db"), synchronous="NORMAL")) == 1
+    with pytest.raises(ValueError):
+        EventStore(str(tmp_path / "bad.db"), synchronous="OFF")
