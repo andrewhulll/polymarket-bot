@@ -600,6 +600,52 @@ This records intent only: nothing is sent to the gateway.
   accepted `price_e6` / `size_e6` / `executed_at` ride along as raw `price` /
   `size` / `executed_at` extras for the accepted-quote record.
 
+## Historical RFQ data (NFL capture)
+
+**Polymarket has no endpoint for past RFQs.** Checked directly against the current docs
+(docs.polymarket.com: `trading/combos/requesters`, `trading/combos/market-makers`, the
+`combos-rfq-openapi.yaml` spec) and confirmed by this repo's own transport notes
+(`combo_mm/stream.py`, `combo_mm/retail.py`): RFQs only ever appear live, once, as they happen.
+
+- The quoter-gateway websocket is a broadcast feed, not a queryable log — "a new stream
+  delivers only NEW events" (`combo_mm/stream.py`), and the official docs tell market makers to
+  "maintain your own logs" if they need history.
+- The Retail REST `/v1/rfqs` list (`combo_mm/retail.py`) returns current-state RFQs, is
+  beta-gated, and has no date-range parameter.
+- The Exchange gRPC `GetRFQs` durable read is a reconciliation snapshot ("what's open right
+  now"), not an archive.
+- A newer, undocumented client (`py-clob-client-v2`) exposes `GET /rfq/data/requests` with a
+  `state: active|inactive` filter that looks like it *might* cover closed RFQs — but it needs
+  live L2 API credentials to test, isn't in the official docs, and the client's own README
+  points new integrations at a different, still-newer unified SDK instead. Untested; flagging it
+  here in case it's worth trying with real keys, not relying on it.
+
+So there was no way to backfill NFL Week 1 (2026) after the fact — nothing was capturing the
+live feed while it happened. The Week 1 RFQs the dashboard's "Run backtest" button replays
+(`combo_mm/nfl/week_backtest.py`) are **synthetic**: real closing lines, reconstructed RFQ
+arrivals — not actual RFQ negotiations pulled from Polymarket.
+
+**Going forward**, `scripts/capture_live_rfqs.py` listens on the same receive-only gateway
+adapter the dashboard's live monitor uses and saves every RFQ to disk — no pricing, no dashboard
+wiring, just capture:
+
+```bash
+export POLYMARKET_API_KEY=... POLYMARKET_SECRET=... POLYMARKET_PASSPHRASE=... POLYMARKET_ADDRESS=...
+python3 scripts/capture_live_rfqs.py --data-dir data/live   # run continuously; Ctrl+C to stop
+```
+
+It writes `data/live/rfq_raw.jsonl` (every event, verbatim — the only place a trade's accepted
+price/size survive, since `normalize()` drops gateway-native fields it doesn't recognize) and
+`data/live/rfq_capture.db` (the same events through the existing normalize/store/screen pipeline,
+so legs resolve against the combo catalog and each RFQ is tagged NFL or not).
+
+Once some data has accumulated, pull out just the NFL rows:
+
+```bash
+python3 scripts/export_nfl_rfqs.py --data-dir data/live --out data/live/nfl_rfqs
+# -> data/live/nfl_rfqs.csv and .json; --since/--until filter by created_time
+```
+
 ## Going live — Exchange gRPC checklist (later)
 
 The live Exchange adapter (`GrpcTransport`) is an explicit stub. To go live,
