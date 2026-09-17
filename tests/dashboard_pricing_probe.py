@@ -48,3 +48,17 @@ app._live_pricing_view(_Monitor(), {"pricing_note": "probe"})
 # part a trader reads.
 quoted = next(q for q in store.list_priced_quotes() if q["status"] == "QUOTED")
 app._model_quote_detail(quoted)
+
+# Settle that quote against a final score (BUF 30 DET 20, so Bills ML and
+# Bills -4.5 both hit) so the settlement section renders real numbers rather
+# than its empty state.
+from combo_mm.nfl.ingest import Game  # noqa: E402
+from combo_mm.nfl.settle_live import GameIndex, settle_quote  # noqa: E402
+
+RESULT = Game(game_id="2026_02_DET_BUF", season=2026, week=2, game_type="REG",
+              gameday="2026-09-18", home="BUF", away="DET", home_score=30, away_score=20,
+              overtime=False, neutral=False, spread_line=-4.5, total_line=54.5)
+for due in store.quotes_needing_settlement():
+    store.record_settlement(settle_quote(due, catalog.lookup, GameIndex([RESULT]),
+                                         settled_at="2026-09-19T00:00:00Z").to_dict())
+app._settlement_view(store)

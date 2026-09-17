@@ -250,6 +250,11 @@ python3 scripts/run_pipeline.py
 
 # Dashboard (demo/observability — not production)
 streamlit run dashboard/app.py
+
+# Score live quotes once their games have finished (offline; writes
+# quote_settlements in data/live/quote_selections.db)
+python3 scripts/settle_live_quotes.py --dry-run
+python3 scripts/settle_live_quotes.py
 ```
 
 The dashboard opens with a PAPER/SHADOW banner and three controls at the top:
@@ -701,8 +706,9 @@ Every RFQ the screen calls `QUOTABLE` is priced by the NFL correlation model as
 it arrives (and again whenever you press **Quote this RFQ**), and the bid and
 ask we would show are logged to `data/live/quote_selections.db` and to the
 application log. That file is durable — it survives closing the dashboard, and
-each live run appends to it — but nothing scores those quotes once the game
-finishes yet; the plan for that is
+each live run appends to it. Once the games finish,
+`python scripts/settle_live_quotes.py` settles each quote against the cached
+nflverse scores and fills in the **Settlement** section of the same tab. See
 [`docs/settlement-tracking.md`](docs/settlement-tracking.md).
 
 ```
