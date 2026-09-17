@@ -2,7 +2,7 @@
 
 Pipeline for one live RFQ (gateway legs are combo-catalog position ids)::
 
-    legs --catalog--> markets --registry (#15)--> canonical score legs, grouped by game
+    legs --catalog--> markets --catalog_markets/#15 registry--> score legs, by game
          --live books (CLOB / Gamma)--> market marginals q_i, per leg
     game's main spread + total books --calibrate_means--> (mu_home, mu_away)
     weekly params file --matchup_covariance--> Sigma          => GameModel
@@ -38,7 +38,7 @@ import math
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -46,7 +46,8 @@ from combo_mm.combo_markets import LegMarket
 from combo_mm.config import PipelineConfig
 from combo_mm.leg_books import LegBook, LegRef
 from combo_mm.nfl import MODEL_VERSION as NFL_MODEL_VERSION
-from combo_mm.nfl.markets import ML, SPR, TOT, TT, NflLegMarket, parse_leg, to_joint_leg, unsupported_reason
+from combo_mm.nfl.catalog_markets import describe_leg, parse_catalog_leg, unsupported_reason
+from combo_mm.nfl.markets import ML, SPR, TOT, TT, NflLegMarket, to_joint_leg
 from combo_mm.nfl.params_provider import ParamsHandle, ParamsProvider
 from combo_mm.pricing import QUOTED_OK, LegMarkInput, _leg_mark, price_combo
 
@@ -233,9 +234,14 @@ class _Leg:
     ref: LegRef
     label: str
     nfl: Optional[NflLegMarket] = None
+    nfl_side: str = "YES"
     book: Optional[LegBook] = None
     q: Optional[float] = None
     p_model: Optional[float] = None
+
+    @property
+    def joint_leg(self):
+        return to_joint_leg(self.nfl, self.nfl_side)
 
 
 class NflLivePricer:
@@ -299,7 +305,16 @@ class NflLivePricer:
                              label=f"{m.title} [{m.outcome}]"))
         quote.legs_label = " | ".join(leg.label for leg in legs)
 
-        # (1) scope: same-game blocks ------------------------------------------
+        # (1) params -------------------------------------------------------------
+        handle = self.params.current()
+        if handle is None:
+            raise _Decline(PARAMS_UNAVAILABLE, f"no params file in {self.params.params_dir}")
+        age_days = handle.age_days(now)
+        if age_days > mc.max_params_age_days:
+            raise _Decline(PARAMS_STALE, f"{handle.version} is {age_days:.1f} days old")
+        quote.params_version = handle.version
+
+        # (2) scope: same-game blocks ----------------------------------------
         per_game: Dict[str, List[_Leg]] = {}
         for leg in legs:
             if leg.market.game:
@@ -311,26 +326,18 @@ class NflLivePricer:
             if not all(leg.market.is_nfl for leg in members):
                 raise _Decline(OTHER_SAME_GAME, f"{game}: same-game legs outside the NFL model")
             for leg in members:
-                leg.nfl = parse_leg(leg.market.slug, leg.market.outcome_index)
-                if leg.nfl is None:
+                parsed = self._parse(leg.market.slug, leg.market.outcome_index, handle)
+                if parsed is None:
                     raise _Decline(UNSUPPORTED_LEG, f"{leg.label}: "
                                    f"{unsupported_reason(leg.market.slug) or 'unparsed NFL market'}")
+                leg.nfl, leg.nfl_side = parsed
             blocks[game] = members
         if not blocks:
             raise _Decline(NO_NFL_SAME_GAME, "no NFL game contributes two or more legs")
         in_block = {id(leg) for members in blocks.values() for leg in members}
         independent = [leg for leg in legs if id(leg) not in in_block]
 
-        # (2) params -------------------------------------------------------------
-        handle = self.params.current()
-        if handle is None:
-            raise _Decline(PARAMS_UNAVAILABLE, f"no params file in {self.params.params_dir}")
-        age_days = handle.age_days(now)
-        if age_days > mc.max_params_age_days:
-            raise _Decline(PARAMS_STALE, f"{handle.version} is {age_days:.1f} days old")
-        quote.params_version = handle.version
-
-        # (3) kickoff + books -----------------------------------------------------
+        # (3) kickoff + books -------------------------------------------------
         for game, members in blocks.items():
             kickoff = _parse_iso(self.book_source.kickoff(members[0].market.market_id))
             if kickoff is not None and now >= kickoff:
@@ -391,7 +398,7 @@ class NflLivePricer:
         quote.legs = [{
             "label": leg.label, "position_id": leg.position_id, "slug": leg.market.slug,
             "game": leg.market.game, "modeled": leg.nfl is not None,
-            "canonical": to_joint_leg(leg.nfl).name if leg.nfl else None,
+            "canonical": leg.joint_leg.name if leg.nfl else None,
             "bid": leg.book.bid if leg.book else None, "ask": leg.book.ask if leg.book else None,
             "book_source": leg.book.source if leg.book else None,
             "q_market": leg.q, "p_model": leg.p_model,
@@ -453,30 +460,48 @@ class NflLivePricer:
         return (f"{book.source} book bid={book.bid} ask={book.ask} age={book.age_s(now_ms):.0f}s"
                 + (" closed" if book.closed else ""))
 
+    def _parse(self, slug: str, outcome_index: int,
+               handle: ParamsHandle) -> Optional[Tuple[NflLegMarket, str]]:
+        """Catalog slug -> registry market, with the slate's own game_id when known."""
+        parsed = parse_catalog_leg(slug, outcome_index)
+        if parsed is None:
+            return None
+        market, side = parsed
+        row = handle.game(market.home, market.away)
+        if row is not None:                      # name the nflverse game the params file knows
+            market = replace(market, game_id=str(row["game_id"]), season=handle.season,
+                             week=handle.week)
+        return market, side
+
     def _calibration_markets(self, game: str) -> Tuple[List[LegMarket], List[LegMarket]]:
         """Full-game spread and total markets (outcome 0) nearest 50/50 by catalog price."""
         spreads, totals = [], []
         for m in self.catalog.markets_for_game(game):
             if m.outcome_index != 0:
                 continue
-            parsed = parse_leg(m.slug, 0)
-            if parsed is None or not parsed.is_main_candidate:
+            parsed = parse_catalog_leg(m.slug, 0)
+            if parsed is None or parsed[0].kind not in (SPR, TOT):
                 continue
-            (spreads if parsed.kind == SPR else totals).append(m)
+            (spreads if parsed[0].kind == SPR else totals).append(m)
         n = self.model_config.calibration_candidates
         by_even = lambda m: abs((m.price if m.price is not None else 0.0) - 0.5)  # noqa: E731
         return sorted(spreads, key=by_even)[:n], sorted(totals, key=by_even)[:n]
 
     def _main_mark(self, candidates: List[LegMarket], books: Dict[LegRef, Optional[LegBook]],
-                   now_ms: int) -> Optional[Tuple[NflLegMarket, float]]:
-        best: Optional[Tuple[NflLegMarket, float]] = None
+                   now_ms: int, handle: ParamsHandle
+                   ) -> Optional[Tuple[NflLegMarket, str, float, str]]:
+        """The candidate nearest 50/50 with a usable book: (market, side, mark, slug)."""
+        best = None
         for m in candidates:
             book = books.get(LegRef(m.market_id, 0))
             mark, reason = _leg_mark(self._mark_input(m.position_id, book, now_ms))
             if reason is not None or mark is None:
                 continue
-            if best is None or abs(mark - 0.5) < abs(best[1] - 0.5):
-                best = (parse_leg(m.slug, 0), mark)  # type: ignore[assignment]
+            parsed = self._parse(m.slug, 0, handle)
+            if parsed is None:
+                continue
+            if best is None or abs(mark - 0.5) < abs(best[2] - 0.5):
+                best = (parsed[0], parsed[1], mark, m.slug)
         return best
 
     def _price_block(self, game: str, members: List[_Leg], calib: Tuple[List[LegMarket], List[LegMarket]],
@@ -486,22 +511,21 @@ class NflLivePricer:
         from combo_mm.nfl.params_io import matchup_covariance
 
         mc = self.model_config
-        spread = self._main_mark(calib[0], books, now_ms)
-        total = self._main_mark(calib[1], books, now_ms)
+        spread = self._main_mark(calib[0], books, now_ms, handle)
+        total = self._main_mark(calib[1], books, now_ms, handle)
         if spread is None or total is None:
             raise _Decline(MISSING_CALIBRATION_MARKET,
                            f"{game}: no priced full-game {'spread' if spread is None else 'total'}")
-        s_mkt, s_mark = spread
-        t_mkt, t_mark = total
-        # Home expected-margin line and the home side's cover probability.
-        if s_mkt.favourite == "home":
-            spread_line, p_home_cover = s_mkt.line, s_mark
-        else:
-            spread_line, p_home_cover = -s_mkt.line, 1.0 - s_mark  # type: ignore[operator]
+        s_mkt, s_side, s_mark, s_slug = spread
+        t_mkt, t_side, t_mark, t_slug = total
+        # A spread market's line is in its subject's terms; the joint model's
+        # is the home expected margin, and outcome 0 pays on the subject.
+        spread_line = -s_mkt.line if s_mkt.subject_is_home else s_mkt.line
+        p_home_cover = s_mark if s_mkt.subject_is_home else 1.0 - s_mark
         home, away = s_mkt.home, s_mkt.away
 
         key = (game, handle.version, mc.corr_scale, spread_line, round(p_home_cover, 4),
-               t_mkt.line, round(t_mark, 4))
+               t_mkt.line, round(t_mark, 4))  # noqa: E501
         with self._cache_lock:
             cached = self._calibrations.get(key)
             if cached is not None:
@@ -524,7 +548,7 @@ class NflLivePricer:
         unique: "OrderedDict[str, _Leg]" = OrderedDict()
         for leg in members:
             unique.setdefault(leg.position_id, leg)
-        joint_legs = [to_joint_leg(leg.nfl) for leg in unique.values()]  # type: ignore[arg-type]
+        joint_legs = [leg.joint_leg for leg in unique.values()]
         p_all = model.joint(joint_legs)
         gaps = []
         for leg, jl in zip(unique.values(), joint_legs):
@@ -552,8 +576,8 @@ class NflLivePricer:
         kinds = {leg.nfl.kind for leg in unique.values()}  # type: ignore[union-attr]
         addons: Dict[str, float] = {}
         explanations = [
-            f"{away} @ {home}: calibrated to {s_mkt.describe()} ({s_mark:.3f}) and "
-            f"{t_mkt.describe()} ({t_mark:.3f}) -> mean score {home} {cal.mu_home:.1f}, "
+            f"{away} @ {home}: calibrated to {describe_leg(s_mkt, s_side)} ({s_mark:.3f}) and "
+            f"{describe_leg(t_mkt, t_side)} ({t_mark:.3f}) -> mean score {home} {cal.mu_home:.1f}, "
             f"{away} {cal.mu_away:.1f}; sd {cal.cov.sigma_home:.2f}/{cal.cov.sigma_away:.2f}, "
             f"rho {cal.cov.rho:+.3f}",
             f"{away} @ {home}: model joint {p_all:.4f}, lift over independence {lift:.3f}, "
@@ -562,7 +586,8 @@ class NflLivePricer:
         confidence_hits: List[Tuple[str, float]] = []
         if not cal.converged:
             confidence_hits.append(("calibration not converged", 0.15))
-        spread_lines = [leg.nfl.line for leg in unique.values() if leg.nfl.kind == SPR]  # type: ignore[union-attr]
+        spread_lines = [abs(leg.nfl.line) for leg in unique.values()   # type: ignore[union-attr]
+                        if leg.nfl.kind == SPR]
         if ML in kinds and SPR in kinds and any(_near_key_number(x) for x in spread_lines):  # type: ignore[arg-type]
             addons["key_number_bps"] = mc.key_number_bps
             explanations.append("Key number: ML x spread near 3/7, where the normal margin misprices")
@@ -576,8 +601,8 @@ class NflLivePricer:
 
         report = {
             "game": game, "home": home, "away": away,
-            "calibration_spread": s_mkt.slug, "p_home_cover": p_home_cover, "spread_line": spread_line,
-            "calibration_total": t_mkt.slug, "p_over": t_mark, "total_line": t_mkt.line,
+            "calibration_spread": s_slug, "p_home_cover": p_home_cover, "spread_line": spread_line,
+            "calibration_total": t_slug, "p_over": t_mark, "total_line": t_mkt.line,
             "mu_home": cal.mu_home, "mu_away": cal.mu_away, "converged": cal.converged,
             "iterations": cal.iterations, **cal.cov.to_dict(), "corr_scale": mc.corr_scale,
             "model_joint": p_all, "naive": naive, "lift": lift, "fair": fair,

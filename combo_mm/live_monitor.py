@@ -25,6 +25,7 @@ from combo_mm.books import LegBookCache
 from combo_mm.combo_markets import ComboMarketCatalog
 from combo_mm.config import PipelineConfig
 from combo_mm.engine import ShadowQuotingEngine
+from combo_mm.events import NormalizedEvent
 from combo_mm.live_quoter import LiveQuoter
 from combo_mm.nfl.live_pricer import LiveRfq
 from combo_mm.normalize import NormalizeError, normalize
@@ -40,6 +41,16 @@ log = logging.getLogger(__name__)
 __all__ = ["LiveMonitor"]
 
 _QUOTABLE = ("rfq_created", "rfq_updated")
+
+
+def _iso_to_ms(value: Optional[str]) -> int:
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, AttributeError, TypeError):
+        return 0
 
 
 class _NoCombos:
@@ -248,7 +259,38 @@ class LiveMonitor:
             if event.event_type == "rfq_created" and event.rfq_id:
                 self._screen_new_rfq(raw, event.rfq_id)
             if event.event_type in _QUOTABLE:
-                self.engine.maybe_quote(event)
+                self._quote_and_measure(event, now)
+
+    def _quote_and_measure(self, event: NormalizedEvent, now: datetime) -> None:
+        """Run the engine, then record how long we took since the RFQ posted.
+
+        ``now`` is the poll's wall-clock time (defaults to real time in
+        live use, fixed in tests) -- using it instead of a fresh
+        ``datetime.now()`` keeps this measurable/testable like the rest of
+        the dispatch path. A posted time we can't parse skips the sample
+        (nothing to measure against).
+        """
+        draft = self.engine.maybe_quote(event)
+        posted_ms = _iso_to_ms(event.event_at)
+        if posted_ms <= 0 or not event.rfq_id:
+            return
+        decided_ms = now.astimezone(timezone.utc).timestamp() * 1000
+        latency_ms = decided_ms - posted_ms
+        budget_ms = self.config.quote_latency_budget_ms
+        over_budget = latency_ms > budget_ms
+        self.store.record_quote_latency(
+            rfq_id=event.rfq_id, event_type=event.event_type,
+            posted_at=event.event_at,
+            decided_at=now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            latency_ms=latency_ms, quoted=draft is not None,
+            over_budget=over_budget, source=self.source_label)
+        if over_budget:
+            log.warning(
+                "SLOW: rfq=%s took %.0fms to %s (budget %dms) -- likely too "
+                "slow to win this RFQ",
+                event.rfq_id, latency_ms,
+                "quote" if draft is not None else "decide against quoting",
+                budget_ms)
 
 
 def _deadline_ms(value: Any) -> Optional[int]:

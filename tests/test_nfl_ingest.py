@@ -5,6 +5,7 @@ from combo_mm.nfl.ingest import (
     IngestError,
     american_to_prob,
     devig_pair,
+    kickoff_utc,
     load_games,
     load_pull,
     parse_games_csv,
@@ -114,3 +115,52 @@ def test_invalid_payload_is_never_cached(tmp_path):
     with pytest.raises(IngestError):
         write_pull(bad.encode(), tmp_path / "nflverse_x", pull_date="x")
     assert not (tmp_path / "nflverse_x" / "manifest.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Kickoff times (issue #15 A5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("gameday,gametime,expected", [
+    # nflverse gametime is US/Eastern, so the UTC offset follows the date:
+    # EDT (-4) in September, EST (-5) in January.
+    ("2024-09-08", "13:00", "2024-09-08T17:00:00Z"),
+    ("2025-01-12", "13:00", "2025-01-12T18:00:00Z"),
+    # The Sunday DST ends: 13:00 kickoff is after the 02:00 switch, so EST.
+    ("2024-11-03", "13:00", "2024-11-03T18:00:00Z"),
+    ("2024-10-27", "13:00", "2024-10-27T17:00:00Z"),
+    # Thursday and Monday night games roll into the next UTC day.
+    ("2024-09-05", "20:20", "2024-09-06T00:20:00Z"),
+    ("2024-09-09", "20:15", "2024-09-10T00:15:00Z"),
+    # London and Germany kickoffs are listed in ET like every other game.
+    ("2024-10-13", "09:30", "2024-10-13T13:30:00Z"),
+])
+def test_kickoff_utc_converts_eastern_per_date(gameday, gametime, expected):
+    games, _ = parse_games_csv(_csv(csv_row(
+        "2024_01_KC_BUF", 2024, 1, "KC", 20, "BUF", 24, 2.0, 45.5,
+        gameday=gameday, gametime=gametime)))
+    assert kickoff_utc(games[0]) == (expected, False)
+
+
+def test_kickoff_falls_back_when_gametime_is_missing():
+    games, _ = parse_games_csv(_csv(csv_row(
+        "2024_01_KC_BUF", 2024, 1, "KC", 20, "BUF", 24, 2.0, 45.5,
+        gameday="2024-09-08")))
+    assert games[0].gametime is None
+    assert kickoff_utc(games[0]) == ("2024-09-08T17:00:00Z", True)
+
+
+def test_neutral_site_games_are_flagged():
+    games, _ = parse_games_csv(_csv(csv_row(
+        "2024_06_JAX_CHI", 2024, 6, "JAX", 16, "CHI", 35, -1.5, 42.5,
+        location="Neutral", gameday="2024-10-13", gametime="09:30")))
+    assert games[0].neutral is True
+    assert kickoff_utc(games[0]) == ("2024-10-13T13:30:00Z", False)
+
+
+def test_unparseable_gametime_is_estimated_not_fatal():
+    games, report = parse_games_csv(_csv(csv_row(
+        "2024_01_KC_BUF", 2024, 1, "KC", 20, "BUF", 24, 2.0, 45.5,
+        gameday="2024-09-08", gametime="tbd")))
+    assert report.ok
+    assert kickoff_utc(games[0]) == ("2024-09-08T17:00:00Z", True)

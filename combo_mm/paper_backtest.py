@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -85,13 +85,17 @@ def run_backtest(session: List[Dict[str, Any]],
                  config: PipelineConfig,
                  *,
                  self_user_id: str = SELF_USER_ID,
-                 db_path: str = ":memory:") -> Tuple[BacktestResult, EventStore]:
+                 db_path: str = ":memory:",
+                 base_ts: Optional[datetime] = None) -> Tuple[BacktestResult, EventStore]:
     """Full-information replay (incl. stream-invisible events) + metrics.
 
     Returns ``(result, store)``; the store backs the dashboard's RFQ and
-    pricing views so all three views read one consistent run.
+    pricing views so all three views read one consistent run. ``base_ts`` is
+    the virtual clock's origin for the session's ``t`` offsets (a generated
+    NFL dataset carries its own; see :mod:`combo_mm.nfl.rfq_sim`).
     """
     config.validate()
+    base_ts = base_ts or BASE_TS
     store = EventStore(db_path)
     transport = SimulatedTransport(session, self_user_id, combos)
     books = LegBookCache(staleness_ms=config.staleness_ms)
@@ -122,14 +126,14 @@ def run_backtest(session: List[Dict[str, Any]],
             continue
         if kind != "event":
             continue
-        now = BASE_TS + timedelta(milliseconds=t)
+        now = base_ts + timedelta(milliseconds=t)
         event = normalize(item["raw"], now=now)
         if store.apply(event) and event.event_type in ("rfq_created", "rfq_updated"):
             engine.maybe_quote(event)
 
     # Fills reconcile exclusively through Drop Copy.
     drain_drop_copy(SimulatedDropCopyTransport(drop_copy_records), store,
-                    now=BASE_TS)
+                    now=base_ts)
 
     result = compute_metrics(store)
     return result, store

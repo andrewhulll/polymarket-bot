@@ -14,6 +14,11 @@ Conventions (verified against the data, see tests):
   All American odds.
 - Relocated franchises are mapped to their current code (``OAK -> LV``,
   ``SD -> LAC``, ``STL -> LA``) so per-team history is continuous.
+- ``gametime`` is the local kickoff in **US/Eastern** (the column is absent
+  from older vintages and blank for some games). :func:`kickoff_utc`
+  converts it with ``zoneinfo``, so EST/EDT is handled per date rather than
+  by a fixed offset, and falls back to 13:00 ET on ``gameday`` --
+  ``kickoff_estimated`` marks that fallback.
 
 Raw pulls are cached immutably under ``<cache_root>/nflverse_<pulldate>/``
 with a ``manifest.json`` (source URL, pull date, SHA-256, row count) so every
@@ -28,14 +33,18 @@ import json
 import math
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 __all__ = [
     "NFLVERSE_GAMES_URL",
     "FRANCHISE_MAP",
     "REQUIRED_COLUMNS",
+    "ET_ZONE",
+    "DEFAULT_KICKOFF_ET",
+    "kickoff_utc",
     "Game",
     "RawPull",
     "ValidationReport",
@@ -62,6 +71,9 @@ REQUIRED_COLUMNS = (
     "away_spread_odds", "home_spread_odds", "under_odds", "over_odds",
     "div_game",
 )
+
+ET_ZONE = ZoneInfo("America/New_York")
+DEFAULT_KICKOFF_ET = time(13, 0)
 
 # Plausibility bounds for validation.
 MAX_SCORE = 80
@@ -95,6 +107,9 @@ class Game:
     over_odds: Optional[float] = None
     under_odds: Optional[float] = None
     div_game: bool = False
+    # Local kickoff "HH:MM" in US/Eastern. Not in REQUIRED_COLUMNS: older
+    # nflverse vintages omit the column and some rows leave it blank.
+    gametime: Optional[str] = None
 
     @property
     def played(self) -> bool:
@@ -172,6 +187,32 @@ def devig_pair(odds_a: Optional[float], odds_b: Optional[float]) -> Optional[flo
 
 
 # ---------------------------------------------------------------------------
+# Kickoff time
+# ---------------------------------------------------------------------------
+
+def kickoff_utc(game: Game) -> Tuple[str, bool]:
+    """``(ISO-8601 UTC kickoff, estimated)`` for ``game``.
+
+    ``gametime`` is US/Eastern local time, converted through ``zoneinfo`` so
+    each date gets its own EST/EDT offset. A missing or unparseable
+    ``gametime`` falls back to :data:`DEFAULT_KICKOFF_ET` and reports
+    ``estimated=True``. International games (``neutral``) are listed in ET
+    too, so they need no special case.
+    """
+    day = datetime.strptime(game.gameday, "%Y-%m-%d").date()
+    estimated = True
+    local_time = DEFAULT_KICKOFF_ET
+    if game.gametime:
+        try:
+            local_time = datetime.strptime(game.gametime, "%H:%M").time()
+            estimated = False
+        except ValueError:
+            pass
+    local = datetime.combine(day, local_time, tzinfo=ET_ZONE)
+    return local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"), estimated
+
+
+# ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
@@ -190,6 +231,11 @@ def _opt_int(raw: str) -> Optional[int]:
     if value != int(value):
         raise ValueError(f"non-integer score {raw!r}")
     return int(value)
+
+
+def _opt_str(raw: Optional[str]) -> Optional[str]:
+    value = (raw or "").strip()
+    return None if value == "" or value.upper() == "NA" else value
 
 
 def _team(raw: str) -> str:
@@ -230,6 +276,7 @@ def parse_games_csv(text: str) -> Tuple[List[Game], ValidationReport]:
                 over_odds=_opt_float(row["over_odds"]),
                 under_odds=_opt_float(row["under_odds"]),
                 div_game=(_opt_float(row["div_game"]) or 0.0) > 0,
+                gametime=_opt_str(row.get("gametime")),
             )
         except (ValueError, KeyError) as exc:
             report.errors.append(f"line {line_no}: unparseable row ({exc})")

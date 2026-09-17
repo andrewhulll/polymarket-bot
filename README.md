@@ -252,7 +252,7 @@ python3 scripts/run_pipeline.py
 streamlit run dashboard/app.py
 ```
 
-The dashboard opens with a PAPER/SHADOW banner and two controls at the top:
+The dashboard opens with a PAPER/SHADOW banner and three controls at the top:
 
 - **Run backtest — NFL 2026 Week 1** — replays every same-game combo (2–3 legs of ML / spread /
   total, 17 combo types) from the week's 16 games as RFQs through the real pipeline
@@ -263,6 +263,11 @@ The dashboard opens with a PAPER/SHADOW banner and two controls at the top:
   with the better price. Trades produce the full quote lifecycle and a fill, then settle on the
   final score; a pushed leg voids the combo. Needs the cached nflverse pull under `data/raw`
   (`python scripts/refresh_params.py --pull`). Deterministic; about 5 seconds.
+- **NFL fixture week** — replays the committed four-game fixture slate
+  (`combo_mm/fixtures_nfl.py`, see [NFL RFQ datasets](#nfl-rfq-datasets-issue-15)). Needs no data
+  pull, so it works on a fresh checkout. Fills are not modelled, so there are no trades: the
+  Performance tab counts each RFQ by its last decision, which for a settled RFQ is the
+  after-the-fact re-check, so read the per-request decisions in **Pricing & quoting**.
 - **Live monitor RFQ feed** — streams live RFQs through the same store and shadow engine
   (`combo_mm/live_monitor.py`), auto-refreshing the views every `poll_interval_s`; **Stop live
   monitor** closes the connection and keeps the data. The source is the receive-only polymarket.com
@@ -346,6 +351,48 @@ seven views: overview (with a train-vs-test table), combo pricing, calibration, 
 sensitivity & P&L, an interactive same-game combo explorer (any team's ML / spread / total, team or
 opponent side, historical or hypothetical game, with the score distribution), and params & data
 (tuning grid, frozen estimator, refresh buttons, gate report).
+
+## NFL RFQ datasets (issue #15)
+
+Steps 2, 3 and 5 of the brief all need NFL RFQ flow to replay, and there is none: the scripted
+replay fixtures are political markets, and Polymarket RFQ history is not available yet (#11).
+Two pieces close that gap. Full method and assumptions:
+[`docs/rfq-simulation.md`](docs/rfq-simulation.md).
+
+**Leg-market registry** (`combo_mm/nfl/markets.py`, stdlib only) gives an RFQ leg symbol a
+meaning: which game, market type, team and line. It owns the symbol grammar, the mapping to the
+canonical score legs the joint model prices (nflverse `spread_line` is the *home* expected margin,
+while a spread symbol carries its line in the *subject's* terms), and settlement — including the
+push and tie rules, which stay config knobs because Polymarket's exact rules are unverified. An
+unknown symbol resolves to `None` rather than a guessed price. A live token resolver (#11) must
+produce the same `NflLegMarket`, so everything downstream stays symbol-agnostic.
+
+**Simulated RFQ sessions** (`combo_mm/nfl/rfq_sim.py`) manufacture flow from historical games in
+the wire format the pipeline already replays, so `SimulatedTransport`, `EventStore.apply` and the
+shadow engine consume it unchanged. Books follow a line path run backwards from the closing line
+and are pinned to the de-vigged closing prices; arrivals are a Poisson process rising into
+kickoff. Sessions carry **only exogenous events** — books, requests, window closes, settlements —
+never acceptances or executions, which depend on our own quote and belong to #5's fill model.
+Final scores reach nothing but the post-game settlements, and a test regenerates a dataset with
+every score zeroed to prove the books are identical.
+
+```bash
+python scripts/gen_nfl_rfq_dataset.py --seasons 2022-2025 --seed 7 \
+    --rfqs-per-game 40 --out data/rfq_sim/test_2022_2025
+```
+
+That run is ~34s for 1,139 games and ~46k RFQs, deterministic for the seed, with a manifest
+pinning the config, the source `games.csv` hash and a SHA-256 per file. Weekly covariance params
+come from the walk-forward estimator (games strictly before the week), cached under
+`params/history/`. Requester types, closing-line fairs and a competitor quote live in a separate
+`sidecar.jsonl.gz` that only #5's fill model may read — a source-scan test fails if any pricing,
+risk or engine module so much as mentions it.
+
+`combo_mm/fixtures_nfl.py` is a committed four-game slate of 40 hand-written RFQs, one deliberate
+case each (nested and impossible combos, a pushed integer spread, a moneyline tie, an overtime
+settlement, a missing main total, an unknown leg, a cross-game combo, a stale book, a cancel, an
+expiry, duplicate and out-of-order deliveries). It needs no data pull and no numpy/scipy, so the
+dashboard's **NFL fixture week** button works on a fresh checkout.
 
 ## Retail live data
 
@@ -602,7 +649,53 @@ This records intent only: nothing is sent to the gateway.
   accepted `price_e6` / `size_e6` / `executed_at` ride along as raw `price` /
   `size` / `executed_at` extras for the accepted-quote record.
 
-### Pricing a live RFQ (the model quotes)
+## Historical RFQ data (NFL capture)
+
+**Polymarket has no endpoint for past RFQs.** Checked directly against the current docs
+(docs.polymarket.com: `trading/combos/requesters`, `trading/combos/market-makers`, the
+`combos-rfq-openapi.yaml` spec) and confirmed by this repo's own transport notes
+(`combo_mm/stream.py`, `combo_mm/retail.py`): RFQs only ever appear live, once, as they happen.
+
+- The quoter-gateway websocket is a broadcast feed, not a queryable log — "a new stream
+  delivers only NEW events" (`combo_mm/stream.py`), and the official docs tell market makers to
+  "maintain your own logs" if they need history.
+- The Retail REST `/v1/rfqs` list (`combo_mm/retail.py`) returns current-state RFQs, is
+  beta-gated, and has no date-range parameter.
+- The Exchange gRPC `GetRFQs` durable read is a reconciliation snapshot ("what's open right
+  now"), not an archive.
+- A newer, undocumented client (`py-clob-client-v2`) exposes `GET /rfq/data/requests` with a
+  `state: active|inactive` filter that looks like it *might* cover closed RFQs — but it needs
+  live L2 API credentials to test, isn't in the official docs, and the client's own README
+  points new integrations at a different, still-newer unified SDK instead. Untested; flagging it
+  here in case it's worth trying with real keys, not relying on it.
+
+So there was no way to backfill NFL Week 1 (2026) after the fact — nothing was capturing the
+live feed while it happened. The Week 1 RFQs the dashboard's "Run backtest" button replays
+(`combo_mm/nfl/week_backtest.py`) are **synthetic**: real closing lines, reconstructed RFQ
+arrivals — not actual RFQ negotiations pulled from Polymarket.
+
+**Going forward**, `scripts/capture_live_rfqs.py` listens on the same receive-only gateway
+adapter the dashboard's live monitor uses and saves every RFQ to disk — no pricing, no dashboard
+wiring, just capture:
+
+```bash
+export POLYMARKET_API_KEY=... POLYMARKET_SECRET=... POLYMARKET_PASSPHRASE=... POLYMARKET_ADDRESS=...
+python3 scripts/capture_live_rfqs.py --data-dir data/live   # run continuously; Ctrl+C to stop
+```
+
+It writes `data/live/rfq_raw.jsonl` (every event, verbatim — the only place a trade's accepted
+price/size survive, since `normalize()` drops gateway-native fields it doesn't recognize) and
+`data/live/rfq_capture.db` (the same events through the existing normalize/store/screen pipeline,
+so legs resolve against the combo catalog and each RFQ is tagged NFL or not).
+
+Once some data has accumulated, pull out just the NFL rows:
+
+```bash
+python3 scripts/export_nfl_rfqs.py --data-dir data/live --out data/live/nfl_rfqs
+# -> data/live/nfl_rfqs.csv and .json; --since/--until filter by created_time
+```
+
+## Pricing a live RFQ (the model quotes)
 
 Every RFQ the screen calls `QUOTABLE` is priced by the NFL correlation model as
 it arrives (and again whenever you press **Quote this RFQ**), and the bid and
@@ -616,8 +709,9 @@ QUOTE rfq=0x8f2… BUY YES 25 shares | bid 0.480 / ask 0.576
 
 How one RFQ is priced (`combo_mm/nfl/live_pricer.py`):
 
-1. **Resolve the legs** — position id → catalog market → `combo_mm/nfl/markets.py`
-   parses the slug into a canonical score leg (`nfl-det-buf-2026-09-18-spread-home-4pt5`
+1. **Resolve the legs** — position id → catalog market →
+   `combo_mm/nfl/catalog_markets.py` parses the slug into the leg registry's
+   `NflLegMarket` (`combo_mm/nfl/markets.py`, #15) and from there the canonical score leg (`nfl-det-buf-2026-09-18-spread-home-4pt5`
    outcome 0 → "home margin > 4.5"). Full-game moneyline, spread, total and team
    totals only; a first-half line or a player prop on the same game is declined
    (`UNSUPPORTED_LEG`), never guessed at.
@@ -682,6 +776,11 @@ Andrew / Totalis must supply:
   the proto bundle / docs.
 - Rate limits on `GetRFQs`/`GetQuotes` (stream-first; durable reads for startup/recovery only).
 - Polymarket's exact push/void/draw settlement semantics per leg type (verify per market rules,
-  don't assume).
+  don't assume). The NFL registry keeps these as config knobs — `push_rule` for a spread or total
+  landing on an integer line, `tie_rule` for a moneyline tie — defaulting to voiding the leg,
+  which voids the combo. See [`docs/rfq-simulation.md`](docs/rfq-simulation.md).
+- Whether Polymarket's listed NFL spreads and totals are always half-points. The simulated
+  datasets assume so by default (`force_half_point_lines`), which makes pushes rare but moves the
+  key numbers 3 and 7 by half a point.
 - Whether combo-RFQ maker access requires enrollment/whitelisting.
 - Fee/rebate treatment in fair value (maker rebates shift the effective edge — quantify before sizing).

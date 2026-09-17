@@ -59,6 +59,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from combo_mm import PipelineConfig  # noqa: E402
+from combo_mm import fixtures_nfl  # noqa: E402
 from combo_mm.auth import CredentialsNotConfigured  # noqa: E402
 from combo_mm.combo_markets import ComboMarketCatalog, LegMarket  # noqa: E402
 from combo_mm.intl_gateway import (  # noqa: E402
@@ -73,7 +74,7 @@ from combo_mm.live_quoter import LiveQuoter  # noqa: E402
 from combo_mm.nfl import week_backtest  # noqa: E402
 from combo_mm.nfl.live_pricer import NflLivePricer  # noqa: E402
 from combo_mm.nfl.params_provider import ParamsProvider  # noqa: E402
-from combo_mm.paper_backtest import BacktestResult  # noqa: E402
+from combo_mm.paper_backtest import BacktestResult, run_backtest  # noqa: E402
 from combo_mm.quote_selections import QuoteSelectionStore  # noqa: E402
 from combo_mm.retail import KEY_ID_ENV, SECRET_ENV, RetailPollingSource  # noqa: E402
 from combo_mm.pricing import QUOTED_OK  # noqa: E402
@@ -97,6 +98,7 @@ RAW_ROOT = REPO / "data" / "raw"
 ESTIMATOR_PATH = REPO / "params" / "estimator.json"
 SEASON, WEEK = week_backtest.BACKTEST_SEASON, week_backtest.BACKTEST_WEEK
 BACKTEST_LABEL = f"NFL {SEASON} Week {WEEK}"
+NFL_FIXTURE_LABEL = "NFL fixture week"
 
 st.set_page_config(page_title="combo_mm dashboard (paper)", layout="wide")
 
@@ -124,8 +126,36 @@ def _run_backtest() -> Dict[str, Any]:
     out = week_backtest.run_from_pull(raw_root=RAW_ROOT, estimator_path=ESTIMATOR_PATH,
                                       db_path=_new_db("combo_mm_backtest_"),
                                       season=SEASON, week=WEEK)
-    return {"mode": "backtest", "db_path": out.db_path, "result": out.result,
-            "trades": out.trades, "meta": out.meta}
+    return {
+        "mode": "backtest", "label": BACKTEST_LABEL, "db_path": out.db_path,
+        "result": out.result, "trades": out.trades, "meta": out.meta,
+        "caption": (
+            f"{out.meta['n_rfqs']} RFQs: every same-game combo (2-3 legs of ML / spread / total) "
+            f"for {out.meta['n_games']} games, reconstructed from nflverse closing lines "
+            f"(pull {out.meta.get('data_vintage', {}).get('pull_date', '?')}) and arriving in "
+            "the 3 hours before kickoff. Each is priced by the joint model, competes with a "
+            "naive independent-leg maker, and settles on the final score."),
+    }
+
+
+def _run_nfl_fixture() -> Dict[str, Any]:
+    """The committed NFL fixture week (#15): no data pull, no network."""
+    items, combos = fixtures_nfl.build_session()
+    db_path = _new_db("combo_mm_nfl_fixture_")
+    result, _store = run_backtest(items, combos, [], PipelineConfig(paper_mode=True),
+                                  db_path=db_path, base_ts=fixtures_nfl.BASE_TS)
+    return {
+        "mode": "backtest", "label": NFL_FIXTURE_LABEL, "db_path": db_path,
+        "result": result, "trades": [], "meta": {},
+        "caption": (
+            "The committed four-game NFL fixture slate: 40 hand-written RFQs where each one "
+            "exercises a deliberate case (nested and impossible combos, a pushed spread, an "
+            "unknown leg, a cross-game combo, a stale book, a cancel, an expiry, duplicate and "
+            "out-of-order deliveries). Fills are not modelled here, so there are no trades: "
+            "that is the backtest harness's job (#5). Performance counts each RFQ by its "
+            "*last* decision, which for a settled RFQ is the after-the-fact re-check, so read "
+            "the per-request decisions in the Pricing & quoting tab instead."),
+    }
 
 
 MISSING_LIVE_KEYS_MSG = (
@@ -233,7 +263,7 @@ def _stop_live(run: Optional[Dict[str, Any]]) -> None:
 run: Optional[Dict[str, Any]] = st.session_state.get("run")
 live_polling = bool(run and run["mode"] == "live" and run.get("polling"))
 
-c_bt, c_live, c_state = st.columns([1.2, 1.2, 2.6])
+c_bt, c_fx, c_live, c_state = st.columns([1.2, 1.1, 1.2, 2.2])
 with c_bt:
     if st.button(f"Run backtest -- {BACKTEST_LABEL}", type="primary", width="stretch"):
         _stop_live(run)
@@ -241,6 +271,17 @@ with c_bt:
             try:
                 run = _run_backtest()
             except Exception as exc:  # missing pull, no games for the week, ...
+                run = {"mode": "backtest", "db_path": None, "error": f"{type(exc).__name__}: {exc}"}
+        st.session_state["run"] = run
+        live_polling = False
+with c_fx:
+    # Needs no nflverse pull, so this always works on a fresh checkout.
+    if st.button(NFL_FIXTURE_LABEL, width="stretch"):
+        _stop_live(run)
+        with st.spinner("Replaying the committed NFL fixture slate..."):
+            try:
+                run = _run_nfl_fixture()
+            except Exception as exc:
                 run = {"mode": "backtest", "db_path": None, "error": f"{type(exc).__name__}: {exc}"}
         st.session_state["run"] = run
         live_polling = False
@@ -256,10 +297,11 @@ with c_live:
         st.rerun()  # redraw the controls with the refresh timers on
 with c_state:
     if run is None:
-        st.caption(f"Choose a data source: the {BACKTEST_LABEL} backtest (historical) "
-                   "or the live RFQ feed.")
+        st.caption(f"Choose a data source: the {BACKTEST_LABEL} backtest (historical), "
+                   f"the {NFL_FIXTURE_LABEL} (committed, no data pull) or the live RFQ feed.")
     elif run["mode"] == "backtest":
-        st.caption(f"Showing: **backtest -- {BACKTEST_LABEL}** (historical RFQ replay).")
+        st.caption(f"Showing: **backtest -- {run.get('label', BACKTEST_LABEL)}** "
+                   "(historical RFQ replay).")
     else:
         st.caption(f"Showing: **live RFQ feed ({run.get('source') or 'not connected'})** -- "
                    + ("polling." if live_polling else "stopped (last data kept)."))
@@ -329,6 +371,20 @@ def _live_status() -> None:
                        f"({last.reason_detail}).")
         if stats["last_error"]:
             st.caption(f"Last pricing error: `{stats['last_error']}`")
+
+    budget_ms = monitor.config.quote_latency_budget_ms
+    lat = monitor.store.get_latency_stats()
+    if lat["count"]:
+        lc1, lc2, lc3, lc4 = st.columns(4)
+        lc1.metric("Quote latency (last)", f"{lat['last_ms']:.0f} ms")
+        lc2.metric("Quote latency (p95)", f"{lat['p95_ms']:.0f} ms")
+        lc3.metric("Quote latency (max)", f"{lat['max_ms']:.0f} ms")
+        lc4.metric(f"Over {budget_ms}ms budget", f"{lat['breaches']}/{lat['count']}",
+                  delta=f"{lat['breach_rate']:.0%}", delta_color="inverse")
+        if lat["breach_rate"]:
+            st.warning(f"{lat['breaches']} of the last {lat['count']} RFQs took longer than "
+                       f"{budget_ms}ms from posting to our decision -- those are too slow to "
+                       "win the contract.")
     catalog = monitor.catalog
     if catalog is not None:
         state = ("crawling" if catalog.refreshing else
@@ -599,14 +655,8 @@ def _rfq_view(r: Dict[str, Any]) -> None:
         trades = _trades_by_rfq(r)
 
         if backtest:
-            st.header(f"Historical RFQs -- {BACKTEST_LABEL}")
-            meta = r["meta"]
-            st.caption(
-                f"{meta['n_rfqs']} RFQs: every same-game combo (2-3 legs of ML / spread / total) for "
-                f"{meta['n_games']} games, reconstructed from nflverse closing lines "
-                f"(pull {meta.get('data_vintage', {}).get('pull_date', '?')}) and arriving in the "
-                "3 hours before kickoff. Each is priced by the joint model, competes with a naive "
-                "independent-leg maker, and settles on the final score.")
+            st.header(f"Historical RFQs -- {r.get('label', BACKTEST_LABEL)}")
+            st.caption(r.get("caption", ""))
         else:
             st.header("Live RFQ feed")
             st.caption("RFQs observed on the live feed since the monitor started "
@@ -954,7 +1004,8 @@ def _live_metrics(db_path: str) -> BacktestResult:
 def _performance_view(r: Dict[str, Any]) -> None:
     backtest = r["mode"] == "backtest"
     result = r["result"] if backtest else _live_metrics(r["db_path"])
-    st.header(f"Performance -- {'backtest, ' + BACKTEST_LABEL if backtest else 'live feed (paper)'}")
+    st.header("Performance -- " + (f"backtest, {r.get('label', BACKTEST_LABEL)}"
+                                   if backtest else "live feed (paper)"))
     if backtest:
         st.caption(
             "Replay of the week's RFQs with exchange-time ordering: params use only games before "
@@ -991,7 +1042,8 @@ def _performance_view(r: Dict[str, Any]) -> None:
     else:
         st.write("(no fills)")
 
-    if not backtest:
+    if not backtest or not r["trades"]:
+        # The fixture slate models no fills: that is #5's harness, not data.
         return
     trades = pd.DataFrame(r["trades"])
     trades["pnl"] = trades["pnl"].fillna(0.0)
@@ -1049,6 +1101,28 @@ def _engine_view(r: Dict[str, Any]) -> None:
                                "GROUP BY decision ORDER BY n DESC").fetchall()
         st.table([{"reason": x["decision"], "count": x["n"]} for x in reasons])
 
+        st.subheader("Quote latency: RFQ posted -> we decided (live feed only)")
+        lat_rows = conn.execute(
+            "SELECT latency_ms, over_budget FROM quote_latency "
+            "ORDER BY id DESC LIMIT 5000").fetchall()
+        if lat_rows:
+            latencies = sorted(x["latency_ms"] for x in lat_rows)
+            n = len(latencies)
+
+            def pct(p: float) -> float:
+                return latencies[min(n - 1, int(p * n))]
+
+            breaches = sum(1 for x in lat_rows if x["over_budget"])
+            budget_ms = r.get("monitor").config.quote_latency_budget_ms if r.get("monitor") else 400
+            lc1, lc2, lc3, lc4 = st.columns(4)
+            lc1.metric("Samples", n)
+            lc2.metric("p50", f"{pct(0.50):.0f} ms")
+            lc3.metric("p95", f"{pct(0.95):.0f} ms")
+            lc4.metric(f"Over {budget_ms}ms", f"{breaches} ({breaches / n:.0%})")
+        else:
+            st.caption("No live latency samples yet -- this is only measured on the live "
+                       "feed (backtest replay uses virtual time, not the real clock).")
+
         st.subheader("Stored draft quotes (status='shadow')")
         drafts = conn.execute(
             "SELECT quote_id, rfq_id, buy_price, sell_price, buy_qty_decimal, sell_qty_decimal, "
@@ -1078,8 +1152,9 @@ def _engine_view(r: Dict[str, Any]) -> None:
 if run is None or not run.get("db_path"):
     for tab in view[:4]:
         with tab:
-            st.info(f'Press "Run backtest -- {BACKTEST_LABEL}" for the historical RFQs, or '
-                    '"Live monitor RFQ feed" to watch the live feed.')
+            st.info(f'Press "Run backtest -- {BACKTEST_LABEL}" for the historical RFQs, '
+                    f'"{NFL_FIXTURE_LABEL}" for the committed fixture slate (no data pull), '
+                    'or "Live monitor RFQ feed" to watch the live feed.')
 else:
     with view[0]:
         _rfq_view(run)
