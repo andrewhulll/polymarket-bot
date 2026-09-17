@@ -700,7 +700,10 @@ python3 scripts/export_nfl_rfqs.py --data-dir data/live --out data/live/nfl_rfqs
 Every RFQ the screen calls `QUOTABLE` is priced by the NFL correlation model as
 it arrives (and again whenever you press **Quote this RFQ**), and the bid and
 ask we would show are logged to `data/live/quote_selections.db` and to the
-application log:
+application log. That file is durable — it survives closing the dashboard, and
+each live run appends to it — but nothing scores those quotes once the game
+finishes yet; the plan for that is
+[`docs/settlement-tracking.md`](docs/settlement-tracking.md).
 
 ```
 QUOTE rfq=0x8f2… BUY YES 25 shares | bid 0.480 / ask 0.576
