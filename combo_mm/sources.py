@@ -14,8 +14,11 @@ pipeline already speaks (see :mod:`combo_mm.stream`):
 
 :class:`SimulatedEventSource` replays the scripted session feed on a
 logical clock. :class:`combo_mm.retail.RetailPollingSource` polls the
-Polymarket US Retail REST API. A future Exchange gRPC adapter would add a
-streaming source here too -- ``PollingConsumer`` accepts any ``EventSource``.
+Polymarket US Retail REST API.
+:class:`combo_mm.intl_gateway.InternationalQuoterGatewayAdapter` streams the
+live international (polymarket.com) quoter-gateway websocket -- receive-only.
+A future Exchange gRPC adapter would add a streaming source here too --
+``PollingConsumer`` accepts any ``EventSource``.
 """
 from __future__ import annotations
 

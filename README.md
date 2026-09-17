@@ -371,6 +371,12 @@ The dashboard offers a data-source selector:
 - **Retail live** — activates only if *both* env vars are set. Otherwise the
   dashboard says so plainly, asks you to set the two env vars, and stays on
   the simulated feed. Credential values are never displayed.
+- **Live (international)** — press **Go live (international)** next to
+  **Run simulation** to stream the receive-only polymarket.com quoter-gateway
+  feed (`combo_mm/intl_gateway.py`, issue #11). A live status block shows
+  connection state, RFQ/trade counters, and recent RFQs; with keys absent you
+  get a graceful warning naming the four env vars. The simulation views stay
+  sim-only by design.
 
 ### How live polling works
 
@@ -459,6 +465,78 @@ paths (`/v1/rfqs*`) are hand-modeled guesses routed through the SDK's
 authenticated `get()` — verify against the Retail docs / API team before
 treating live RFQ polling as authoritative, and check
 `RetailPollingSource.last_error` after polls.
+
+## Live international RFQ feed (quoter gateway)
+
+The dashboard (and pipeline) can read the **live international RFQ stream**
+on polymarket.com instead of the simulated replay. RFQs arrive over the
+quoter-gateway websocket (`wss://combos-rfq-gateway-quoter.polymarket.com/ws/rfq`);
+the adapter (`combo_mm/intl_gateway.py::InternationalQuoterGatewayAdapter`,
+an `EventSource`) authenticates, reads the `RFQ_REQUEST` / `RFQ_TRADE`
+broadcast feed, and maps frames onto the pipeline's normalized RFQ lifecycle
+events (`rfq_created` / `rfq_closed`). Reconnect uses exponential backoff
+with jitter; `websockets` ping/pong is the heartbeat.
+
+**Receive-only, by construction.** The adapter has no code path that sends
+quotes, orders, or any trading message — there is no quote-submission client
+anywhere in the module, and `tests/test_intl_gateway.py` asserts that
+structurally. The 400 ms quote window is irrelevant to us: we only watch.
+
+### Installation
+
+Core pipeline: Python 3.12, stdlib only, plus `pytest` for tests.
+
+The live gateway feed needs the websocket client (optional dependency —
+the simulated pipeline and all non-gateway tests run without it):
+
+```bash
+pip install websockets
+```
+
+### Credentials
+
+From the **runtime environment only**:
+
+```bash
+export POLY_API_KEY="..."
+export POLY_API_SECRET="..."
+export POLY_API_PASSPHRASE="..."
+export POLY_WALLET_ADDRESS="0x..."
+```
+
+Create these on polymarket.com (profile → Settings → API keys; requires a
+wallet signature). A gitignored local `.env` file in the repo root is also
+accepted and only fills gaps — real environment variables always win.
+
+Rules (enforced by tests):
+
+- All four values are read at adapter construction and never leave memory.
+- They are never logged (failure paths log the exception *class* only),
+  persisted, displayed, or committed. `GatewayCredentials.__repr__` redacts.
+- **Never commit secrets.** `.env` and `polymarket.keys*` are gitignored.
+  The no-trading-code test (`test_no_trading_code_paths`) scans the adapter
+  for trading wire tokens (`RFQ_QUOTE`, `signed_order`, `maker/quotes`) and
+  trading identifiers, so a quote-submission path cannot be added silently.
+- No private key is needed — gateway auth uses only the API triple plus the
+  wallet address for the identity field.
+
+### Dashboard
+
+Press **Go live (international)** next to **Run simulation**. With keys
+absent you get a graceful warning naming the four variables; with keys
+present the adapter starts in a background thread and a live status block
+shows connection state, RFQ/trade counters, and recent RFQs. The simulation
+views below stay sim-only by design (full live pipeline wiring is a
+follow-up).
+
+### Mapping notes
+
+- `requested_size.unit == "notional"` → `cashOrderQty`; `"shares"` →
+  `qtyDecimal` (exactly one set, per the normalize XOR rule).
+- Legs carry on-chain **position ids** as `symbol` and inherit the
+  combo-level YES/NO `side` — the gateway provides no per-leg market symbol
+  or side. The RFQ `symbol` is the combo `condition_id`.
+- `RFQ_TRADE` (confirmed trade broadcast) → `rfq_closed`: "stop quoting".
 
 ## Going live — Exchange gRPC checklist (later)
 
