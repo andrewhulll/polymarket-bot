@@ -247,24 +247,40 @@ python3 scripts/run_pipeline.py
 streamlit run dashboard/app.py
 ```
 
-The dashboard opens with a PAPER/SHADOW banner. Press **Run simulation** to replay the scripted
-session into a SQLite DB, then browse:
+The dashboard opens with a PAPER/SHADOW banner and two controls at the top:
 
-1. **RFQs** — every RFQ request, each expandable to full detail (combo symbol, legs with market
-   symbol / side / settlement value, size mode and quantity, timestamps, lifecycle state,
-   requester ID).
-2. **Pricing & quoting** — per RFQ: V1 fair combo price, quoted buy/sell prices, size, expected
-   edge, and a human-readable explanation of each pricing adjustment (spread components +
-   reason code).
-3. **Performance** — paper/shadow replay metrics: RFQs received/quoted/rejected/expired/executed,
-   quote and execution rates, expected vs realized P&L, max downswing/upswing, inventory/exposure
-   over time.
-4. **NFL correlation** — independent of the simulation button; see
+- **Run backtest — NFL 2026 Week 1** — replays every same-game combo (2–3 legs of ML / spread /
+  total, 17 combo types) from the week's 16 games as RFQs through the real pipeline
+  (`combo_mm/nfl/week_backtest.py`). Leg books are one cent wide around the de-vigged closing
+  prices; params are estimated walk-forward from games before Week 1 with the frozen estimator.
+  The shadow engine prices each RFQ with the NFL joint model (`combo_mm/nfl/joint_pricer.py`), a
+  naive independent-leg maker quotes the same RFQ, and the requester (about 3 in 4 buy) trades
+  with the better price. Trades produce the full quote lifecycle and a fill, then settle on the
+  final score; a pushed leg voids the combo. Needs the cached nflverse pull under `data/raw`
+  (`python scripts/refresh_params.py --pull`). Deterministic; about 5 seconds.
+- **Live monitor RFQ feed** — streams live RFQs through the same store and shadow engine
+  (`combo_mm/live_monitor.py`), auto-refreshing the views every `poll_interval_s`; **Stop live
+  monitor** closes the connection and keeps the data. The source is the receive-only polymarket.com
+  quoter gateway when its `POLYMARKET_*` keys are set (see
+  [Live international RFQ feed](#live-international-rfq-feed-quoter-gateway)), else the US Retail
+  API when its two env vars are set (see [Retail live data](#retail-live-data)). There is no
+  simulated fallback: without keys, the needed package, or RFQ beta access, the dashboard says
+  which is missing. Live RFQs are not priced by the NFL model yet: Retail RFQs use the V1 pricer,
+  and gateway legs (on-chain position ids, no leg books) are recorded as `MISSING_LEG` declines.
+
+Views (all read the active run):
+
+1. **RFQs** — the Week 1 historical RFQs or the live feed: filterable table (game, status) with
+   combo, size, requester side, naive vs model fair, our trade price, result and P&L; per-RFQ
+   detail with legs, settlement values, our quote vs the naive maker's, and lifecycle events.
+2. **Pricing & quoting** — every shadow decision: naive product vs model fair, correlation
+   adjustment, quoted bid/offer, size, expected edge, and each spread component.
+3. **Performance** — RFQs received/quoted/executed, win rate vs the naive maker, expected (model
+   edge on trades) vs realized P&L, max downswing/upswing, P&L and exposure over time, and for
+   the backtest results by combo family, combo size, requester side and game.
+4. **Engine status** — shadow engine health, skip/decline reasons, stored drafts.
+5. **NFL correlation** — independent of the controls; see
    [NFL correlation pipeline](#nfl-correlation-pipeline-issue-6).
-
-The dashboard currently replays the **simulated feed only**. A Retail-live data-source selector is
-planned but not yet wired into `dashboard/app.py`; to exercise the Retail path today, drive
-`RetailPollingSource` through `PollingConsumer` directly (see below).
 
 ## NFL correlation pipeline (issue #6)
 
@@ -364,22 +380,14 @@ Rules (enforced by tests):
 - The Secure Vault cannot store this key/secret scheme — env vars are the
   only supported route.
 
-### Streamlit toggle (not yet implemented)
+### Dashboard live monitor
 
-The dashboard offers a data-source selector:
-
-- **Simulated feed** (default)
-- **Retail live** — *planned, not implemented*: when built it will activate only
-  if *both* env vars are set. Otherwise the dashboard will say so plainly, ask
-  you to set the two env vars, and stay on the simulated feed. Credential values
-  are never displayed. It is **not** in `dashboard/app.py` yet; today the
-  dashboard runs the simulated replay (or the live international feed below).
-- **Live (international)** — press **Go live (international)** next to
-  **Run simulation** to stream the receive-only polymarket.com quoter-gateway
-  feed (`combo_mm/intl_gateway.py`, issue #11). A live status block shows
-  connection state, RFQ/trade counters, and recent RFQs; with keys absent you
-  get a graceful warning naming the four env vars. The simulation views stay
-  sim-only by design.
+**Live monitor RFQ feed** prefers the polymarket.com quoter gateway (see
+[Live international RFQ feed](#live-international-rfq-feed-quoter-gateway)) when its four
+`POLYMARKET_*` keys are present. It falls back to a `RetailPollingSource` when *both* Retail env
+vars are set and the SDK is installed. Otherwise the dashboard says plainly what is missing and
+shows no RFQs. Credential values are never displayed. On Retail, a 403 on the RFQ endpoints shows
+"RFQ beta access: NOT enabled" while leg books keep refreshing.
 
 ### How live polling works
 
@@ -446,6 +454,8 @@ pick up the RFQ beta on the next successful poll.
 export POLYMARKET_US_KEY_ID="..."
 export POLYMARKET_US_SECRET_KEY="..."
 pip install polymarket-us
+# dashboard: streamlit run dashboard/app.py, then press "Live monitor RFQ feed"
+# (without the gateway keys set); or drive the source directly:
 python3 -c "
 from combo_mm import EventStore, PollingConsumer, RetailPollingSource
 store = EventStore('retail.db')
@@ -530,12 +540,12 @@ Rules (enforced by tests):
 
 ### Dashboard
 
-Press **Go live (international)** next to **Run simulation**. With keys
-absent you get a graceful warning naming the four variables; with keys
-present the adapter starts in a background thread and a live status block
-shows connection state, RFQ/trade counters, and recent RFQs. The simulation
-views below stay sim-only by design (full live pipeline wiring is a
-follow-up).
+Press **Live monitor RFQ feed**. With keys absent you get a message naming
+the variables; with keys present the adapter starts in a background thread,
+a live status strip shows connection state and RFQ/trade/reconnect counters,
+and every received RFQ flows through `LiveMonitor` into the store and shadow
+engine, so it appears on the RFQs, Pricing, Performance and Engine status
+tabs. **Stop live monitor** closes the websocket.
 
 ### Mapping notes
 
