@@ -39,6 +39,12 @@ class PipelineConfig:
     price_min: float = 0.001
     price_max: float = 0.999
     min_qty: float = 1.0
+    # --- Shadow quoting engine knobs ---
+    max_per_rfq_notional: float = 1000.0   # per-RFQ draft notional cap
+    max_per_game_notional: float = 5000.0   # per-game exposure cap
+    initial_capital: float = 50000.0        # total exposure bound
+    stale_rfq_ms: int = 60000              # RFQ staleness cutoff (exchange time)
+    params_version: str = "unversioned"    # pricing params version tag
 
     def __post_init__(self) -> None:
         self.validate()
@@ -77,6 +83,16 @@ class PipelineConfig:
                 raise ValueError(f"{name} must be a positive number")
         if self.price_max <= self.price_min:
             raise ValueError("price_max must be > price_min")
+        for name in ("max_per_rfq_notional", "max_per_game_notional",
+                     "initial_capital"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"{name} must be a positive number")
+        if (not isinstance(self.stale_rfq_ms, int)
+                or self.stale_rfq_ms <= 0):
+            raise ValueError("stale_rfq_ms must be a positive int")
+        if not isinstance(self.params_version, str) or not self.params_version:
+            raise ValueError("params_version must be a non-empty string")
         if not isinstance(self.watchlist, (list, tuple)) or not all(
             isinstance(s, str) for s in self.watchlist
         ):
@@ -114,5 +130,7 @@ class PipelineConfig:
             "=" * 60,
         ]
         if not self.paper_mode:
-            lines[2] = "LIVE MODE — outbound RPCs enabled (paper_mode=False)"
+            lines[2] = ("LIVE MODE requested (paper_mode=False) -- unsupported: "
+                        "no live transport is implemented; the quoting engine "
+                        "will refuse to run.")
         return "\n".join(lines)

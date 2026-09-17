@@ -6,28 +6,25 @@ Demo/observability only -- not production. Run with::
 
 from the repo root. Press "Run simulation" to replay the scripted session
 through the pipeline (simulated transport, no network) into a SQLite DB, then
-browse the three views, which all read precomputed tables from that DB:
+browse the four views, which all read precomputed tables from that DB:
 
 1. RFQs -- every RFQ request, expandable to full detail.
 2. Pricing & quoting -- V1 fair price, quoted buy/sell, size, expected edge,
    and a human-readable explanation of each pricing adjustment.
 3. Performance -- paper/shadow backtest metrics over the fixture dataset.
+4. Engine status -- shadow quoting engine health: RFQs seen vs quoted vs
+   skipped (with skip-reason breakdown) and the stored draft quotes.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
-import sys
 import tempfile
 from pathlib import Path
 
 import streamlit as st
 
-# ``streamlit run dashboard/app.py`` puts dashboard/ (not the repo root) on
-# sys.path, so make the combo_mm package importable without installing it.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from combo_mm import PipelineConfig, fixtures, paper_backtest  # noqa: E402
+from combo_mm import PipelineConfig, fixtures, paper_backtest
 
 st.set_page_config(page_title="combo_mm dashboard (paper)", layout="wide")
 
@@ -76,7 +73,7 @@ if sim is not None:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
-    view = st.tabs(["RFQs", "Pricing & quoting", "Performance"])
+    view = st.tabs(["RFQs", "Pricing & quoting", "Performance", "Engine status"])
 
     # ---------------------------------------------------------------------------
     # View 1: RFQs
@@ -265,5 +262,83 @@ if sim is not None:
 
         st.subheader("Per-RFQ detail")
         st.table(result.per_rfq)
+
+    # ---------------------------------------------------------------------------
+    # View 4: Engine status (shadow quoting engine)
+    # ---------------------------------------------------------------------------
+    with view[3]:
+        st.header("Engine status -- shadow quoting engine")
+        st.caption(
+            "Eligibility -> pricer -> risk -> draft. Drafts are stored with "
+            "status='shadow' / origin='shadow' and are never submitted."
+        )
+        seen = conn.execute(
+            "SELECT COUNT(DISTINCT rfq_id) AS n FROM shadow_decisions"
+        ).fetchone()["n"]
+        quoted = conn.execute(
+            "SELECT COUNT(DISTINCT rfq_id) AS n FROM shadow_decisions "
+            "WHERE decision = 'QUOTED_OK'"
+        ).fetchone()["n"]
+        skipped = conn.execute(
+            "SELECT COUNT(*) AS n FROM shadow_decisions "
+            "WHERE substr(decision, 1, 5) = 'SKIP_'"
+        ).fetchone()["n"]
+        declined = conn.execute(
+            "SELECT COUNT(*) AS n FROM shadow_decisions "
+            "WHERE decision <> 'QUOTED_OK' AND substr(decision, 1, 5) <> 'SKIP_'"
+        ).fetchone()["n"]
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("RFQs seen", seen)
+        with c2:
+            st.metric("Quoted (drafts)", quoted)
+        with c3:
+            st.metric("Skipped", skipped)
+        with c4:
+            st.metric("Declined (pricer/risk)", declined)
+
+        st.subheader("Skip / decline reason breakdown")
+        reasons = conn.execute(
+            "SELECT decision, COUNT(*) AS n FROM shadow_decisions "
+            "GROUP BY decision ORDER BY n DESC"
+        ).fetchall()
+        st.table([{"reason": r["decision"], "count": r["n"]} for r in reasons])
+
+        st.subheader("Stored draft quotes (status='shadow')")
+        drafts = conn.execute(
+            "SELECT quote_id, rfq_id, symbol, buy_price, sell_price, "
+            "buy_qty_decimal, sell_qty_decimal, model_version, "
+            "params_version, decided_by, created_time, input_snapshot_json "
+            "FROM quotes WHERE status = 'shadow' ORDER BY rowid"
+        ).fetchall()
+
+        def _fair(q):
+            try:
+                return json.loads(q["input_snapshot_json"] or "{}").get(
+                    "fair_value")
+            except (ValueError, TypeError):
+                return None
+
+        def _f(x, spec=".4f"):
+            return ("{:" + spec + "}").format(x) if x is not None else "-"
+
+        st.table(
+            [
+                {
+                    "quote_id": q["quote_id"],
+                    "rfq_id": q["rfq_id"],
+                    "fair": _f(_fair(q)),
+                    "buy (offer)": _f(q["buy_price"], ".3f"),
+                    "sell (bid)": _f(q["sell_price"], ".3f"),
+                    "buy qty": q["buy_qty_decimal"],
+                    "sell qty": q["sell_qty_decimal"],
+                    "model": q["model_version"],
+                    "params": q["params_version"],
+                    "decided at": q["created_time"],
+                    "decided by": q["decided_by"],
+                }
+                for q in drafts
+            ]
+        )
 
     conn.close()

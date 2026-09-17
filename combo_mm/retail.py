@@ -295,14 +295,10 @@ class RetailPollingSource(EventSource):
             if rid not in live_ids and not prev.get("terminal"):
                 # Absent from a full listing => treat like the durable
                 # GetRFQs(open) absence reconciliation: stop quoting.
-                # Stamp the inference with the poll time: the listing's last
-                # updatedTime is already stored, and the store only projects
-                # strictly newer updates, so reusing it would drop the close.
                 items.append(self._raw_item(
                     "rfq_closed", prev["fields"], now_iso,
                     client_derived=True,
-                    status=prev["fields"]["status"],
-                    updated_time=now_iso))
+                    status=prev["fields"]["status"]))
                 prev["terminal"] = True
                 log.info("retail RFQ %s disappeared from listing; "
                          "emitting client-derived rfq_closed", rid)
@@ -403,8 +399,17 @@ class RetailPollingSource(EventSource):
                   prev: Dict[str, Any]) -> bool:
         if fields["status"] != prev["status"]:
             return True
-        return RetailPollingSource._ts_advanced(fields["updated_time"],
-                                                prev["updated_time"])
+        new_ts, old_ts = fields["updated_time"], prev["updated_time"]
+        if not new_ts or new_ts == old_ts:
+            return False
+        if old_ts is None:
+            return True
+        # Parsed comparison: mixed ISO precisions (…01Z vs …01.100000Z)
+        # do not order correctly as raw strings.
+        new_dt, old_dt = _parse_ts(new_ts), _parse_ts(old_ts)
+        if new_dt is not None and old_dt is not None:
+            return new_dt > old_dt
+        return new_ts > old_ts
 
     def _handle_new_rfq(self, fields: Dict[str, Any],
                         now_iso: str) -> List[Dict[str, Any]]:
@@ -472,13 +477,6 @@ class RetailPollingSource(EventSource):
         rid = fields["rfq_id"]
         if prev.get("unmappable"):
             return []
-        # A status change can arrive without an updatedTime bump; the store
-        # ignores non-newer updates, so fall back to the poll time then.
-        ts_override = None
-        if (fields["status"] != prev["status"]
-                and not self._ts_advanced(fields["updated_time"],
-                                          prev["updated_time"])):
-            ts_override = now_iso
         prev.update(status=fields["status"],
                     updated_time=fields["updated_time"],
                     legs=fields["legs"] or prev["legs"],
@@ -487,39 +485,21 @@ class RetailPollingSource(EventSource):
         if fields["status"] == "EXPIRED":
             prev["terminal"] = True
             return [self._raw_item("rfq_expired", fields, now_iso,
-                                    client_derived=True,
-                                    updated_time=ts_override)]
+                                    client_derived=True)]
         if fields["status"] in _TERMINAL_STATUSES:
             prev["terminal"] = True
-            return [self._raw_item("rfq_closed", fields, now_iso,
-                                   updated_time=ts_override)]
-        return [self._raw_item("rfq_updated", fields, now_iso,
-                               updated_time=ts_override)]
-
-    @staticmethod
-    def _ts_advanced(new_ts: Optional[str], old_ts: Optional[str]) -> bool:
-        """True if ``new_ts`` is strictly later (parsed: mixed ISO precisions
-        such as ``…01Z`` vs ``…01.100000Z`` misorder as raw strings)."""
-        if not new_ts or new_ts == old_ts:
-            return False
-        if old_ts is None:
-            return True
-        new_dt, old_dt = _parse_ts(new_ts), _parse_ts(old_ts)
-        if new_dt is not None and old_dt is not None:
-            return new_dt > old_dt
-        return new_ts > old_ts
+            return [self._raw_item("rfq_closed", fields, now_iso)]
+        return [self._raw_item("rfq_updated", fields, now_iso)]
 
     def _raw_item(self, event_type: str, fields: Dict[str, Any],
                   now_iso: str, *, client_derived: bool = False,
-                  status: Optional[str] = None,
-                  updated_time: Optional[str] = None) -> Dict[str, Any]:
+                  status: Optional[str] = None) -> Dict[str, Any]:
         rid = fields["rfq_id"]
-        updated = updated_time or fields["updated_time"] or now_iso
         payload: Dict[str, Any] = {
             "id": rid,
             "symbol": fields["symbol"],
             "status": status or fields["status"],
-            "updatedTime": updated,
+            "updatedTime": fields["updated_time"] or now_iso,
             "comboLegs": [{"symbol": e["symbol"], "side": e["side"]}
                           for e in fields["legs"] if e["side"]],
         }
@@ -535,9 +515,10 @@ class RetailPollingSource(EventSource):
             "raw": {
                 "event_type": event_type,
                 # Deterministic: re-polls of the same change dedupe in store.
-                "event_id": f"retail:{rid}:{event_type}:{updated}",
+                "event_id": f"retail:{rid}:{event_type}:"
+                            f"{fields['updated_time'] or now_iso}",
                 "rfq_id": rid,
-                "exchange_ts": updated,
+                "exchange_ts": fields["updated_time"] or now_iso,
                 "payload": payload,
             },
         }

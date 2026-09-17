@@ -5,10 +5,11 @@ contract: RFQ stream ingestion (empty request, Bearer auth), normalization
 with exact wire shapes, append-only event storage with idempotent
 projections, reconnect + recovery in the contract-mandated order, Drop Copy
 fill reconciliation, auth structure (RS256 Private Key JWT -> Auth0), the V1
-independent-leg pricer, shadow quoting (paper only), paper metrics, and the
-Streamlit dashboard.
+independent-leg pricer, the shadow quoting engine (paper only), paper
+metrics, and the Streamlit dashboard.
 
-Parked (not implemented here): correlation model, inventory/risk engine,
+Parked (not implemented here): correlation model, full inventory/risk engine
+(a conservative hard-cap placeholder stands in behind the risk seam),
 production quoting, formal backtest.
 """
 
@@ -59,7 +60,37 @@ from combo_mm.pricing import (
     QuoteDecision,
     price_combo,
 )
-from combo_mm.shadow import MODEL_VERSION as SHADOW_MODEL_VERSION, ShadowQuoter
+from combo_mm.pricer import (
+    MODEL_VERSION as PRICER_MODEL_VERSION,
+    Pricer,
+    PricerResult,
+    V1NaivePricer,
+)
+from combo_mm.risk import (
+    RISK_CAPITAL,
+    RISK_GAME_EXPOSURE,
+    RISK_OK,
+    RISK_SIZE_REDUCED,
+    ConservativeRiskCheck,
+    InventoryState,
+    RiskCheck,
+    RiskVerdict,
+)
+from combo_mm.eligibility import (
+    SKIP_NO_LEGS,
+    SKIP_NO_RFQ,
+    SKIP_RFQ_CLOSED,
+    SKIP_STALE_RFQ,
+    Eligibility,
+    check_eligibility,
+)
+from combo_mm.engine import (
+    DECIDED_BY as SHADOW_DECIDED_BY,
+    ENGINE_VERSION as SHADOW_ENGINE_VERSION,
+    DraftQuote,
+    PaperModeError,
+    ShadowQuotingEngine,
+)
 from combo_mm import fixtures, paper_backtest, replay
 
 __all__ = [
@@ -105,8 +136,29 @@ __all__ = [
     "LegMarkInput",
     "QuoteDecision",
     "price_combo",
-    "SHADOW_MODEL_VERSION",
-    "ShadowQuoter",
+    "PRICER_MODEL_VERSION",
+    "Pricer",
+    "PricerResult",
+    "V1NaivePricer",
+    "RISK_CAPITAL",
+    "RISK_GAME_EXPOSURE",
+    "RISK_OK",
+    "RISK_SIZE_REDUCED",
+    "ConservativeRiskCheck",
+    "InventoryState",
+    "RiskCheck",
+    "RiskVerdict",
+    "SKIP_NO_LEGS",
+    "SKIP_NO_RFQ",
+    "SKIP_RFQ_CLOSED",
+    "SKIP_STALE_RFQ",
+    "Eligibility",
+    "check_eligibility",
+    "SHADOW_DECIDED_BY",
+    "SHADOW_ENGINE_VERSION",
+    "DraftQuote",
+    "PaperModeError",
+    "ShadowQuotingEngine",
     "fixtures",
     "paper_backtest",
     "replay",
