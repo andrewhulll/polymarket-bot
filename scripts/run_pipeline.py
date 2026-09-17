@@ -24,7 +24,7 @@ from combo_mm import (  # noqa: E402
     LegBookCache,
     PipelineConfig,
     ReferenceCache,
-    ShadowQuoter,
+    ShadowQuotingEngine,
     SimulatedDropCopyTransport,
     SimulatedTransport,
     StreamConsumer,
@@ -44,7 +44,13 @@ def main() -> None:
     store = EventStore(config.db_path)
     books = LegBookCache(staleness_ms=config.staleness_ms)
     reference = ReferenceCache(transport, ttl_s=config.reference_ttl_s)
-    quoter = ShadowQuoter(store, books, reference, config)
+    engine = ShadowQuotingEngine(store, books, reference, config,
+                                 params_version=config.params_version)
+
+    # Dedupe on the stable event key: the dispatch below replays items for
+    # every delivery (including redeliveries), and quoting the same event
+    # twice would mint a spurious second draft.
+    seen_keys = set()
 
     def on_event(item) -> None:
         kind = item.get("kind")
@@ -60,7 +66,10 @@ def main() -> None:
                     event = normalize(raw)
                 except Exception:
                     return
-                quoter.maybe_quote(event)
+                if event.event_key in seen_keys:
+                    return
+                seen_keys.add(event.event_key)
+                engine.maybe_quote(event)
 
     expected = len([i for i in session
                     if i.get("kind") in ("book", "event")
@@ -81,14 +90,12 @@ def main() -> None:
         print(f"WARNING: only {consumer.events_seen}/{expected} items consumed")
 
     # Fills reconcile exclusively through Drop Copy.
-    fills_before = store.get_fill_stats()["fills"]
-    resume_token = drain_drop_copy(
+    n_fills = drain_drop_copy(
         SimulatedDropCopyTransport(fixtures.build_drop_copy_feed()),
         store,
         now=fixtures.BASE_TS,
     )
-    n_fills = store.get_fill_stats()["fills"] - fills_before
-    print(f"drop copy: {n_fills} fills applied (resume_token={resume_token})")
+    print(f"drop copy: {n_fills} fills applied")
 
     print("\n=== pipeline summary ===")
     print(f"items seen:           {consumer.events_seen}")

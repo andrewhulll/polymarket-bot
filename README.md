@@ -115,7 +115,10 @@ Sensitivity to correlation.
 | `auth.py` | Private-Key-JWT → Auth0 structure for the Exchange API (RS256, 3-minute refresh, key rotation, gRPC error mapping). Stubbed — no network, no credentials. |
 | `retail.py` | `RetailPollingSource`: Retail REST polling adapter (RFQ list/detail diffing, leg book/BBO refresh, beta-gate fallback). See “Retail live data”. |
 | `pricing.py` | Minimal V1 independent-leg pricer (pure, no I/O): bounded microprice / midpoint leg marks, `fair = product(q_i)`, spread = base edge + uncertainty + depth + event risk + buffer, tick rounding, side `"0"` suppression, structured reason codes. |
-| `shadow.py` | Shadow quoter: computes V1 draft quotes for eligible RFQs, stores them in `quote_decisions`, never submits. |
+| `pricer.py` | Pricer seam (issue #2): `Pricer` protocol + `PricerResult`; `V1NaivePricer` adapts `price_combo`. The MVN pricer implements the same interface with zero engine changes. |
+| `risk.py` | Risk seam (issue #3): `RiskCheck` protocol + `InventoryState` / `RiskVerdict`; `ConservativeRiskCheck` enforces per-RFQ / per-game / capital hard caps (shrink or reject). The full risk module replaces it behind the same interface. |
+| `eligibility.py` | Pure pre-pricing eligibility filter: event type → RFQ present → status terminal → legs present → exchange-time staleness. Skip reasons `SKIP_NO_RFQ` / `SKIP_RFQ_CLOSED` / `SKIP_NO_LEGS` / `SKIP_STALE_RFQ`. |
+| `engine.py` | Shadow quoting engine (issue #4): eligibility → pricer → risk → two-sided draft quote, stored in `quotes` (`status='shadow'`, `origin='shadow'`) with a full reproducible input snapshot. Paper-only: no call path to any outbound RPC, `PaperModeError` unless `paper_mode=True`. |
 | `paper_backtest.py` | Replay-based paper backtest over fixture/simulated sessions: counts, rates, expected vs realized P&L, swings, exposure over time. No future information (books filtered to `updated_at <= event time`). |
 | `fixtures.py` | Scripted sessions: full lifecycle flows, cancelled/expired RFQs, the `rfq_closed` race, duplicate + out-of-order deliveries, a mid-stream disconnect, and a missed `rfq_closed` only recovery can catch. |
 | `replay.py` | Deterministic replay harness (virtual clock) producing state digests for byte-for-byte comparison. |
@@ -177,6 +180,59 @@ Key semantics (per the real contract):
   `width_weight = 0.5`, `depth_slope_bps = 20`, `event_risk_bps = 5`,
   `operational_buffer_bps = 5`, `tick_size = 0.001`, `price_min/max = 0.001/0.999`,
   `min_qty = 1.0`.
+- Shadow engine: `max_per_rfq_notional = 1000.0`, `max_per_game_notional = 5000.0`,
+  `initial_capital = 50000.0`, `stale_rfq_ms = 60000`, `params_version = "unversioned"`.
+
+## Shadow quoting engine
+
+The always-on paper-trading loop (issue #4). For every `rfq_created` / `rfq_updated`
+event the engine runs four stages:
+
+1. **Eligibility** (`eligibility.py`, pure function) — event type → RFQ present →
+   status terminal → legs present (inline or reference fallback) → exchange-time
+   staleness. Skips are logged per RFQ (`SKIP_NO_RFQ`, `SKIP_RFQ_CLOSED`,
+   `SKIP_NO_LEGS`, `SKIP_STALE_RFQ`); anything else is ignored silently.
+2. **Pricing** (`pricer.py`, the #2 seam) — any `Pricer` implementation prices the
+   legs into a `PricerResult` (fair value, marginals, correlation adjustment,
+   confidence, decline reason). `V1NaivePricer` adapts the existing independent-leg
+   `price_combo`; the MVN pricer will implement the same interface with zero
+   engine changes.
+3. **Risk** (`risk.py`, the #3 seam) — any `RiskCheck` implementation verdicts the
+   draft against the quoted notional and the `InventoryState`. `ConservativeRiskCheck`
+   shrinks both sides proportionally past the per-RFQ cap (`RISK_SIZE_REDUCED`),
+   rejects past the per-game cap (`RISK_GAME_EXPOSURE`) or total capital
+   (`RISK_CAPITAL`).
+4. **Draft** — a two-sided `DraftQuote` with a deterministic id
+   (`shdw-<rfq_id>-<n>`), stored in the `quotes` table with `status='shadow'` and
+   `origin='shadow'` (the `CHECK (origin IN ('shadow','live'))` constraint makes
+   live vs shadow unmistakable). Every draft carries its full input snapshot as
+   canonical JSON — leg marks/prices, model and params versions, inventory state,
+   spread and risk knobs — so any draft is reproducible byte-for-byte.
+
+Every outcome (quote, pricer decline, risk decline, eligibility skip) also lands
+in `shadow_decisions` with its reason code, which powers the dashboard's
+**Engine status** tab: RFQs seen vs quoted vs skipped, the skip-reason breakdown,
+and the stored drafts table.
+
+**Safety guarantees (hard requirements):**
+
+- No code path from the engine to any order-submission endpoint — the module has
+  no transport reference and no quoting client to import (the retail adapter is
+  read-only). A source scan test asserts the engine, pricer, risk, and
+  eligibility modules contain none of `create_quote`, `CreateQuote`,
+  `submit_order`, `place_order`, `post_order`, `grpc`, `http.client`, `requests.`.
+- `PAPER_MODE` guard: constructing `ShadowQuotingEngine` with
+  `paper_mode=False` raises `PaperModeError` — quoting logic refuses to run
+  without explicit live-trading scaffolding, which does not exist.
+- All timestamps are exchange/virtual time (`event.event_at`); the engine never
+  reads the wall clock, so fixture replays are deterministic.
+
+Run it:
+
+```bash
+python3 scripts/run_pipeline.py        # scripted session through the consumer
+python3 -m pytest tests/test_shadow_engine.py -q   # determinism + safety tests
+```
 
 ## Running
 
@@ -206,9 +262,8 @@ session into a SQLite DB, then browse:
 4. **NFL correlation** — independent of the simulation button; see
    [NFL correlation pipeline](#nfl-correlation-pipeline-issue-6).
 
-The dashboard currently replays the **simulated feed only**. A Retail-live data-source selector is
-planned but not yet wired into `dashboard/app.py`; to exercise the Retail path today, drive
-`RetailPollingSource` through `PollingConsumer` directly (see below).
+A data-source selector offers **Simulated feed** (default) vs **Retail live** (activates only when
+both retail env vars are set; otherwise it says so and stays simulated).
 
 ## NFL correlation pipeline (issue #6)
 
@@ -297,11 +352,14 @@ Rules (enforced by tests):
 - The Secure Vault cannot store this key/secret scheme — env vars are the
   only supported route.
 
-### Streamlit toggle (not yet implemented)
+### Streamlit toggle
 
-Planned: a dashboard data-source selector — **Simulated feed** (default) vs **Retail live**, the
-latter activating only when *both* env vars are set and never displaying credential values. It is
-**not** in `dashboard/app.py` yet; today the dashboard always runs the simulated replay.
+The dashboard offers a data-source selector:
+
+- **Simulated feed** (default)
+- **Retail live** — activates only if *both* env vars are set. Otherwise the
+  dashboard says so plainly, asks you to set the two env vars, and stays on
+  the simulated feed. Credential values are never displayed.
 
 ### How live polling works
 
@@ -368,12 +426,7 @@ pick up the RFQ beta on the next successful poll.
 export POLYMARKET_US_KEY_ID="..."
 export POLYMARKET_US_SECRET_KEY="..."
 pip install polymarket-us
-python3 -c "
-from combo_mm import EventStore, PollingConsumer, RetailPollingSource
-store = EventStore('retail.db')
-PollingConsumer(RetailPollingSource(), store).poll_once()
-print(store.get_rfq_stats(), store.get_book_stats())
-"
+# run the dashboard / poller with "Retail live" selected
 ```
 
 Tests are all mocked (no network, no real credentials):

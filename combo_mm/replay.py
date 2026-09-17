@@ -3,9 +3,8 @@
 Feeds session items through the pipeline with a virtual clock (no wall-clock
 dependence): book snapshots update the cache + store, events normalize with
 ``received_at = base + t`` and apply through the exactly-once write path,
-and the shadow quoter prices each new/updated RFQ. Used by tests and the demo
-script. Returns the state digest plus counters.
-
+and the shadow quoting engine prices each new/updated RFQ. Used by tests
+and the demo script. Returns the state digest plus counters.
 :param include_stream_invisible: when True, stream-invisible events are also
     replayed (full-information replay, e.g. for the backtest). When False,
     only what the stream would deliver is replayed (recovery is then needed
@@ -23,10 +22,10 @@ from typing import Any, Dict, List, Optional
 from combo_mm.books import LegBookCache
 from combo_mm.config import PipelineConfig
 from combo_mm.dropcopy import SimulatedDropCopyTransport, drain_drop_copy
+from combo_mm.engine import ShadowQuotingEngine
 from combo_mm.fixtures import BASE_TS, SELF_USER_ID
 from combo_mm.normalize import normalize
 from combo_mm.reference import ReferenceCache
-from combo_mm.shadow import ShadowQuoter
 from combo_mm.store import EventStore
 from combo_mm.stream import SimulatedTransport
 
@@ -59,7 +58,9 @@ def replay_session(session: List[Dict[str, Any]],
     transport = SimulatedTransport(session, self_user_id, combos)
     books = books or LegBookCache(staleness_ms=config.staleness_ms)
     reference = ReferenceCache(transport, ttl_s=config.reference_ttl_s)
-    quoter = ShadowQuoter(store, books, reference, config) if enable_shadow else None
+    engine = (ShadowQuotingEngine(store, books, reference, config,
+                                  params_version=config.params_version)
+              if enable_shadow else None)
 
     counters = {"events": 0, "duplicates": 0, "books": 0, "decisions": 0}
     for item in sorted(session, key=lambda i: i.get("t", 0)):
@@ -86,9 +87,11 @@ def replay_session(session: List[Dict[str, Any]],
         event = normalize(item["raw"], now=now)
         if store.apply(event):
             counters["events"] += 1
-            if quoter is not None and event.event_type in ("rfq_created", "rfq_updated"):
-                if quoter.maybe_quote(event) is not None:
-                    counters["decisions"] += 1
+            if engine is not None and event.event_type in ("rfq_created", "rfq_updated"):
+                # One engine run == one shadow_decisions row (quote, decline,
+                # or skip).
+                engine.maybe_quote(event)
+                counters["decisions"] += 1
         else:
             counters["duplicates"] += 1
 
