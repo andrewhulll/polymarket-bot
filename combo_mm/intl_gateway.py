@@ -49,8 +49,8 @@ Mapping notes (gateway -> pipeline normalized events):
   the normalized event.
 
 Credentials come from the runtime environment only
-(``POLY_API_KEY``, ``POLY_API_SECRET``, ``POLY_API_PASSPHRASE``,
-``POLY_WALLET_ADDRESS``), optionally via a gitignored local ``.env`` that
+(``POLYMARKET_API_KEY``, ``POLYMARKET_SECRET``, ``POLYMARKET_PASSPHRASE``,
+``POLYMARKET_ADDRESS``), optionally via a gitignored local ``.env`` that
 never overrides real environment variables. Secrets are never logged,
 persisted, or committed -- see README "Live international RFQ feed".
 """
@@ -90,10 +90,10 @@ DEFAULT_GATEWAY_URL = "wss://combos-rfq-gateway-quoter.polymarket.com/ws/rfq"
 
 #: Environment variables carrying the international API credentials.
 GATEWAY_ENV_VARS = (
-    "POLY_API_KEY",
-    "POLY_API_SECRET",
-    "POLY_API_PASSPHRASE",
-    "POLY_WALLET_ADDRESS",
+    "POLYMARKET_API_KEY",
+    "POLYMARKET_SECRET",
+    "POLYMARKET_PASSPHRASE",
+    "POLYMARKET_ADDRESS",
 )
 
 _E6 = Decimal(1_000_000)
@@ -205,10 +205,10 @@ class GatewayCredentials:
                 ".env file); never commit them."
             )
         return cls(
-            api_key=str(source["POLY_API_KEY"]),
-            api_secret=str(source["POLY_API_SECRET"]),
-            api_passphrase=str(source["POLY_API_PASSPHRASE"]),
-            wallet_address=str(source["POLY_WALLET_ADDRESS"]),
+            api_key=str(source["POLYMARKET_API_KEY"]),
+            api_secret=str(source["POLYMARKET_SECRET"]),
+            api_passphrase=str(source["POLYMARKET_PASSPHRASE"]),
+            wallet_address=str(source["POLYMARKET_ADDRESS"]),
         )
 
 

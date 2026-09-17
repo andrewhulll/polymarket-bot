@@ -498,10 +498,10 @@ pip install websockets
 From the **runtime environment only**:
 
 ```bash
-export POLY_API_KEY="..."
-export POLY_API_SECRET="..."
-export POLY_API_PASSPHRASE="..."
-export POLY_WALLET_ADDRESS="0x..."
+export POLYMARKET_API_KEY="..."
+export POLYMARKET_SECRET="..."
+export POLYMARKET_PASSPHRASE="..."
+export POLYMARKET_ADDRESS="0x..."
 ```
 
 Create these on polymarket.com (profile → Settings → API keys; requires a

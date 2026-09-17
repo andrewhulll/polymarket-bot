@@ -137,10 +137,10 @@ def test_map_rfq_trade_rejects_missing_id():
 
 def test_credentials_from_env_ok():
     env = {
-        "POLY_API_KEY": "key-abc-123",
-        "POLY_API_SECRET": "secret-def-456",
-        "POLY_API_PASSPHRASE": "phrase-ghi-789",
-        "POLY_WALLET_ADDRESS": "0xabc",
+        "POLYMARKET_API_KEY": "key-abc-123",
+        "POLYMARKET_SECRET": "secret-def-456",
+        "POLYMARKET_PASSPHRASE": "phrase-ghi-789",
+        "POLYMARKET_ADDRESS": "0xabc",
     }
     creds = GatewayCredentials.from_env(env=env)
     assert creds.api_key == "key-abc-123"
@@ -152,16 +152,16 @@ def test_credentials_from_env_ok():
 
 def test_credentials_missing_names_the_var():
     with pytest.raises(MissingCredentialsError) as excinfo:
-        GatewayCredentials.from_env(env={"POLY_API_KEY": "k"})
+        GatewayCredentials.from_env(env={"POLYMARKET_API_KEY": "k"})
     msg = str(excinfo.value)
-    assert "POLY_API_SECRET" in msg and "POLY_WALLET_ADDRESS" in msg
+    assert "POLYMARKET_SECRET" in msg and "POLYMARKET_ADDRESS" in msg
 
 
 def test_credentials_dotenv_fills_gaps(tmp_path):
     dotenv = tmp_path / ".env"
     dotenv.write_text(
-        "# comment\nPOLY_API_KEY=k\nPOLY_API_SECRET='s'\n"
-        'POLY_API_PASSPHRASE="p"\nPOLY_WALLET_ADDRESS=0xabc\n'
+        "# comment\nPOLYMARKET_API_KEY=k\nPOLYMARKET_SECRET='s'\n"
+        'POLYMARKET_PASSPHRASE="p"\nPOLYMARKET_ADDRESS=0xabc\n'
     )
     creds = GatewayCredentials.from_env(env={}, dotenv_path=dotenv)
     assert (creds.api_key, creds.api_secret, creds.api_passphrase) == ("k", "s", "p")
@@ -169,17 +169,17 @@ def test_credentials_dotenv_fills_gaps(tmp_path):
 
 def test_credentials_env_wins_over_dotenv(tmp_path):
     dotenv = tmp_path / ".env"
-    dotenv.write_text("POLY_API_KEY=fromfile\nPOLY_API_SECRET=s\n")
+    dotenv.write_text("POLYMARKET_API_KEY=fromfile\nPOLYMARKET_SECRET=s\n")
     # File alone cannot satisfy the four required vars...
     with pytest.raises(MissingCredentialsError):
         GatewayCredentials.from_env(env={}, dotenv_path=dotenv)
     # ...but the real environment fills the gap and wins over the file.
     creds = GatewayCredentials.from_env(
         env={
-            "POLY_API_KEY": "fromenv",
-            "POLY_API_SECRET": "s",
-            "POLY_API_PASSPHRASE": "p",
-            "POLY_WALLET_ADDRESS": "0xabc",
+            "POLYMARKET_API_KEY": "fromenv",
+            "POLYMARKET_SECRET": "s",
+            "POLYMARKET_PASSPHRASE": "p",
+            "POLYMARKET_ADDRESS": "0xabc",
         },
         dotenv_path=dotenv,
     )

@@ -22,8 +22,8 @@ STATE_KEY = "live_intl"
 MISSING_KEYS_MSG = (
     "Live international feed needs API keys. Set these environment variables "
     "(or put them in a gitignored `.env` file in the repo root) and press the "
-    "button again: `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_API_PASSPHRASE`, "
-    "`POLY_WALLET_ADDRESS`. Keys are read from your environment only -- they "
+    "button again: `POLYMARKET_API_KEY`, `POLYMARKET_SECRET`, `POLYMARKET_PASSPHRASE`, "
+    "`POLYMARKET_ADDRESS`. Keys are read from your environment only -- they "
     "are never displayed, logged, or committed."
 )
 
