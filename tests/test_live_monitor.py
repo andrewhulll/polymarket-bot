@@ -1,7 +1,8 @@
 """LiveMonitor: poll -> store -> shadow engine, failures recorded not raised."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from combo_mm.combo_markets import ComboMarketCatalog, parse_catalog_page
+from combo_mm.config import PipelineConfig
 from combo_mm.intl_gateway import map_rfq_request, map_rfq_trade
 from combo_mm.live_monitor import LiveMonitor
 from combo_mm.quote_selections import QuoteSelectionStore
@@ -71,6 +72,30 @@ def test_duplicate_rfq_is_not_requoted():
     monitor.poll_once(NOW)
     assert monitor.events_applied == 1
     assert len(store.get_shadow_decisions()) == 1
+
+
+def test_quote_latency_over_budget_is_flagged():
+    """An RFQ decided 250ms after it posted breaches a 100ms budget."""
+    store = EventStore()
+    config = PipelineConfig(quote_latency_budget_ms=100)
+    monitor = LiveMonitor(FakeSource([[_book("KC-ML", 0.60, 0.62), _book("KC-OVER", 0.49, 0.51),
+                                       _rfq("R1")]]), store, config)
+    monitor.poll_once(NOW + timedelta(milliseconds=250))
+    lat = store.get_latency_stats()
+    assert lat["count"] == 1
+    assert lat["breaches"] == 1
+    assert 240 <= lat["last_ms"] <= 260
+
+
+def test_quote_latency_within_budget_is_not_flagged():
+    store = EventStore()
+    config = PipelineConfig(quote_latency_budget_ms=1000)
+    monitor = LiveMonitor(FakeSource([[_book("KC-ML", 0.60, 0.62), _book("KC-OVER", 0.49, 0.51),
+                                       _rfq("R1")]]), store, config)
+    monitor.poll_once(NOW + timedelta(milliseconds=50))
+    lat = store.get_latency_stats()
+    assert lat["count"] == 1
+    assert lat["breaches"] == 0
 
 
 def test_source_failure_is_recorded_not_raised():

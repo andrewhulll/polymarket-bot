@@ -28,6 +28,10 @@ class PipelineConfig:
     # --- Retail polling knobs (live polling path only) ---
     poll_interval_s: float = 5.0       # seconds between Retail REST polls
     max_requests_per_poll: int = 10    # request budget per poll (reads only)
+    # Wall-clock budget from an RFQ posting to us deciding whether to quote
+    # it (live monitor only -- see combo_mm.live_monitor). Missing this
+    # budget means we likely lose the RFQ to a faster maker.
+    quote_latency_budget_ms: int = 400
     # --- V1 pricer knobs (spread components, basis points unless noted) ---
     base_edge_bps: float = 15.0
     uncertainty_per_leg_bps: float = 5.0
@@ -71,6 +75,9 @@ class PipelineConfig:
             raise ValueError("poll_interval_s must be positive")
         if not isinstance(self.max_requests_per_poll, int) or self.max_requests_per_poll < 1:
             raise ValueError("max_requests_per_poll must be an int >= 1")
+        if (not isinstance(self.quote_latency_budget_ms, int)
+                or self.quote_latency_budget_ms <= 0):
+            raise ValueError("quote_latency_budget_ms must be a positive int")
         for name in ("base_edge_bps", "uncertainty_per_leg_bps", "width_weight",
                      "depth_slope_bps", "event_risk_bps",
                      "operational_buffer_bps"):

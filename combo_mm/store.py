@@ -250,6 +250,25 @@ class EventStore:
                 CREATE INDEX IF NOT EXISTS idx_screen_rank_seq ON rfq_screen(rank, seq);
                 CREATE INDEX IF NOT EXISTS idx_screen_unresolved
                     ON rfq_screen(catalog_version) WHERE n_resolved < n_legs;
+
+                -- Live-only wall-clock latency samples: how long from an RFQ
+                -- posting to us deciding whether to quote it
+                -- (combo_mm.live_monitor). Never written by replay/backtest
+                -- (virtual time has no real elapsed wall clock), so this is
+                -- deliberately excluded from state_digest().
+                CREATE TABLE IF NOT EXISTS quote_latency (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rfq_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    posted_at TEXT NOT NULL,
+                    decided_at TEXT NOT NULL,
+                    latency_ms REAL NOT NULL,
+                    quoted INTEGER NOT NULL,
+                    over_budget INTEGER NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'live'
+                );
+                CREATE INDEX IF NOT EXISTS idx_latency_over_budget
+                    ON quote_latency(over_budget);
                 """
             )
             # Migration for DBs created before the shadow-engine columns
@@ -1065,6 +1084,54 @@ class EventStore:
                 "SELECT decision, COUNT(*) AS n FROM shadow_decisions "
                 "GROUP BY decision").fetchall()
             return {r["decision"]: r["n"] for r in rows}
+
+    # -- quote latency (live only) ---------------------------------------------
+    def record_quote_latency(self, *, rfq_id: str, event_type: str,
+                             posted_at: str, decided_at: str,
+                             latency_ms: float, quoted: bool,
+                             over_budget: bool, source: str = "live") -> None:
+        """One live wall-clock sample: ``decided_at`` minus the RFQ's posted time.
+
+        Live-only (see :mod:`combo_mm.live_monitor`); replay/backtest never
+        calls this.
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO quote_latency
+                    (rfq_id, event_type, posted_at, decided_at, latency_ms,
+                     quoted, over_budget, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (rfq_id, event_type, posted_at, decided_at, latency_ms,
+                 1 if quoted else 0, 1 if over_budget else 0, source),
+            )
+
+    def get_latency_stats(self, limit: int = 5000) -> Dict[str, Any]:
+        """Rolling stats over the most recent ``limit`` latency samples."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT latency_ms, over_budget FROM quote_latency "
+                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        if not rows:
+            return {"count": 0, "last_ms": None, "p50_ms": None, "p95_ms": None,
+                    "max_ms": None, "breaches": 0, "breach_rate": None}
+        latencies = sorted(r["latency_ms"] for r in rows)
+        n = len(latencies)
+
+        def pct(p: float) -> float:
+            return latencies[min(n - 1, int(p * n))]
+
+        breaches = sum(1 for r in rows if r["over_budget"])
+        return {
+            "count": n,
+            "last_ms": rows[0]["latency_ms"],  # rows are newest-first
+            "p50_ms": pct(0.50),
+            "p95_ms": pct(0.95),
+            "max_ms": latencies[-1],
+            "breaches": breaches,
+            "breach_rate": breaches / n,
+        }
 
     # -- live RFQ screen -------------------------------------------------------
     def upsert_rfq_screen(self, rfq_id: str, *, n_legs: int, n_resolved: int,

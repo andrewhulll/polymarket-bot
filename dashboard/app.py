@@ -313,6 +313,20 @@ def _live_status() -> None:
         pricing_note = "V1 independent-leg pricer (live symbols are not mapped to the NFL model yet)"
     st.caption(f"Source: {run['source']} (receive-only) · last poll: {monitor.last_poll_at} · "
                f"every {run['poll_interval_s']:.0f}s · {pricing_note}.")
+
+    budget_ms = monitor.config.quote_latency_budget_ms
+    lat = monitor.store.get_latency_stats()
+    if lat["count"]:
+        lc1, lc2, lc3, lc4 = st.columns(4)
+        lc1.metric("Quote latency (last)", f"{lat['last_ms']:.0f} ms")
+        lc2.metric("Quote latency (p95)", f"{lat['p95_ms']:.0f} ms")
+        lc3.metric("Quote latency (max)", f"{lat['max_ms']:.0f} ms")
+        lc4.metric(f"Over {budget_ms}ms budget", f"{lat['breaches']}/{lat['count']}",
+                  delta=f"{lat['breach_rate']:.0%}", delta_color="inverse")
+        if lat["breach_rate"]:
+            st.warning(f"{lat['breaches']} of the last {lat['count']} RFQs took longer than "
+                       f"{budget_ms}ms from posting to our decision -- those are too slow to "
+                       "win the contract.")
     catalog = monitor.catalog
     if catalog is not None:
         state = ("crawling" if catalog.refreshing else
@@ -888,6 +902,28 @@ def _engine_view(r: Dict[str, Any]) -> None:
         reasons = conn.execute("SELECT decision, COUNT(*) AS n FROM shadow_decisions "
                                "GROUP BY decision ORDER BY n DESC").fetchall()
         st.table([{"reason": x["decision"], "count": x["n"]} for x in reasons])
+
+        st.subheader("Quote latency: RFQ posted -> we decided (live feed only)")
+        lat_rows = conn.execute(
+            "SELECT latency_ms, over_budget FROM quote_latency "
+            "ORDER BY id DESC LIMIT 5000").fetchall()
+        if lat_rows:
+            latencies = sorted(x["latency_ms"] for x in lat_rows)
+            n = len(latencies)
+
+            def pct(p: float) -> float:
+                return latencies[min(n - 1, int(p * n))]
+
+            breaches = sum(1 for x in lat_rows if x["over_budget"])
+            budget_ms = r.get("monitor").config.quote_latency_budget_ms if r.get("monitor") else 400
+            lc1, lc2, lc3, lc4 = st.columns(4)
+            lc1.metric("Samples", n)
+            lc2.metric("p50", f"{pct(0.50):.0f} ms")
+            lc3.metric("p95", f"{pct(0.95):.0f} ms")
+            lc4.metric(f"Over {budget_ms}ms", f"{breaches} ({breaches / n:.0%})")
+        else:
+            st.caption("No live latency samples yet -- this is only measured on the live "
+                       "feed (backtest replay uses virtual time, not the real clock).")
 
         st.subheader("Stored draft quotes (status='shadow')")
         drafts = conn.execute(
