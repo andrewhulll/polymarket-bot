@@ -5,22 +5,27 @@ without raising, and the 5-tab bar must be present. Skipped when streamlit
 isn't importable (e.g. minimal CI images); the CI workflow installs it.
 """
 import pytest
+from pathlib import Path
 
 streamlit = pytest.importorskip("streamlit")
 AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
+
+# AppTest.from_file resolves relative paths against the calling test file
+# (tests/), not the repo root, so resolve dashboard/app.py absolutely.
+APP_PATH = Path(__file__).resolve().parents[1] / "dashboard" / "app.py"
 
 EXPECTED_TABS = ["RFQs", "Pricing & quoting", "Performance",
                  "Engine status", "NFL correlation"]
 
 
 def test_dashboard_renders_without_exceptions():
-    at = AppTest.from_file("dashboard/app.py")
+    at = AppTest.from_file(str(APP_PATH))
     at.run()
     assert not at.exception, f"dashboard raised: {at.exception!r}"
 
 
 def test_dashboard_has_five_tabs():
-    at = AppTest.from_file("dashboard/app.py")
+    at = AppTest.from_file(str(APP_PATH))
     at.run()
     assert not at.exception, f"dashboard raised: {at.exception!r}"
     assert len(at.tabs) == 5, f"expected 5 tabs, got {len(at.tabs)}"
