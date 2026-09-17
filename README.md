@@ -247,23 +247,37 @@ python3 scripts/run_pipeline.py
 streamlit run dashboard/app.py
 ```
 
-The dashboard opens with a PAPER/SHADOW banner. Press **Run simulation** to replay the scripted
-session into a SQLite DB, then browse:
+The dashboard opens with a PAPER/SHADOW banner and two controls at the top:
 
-1. **RFQs** — every RFQ request, each expandable to full detail (combo symbol, legs with market
-   symbol / side / settlement value, size mode and quantity, timestamps, lifecycle state,
-   requester ID).
-2. **Pricing & quoting** — per RFQ: V1 fair combo price, quoted buy/sell prices, size, expected
-   edge, and a human-readable explanation of each pricing adjustment (spread components +
-   reason code).
-3. **Performance** — paper/shadow replay metrics: RFQs received/quoted/rejected/expired/executed,
-   quote and execution rates, expected vs realized P&L, max downswing/upswing, inventory/exposure
-   over time.
-4. **NFL correlation** — independent of the simulation button; see
+- **Run backtest — NFL 2026 Week 1** — replays every same-game combo (2–3 legs of ML / spread /
+  total, 17 combo types) from the week's 16 games as RFQs through the real pipeline
+  (`combo_mm/nfl/week_backtest.py`). Leg books are one cent wide around the de-vigged closing
+  prices; params are estimated walk-forward from games before Week 1 with the frozen estimator.
+  The shadow engine prices each RFQ with the NFL joint model (`combo_mm/nfl/joint_pricer.py`), a
+  naive independent-leg maker quotes the same RFQ, and the requester (about 3 in 4 buy) trades
+  with the better price. Trades produce the full quote lifecycle and a fill, then settle on the
+  final score; a pushed leg voids the combo. Needs the cached nflverse pull under `data/raw`
+  (`python scripts/refresh_params.py --pull`). Deterministic; about 5 seconds.
+- **Live monitor RFQ feed** — polls the Retail API every `poll_interval_s` through the same store
+  and shadow engine (`combo_mm/live_monitor.py`), auto-refreshing the views; **Stop live monitor**
+  keeps the data. Needs the two retail env vars and `pip install polymarket-us` (see
+  [Retail live data](#retail-live-data)). There is no simulated fallback: without credentials,
+  the SDK, or RFQ beta access, the dashboard says which is missing. Live RFQs are priced by the V1
+  pricer until Polymarket leg symbols are mapped to the NFL model.
+
+Views (all read the active run):
+
+1. **RFQs** — the Week 1 historical RFQs or the live feed: filterable table (game, status) with
+   combo, size, requester side, naive vs model fair, our trade price, result and P&L; per-RFQ
+   detail with legs, settlement values, our quote vs the naive maker's, and lifecycle events.
+2. **Pricing & quoting** — every shadow decision: naive product vs model fair, correlation
+   adjustment, quoted bid/offer, size, expected edge, and each spread component.
+3. **Performance** — RFQs received/quoted/executed, win rate vs the naive maker, expected (model
+   edge on trades) vs realized P&L, max downswing/upswing, P&L and exposure over time, and for
+   the backtest results by combo family, combo size, requester side and game.
+4. **Engine status** — shadow engine health, skip/decline reasons, stored drafts.
+5. **NFL correlation** — independent of the controls; see
    [NFL correlation pipeline](#nfl-correlation-pipeline-issue-6).
-
-A data-source selector offers **Simulated feed** (default) vs **Retail live** (activates only when
-both retail env vars are set; otherwise it says so and stays simulated).
 
 ## NFL correlation pipeline (issue #6)
 
@@ -363,14 +377,12 @@ Rules (enforced by tests):
 - The Secure Vault cannot store this key/secret scheme — env vars are the
   only supported route.
 
-### Streamlit toggle
+### Dashboard live monitor
 
-The dashboard offers a data-source selector:
-
-- **Simulated feed** (default)
-- **Retail live** — activates only if *both* env vars are set. Otherwise the
-  dashboard says so plainly, asks you to set the two env vars, and stays on
-  the simulated feed. Credential values are never displayed.
+**Live monitor RFQ feed** starts a `RetailPollingSource` only if *both* env vars are set and the
+SDK is installed; otherwise the dashboard says plainly what is missing and shows no RFQs.
+Credential values are never displayed. A 403 on the RFQ endpoints shows "RFQ beta access: NOT
+enabled" while leg books keep refreshing.
 
 ### How live polling works
 
@@ -437,7 +449,7 @@ pick up the RFQ beta on the next successful poll.
 export POLYMARKET_US_KEY_ID="..."
 export POLYMARKET_US_SECRET_KEY="..."
 pip install polymarket-us
-# run the dashboard / poller with "Retail live" selected
+# streamlit run dashboard/app.py, then press "Live monitor RFQ feed"
 ```
 
 Tests are all mocked (no network, no real credentials):

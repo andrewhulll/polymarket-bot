@@ -40,7 +40,7 @@ from combo_mm.stream import SimulatedTransport
 
 log = logging.getLogger(__name__)
 
-__all__ = ["BacktestResult", "run_backtest", "combo_settlement_value"]
+__all__ = ["BacktestResult", "run_backtest", "compute_metrics", "combo_settlement_value"]
 
 
 def combo_settlement_value(legs: List[Dict[str, Any]]) -> Optional[float]:
@@ -131,11 +131,11 @@ def run_backtest(session: List[Dict[str, Any]],
     drain_drop_copy(SimulatedDropCopyTransport(drop_copy_records), store,
                     now=BASE_TS)
 
-    result = _compute_metrics(store)
+    result = compute_metrics(store)
     return result, store
 
 
-def _compute_metrics(store: EventStore) -> BacktestResult:
+def compute_metrics(store: EventStore) -> BacktestResult:
     res = BacktestResult()
     rfqs = store.list_rfqs()
     res.rfqs_received = len(rfqs)

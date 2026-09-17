@@ -154,12 +154,18 @@ def price_combo(
     price_min: float = 0.001,
     price_max: float = 0.999,
     min_qty: float = 1.0,
+    fair_override: Optional[float] = None,
 ) -> QuoteDecision:
     """Price one combo RFQ. Pure function -- no I/O.
 
     Returns a :class:`QuoteDecision` with ``reason_code=QUOTED_OK`` on success,
     or a decline reason otherwise. Every spread component is recorded in
     ``components`` for dashboard explanation.
+
+    ``fair_override`` lets a dependence-aware pricer (e.g. the NFL joint
+    model) supply the combo fair while reusing this function's leg checks,
+    spread, tick rounding and sizing. The independent-leg product is still
+    computed and recorded as ``components["naive_fair"]``.
     """
     leg_inputs = [
         {
@@ -260,6 +266,9 @@ def price_combo(
     for q in q_list:
         fair *= q
     fair = min(max(fair, 0.0), 1.0)
+    naive_fair = fair
+    if fair_override is not None:
+        fair = min(max(float(fair_override), 0.0), 1.0)
 
     # --- spread ----------------------------------------------------------
     # Uncertainty grows with wide/shallow books and leg count. The spread is
@@ -339,6 +348,7 @@ def price_combo(
         "leg_count": len(legs),
         "leg_marks": leg_marks,
         "fair": fair,
+        "naive_fair": naive_fair,
         "spread_bps_total": total_bps,
         "base_edge_bps": base_edge_bps,
         "model_uncertainty_bps": model_uncertainty_bps,
