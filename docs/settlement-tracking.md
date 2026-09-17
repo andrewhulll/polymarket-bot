@@ -1,7 +1,12 @@
 # Settling live quotes: scoring the model after the final whistle
 
-*Plan only — no behaviour change ships with this document. Scope: NFL only,
-same-game combos, paper trading only. Related: Step 5 backtest harness
+*Implemented — `combo_mm/nfl/settle_live.py`, `scripts/settle_live_quotes.py`
+and the dashboard's Settlement section. Scope: NFL only, same-game combos,
+paper trading only.*
+
+*Where this differs from the plan as first written, the text says so: running
+it against real live quotes turned up one case the plan had missed (see
+**Unsettleable legs**). Related: Step 5 backtest harness
 ([#5](https://github.com/andrewhulll/polymarket-bot/issues/5)) and the roadmap
 ([#17](https://github.com/andrewhulll/polymarket-bot/issues/17)).*
 
@@ -60,7 +65,7 @@ The plan reuses all six rather than restating any of them.
 A live leg carries a game key of the form `nfl-{away}-{home}-{date}` (for
 example `nfl-det-buf-2026-09-18`). `catalog_markets.parse_game_slug` already
 decomposes it into `(game_key, AWAY, HOME, date, suffix)` with the team codes
-upper-cased. The nflverse side has `Game.away_team` / `Game.home_team` /
+upper-cased. The nflverse side has `Game.away` / `Game.home` /
 `Game.gameday`. So the join key is `(season, away, home)`, with
 `catalog_markets.season_of(date)` supplying the season (it already handles
 January and February belonging to the prior season).
@@ -79,6 +84,34 @@ Three things must be handled explicitly rather than assumed:
    `PENDING`, not a loss. A quote priced on Thursday must not settle to `0.0`
    because the game had not kicked off when the job ran.
 
+### Unsettleable legs (found while implementing)
+
+The screen only requires that **one NFL game contributes two or more legs**.
+Every other leg rides along and is priced as an independent multiplier — a
+single leg from another game, or a non-game market entirely. The first real
+run made the consequence concrete: of 730 stored quotes, **149 (20%) carry a
+leg that no final score can ever settle**. One of them is an MLB leg,
+`mlb-det-cws-2026-09-17`; others are player props and half/quarter markets.
+
+Treating these as `UNRESOLVED` would mean retrying a fifth of the book on
+every run, forever, for an answer that can never arrive. So they get their own
+terminal status, `UNSETTLEABLE`, distinct from `UNRESOLVED` (an unknown
+position id or a game missing from the pull, both of which a later run may
+well resolve).
+
+The status precedence is therefore:
+
+| Status | Terminal | Meaning |
+| --- | --- | --- |
+| `VOID` | yes | A leg pushed or an ML tied. Absorbing — one void leg voids the combo whatever the others did, which is the backtest's convention. |
+| `UNSETTLEABLE` | yes | A leg no final score settles: prop, period, or non-NFL. |
+| `UNRESOLVED` | no | A position id not in the catalog cache, or a game not in the pull. Retried. |
+| `PENDING` | no | Every leg resolved; a game has not been played. Not a loss. |
+| `SETTLED` | — | Every leg settled; `combo_value` is 1.0 or 0.0. |
+
+A leg we cannot settle blocks the combo even when another leg has already
+lost: the unknown leg could itself void, and a void combo is not a losing one.
+
 ## Part B — schema
 
 A new table in the same database. `priced_quotes` is never mutated: what the
@@ -90,21 +123,24 @@ CREATE TABLE IF NOT EXISTS quote_settlements (
     rfq_id           TEXT NOT NULL,
     trigger          TEXT NOT NULL,
     settled_at       TEXT NOT NULL,   -- when this row was computed
-    status           TEXT NOT NULL,   -- SETTLED | VOID | PENDING | UNRESOLVED
-    reason_detail    TEXT,            -- why PENDING or UNRESOLVED
-    combo_value      REAL,            -- 1.0 or 0.0; NULL when VOID/PENDING
+    status           TEXT NOT NULL,   -- SETTLED | VOID | PENDING | UNRESOLVED | UNSETTLEABLE
+    reason_detail    TEXT,            -- why it is not SETTLED
+    combo_value      REAL,            -- requested side, 1.0 / 0.0; NULL unless SETTLED
+    combo_yes        REAL,            -- the combo's own YES, before the side inversion
     n_legs           INTEGER NOT NULL,
     n_legs_settled   INTEGER NOT NULL,
-    legs_json        TEXT NOT NULL,   -- per leg: position_id, settlement_price, game_id
+    legs_json        TEXT NOT NULL,   -- per leg: position_id, settlement_price, game_id, side
+    side             TEXT,            -- the side the RFQ asked about
     fair             REAL,            -- copied from the quote, so scoring needs no re-join
+    naive            REAL,
     bid              REAL,
     ask              REAL,
-    naive            REAL,
     brier            REAL,            -- (fair - combo_value)^2
     naive_brier      REAL,            -- (naive - combo_value)^2
     edge_vs_naive    REAL,            -- naive_brier - brier; > 0 means the joint model won
     hypo_edge_bid    REAL,            -- combo_value - bid   (counterfactual, 1 unit)
     hypo_edge_ask    REAL,            -- ask - combo_value    (counterfactual, 1 unit)
+    realized_pnl     REAL,            -- only where an accepted fill exists
     scores_vintage   TEXT,            -- nflverse pull date used
     model_version    TEXT,
     params_version   TEXT,
@@ -210,7 +246,7 @@ network, deterministic:
 - Player props and period markets are already screened out upstream and stay
   out of scope.
 
-## Rollout order
+## Rollout order (all landed)
 
 1. `quote_settlements` schema + store methods on `QuoteSelectionStore`
 2. `combo_mm/nfl/settle_live.py` — pure functions: leg resolution, the score

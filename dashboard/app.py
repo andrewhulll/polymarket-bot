@@ -111,7 +111,33 @@ st.title("Combo RFQ pipeline -- paper dashboard")
 
 
 def _new_db(prefix: str) -> str:
+    """A throwaway store for a backtest replay, which is recomputed on demand."""
     return tempfile.NamedTemporaryFile(prefix=prefix, suffix=".db", delete=False).name
+
+
+# Live lifecycle events (RFQ history, screen results, quote latency) used to go
+# to a %TEMP% file per run, so none of it survived a restart -- and it grows
+# fast: one session left a 142 MB orphan behind. Keep it beside the quotes
+# instead, one file per day, and prune the oldest.
+LIVE_EVENT_RETENTION = 3
+
+
+def _prune_live_events(keep: int = LIVE_EVENT_RETENTION) -> None:
+    """Delete all but the newest ``keep`` daily event stores (and their WAL sidecars)."""
+    files = sorted(LIVE_DATA.glob("events_*.db"))
+    for old in files[:-keep]:
+        for path in (old, Path(f"{old}-wal"), Path(f"{old}-shm")):
+            try:
+                path.unlink()
+            except OSError:
+                pass        # still open elsewhere, or already gone; try again next run
+
+
+def _live_event_db() -> str:
+    """Today's durable live event store under ``data/live/`` (gitignored)."""
+    LIVE_DATA.mkdir(parents=True, exist_ok=True)
+    _prune_live_events()
+    return str(LIVE_DATA / f"events_{datetime.now(timezone.utc):%Y-%m-%d}.db")
 
 
 def _f(x: Any, spec: str = ".4f") -> str:
@@ -236,7 +262,7 @@ def _start_live() -> Dict[str, Any]:
     if source is None:
         run["error"] = "No live feed credentials found."
         return run
-    db_path = _new_db("combo_mm_live_")
+    db_path = _live_event_db()
     quoter, note = _live_quoter(config, _combo_catalog(), _quote_selections())
     run.update(db_path=db_path, polling=True, source=label, pricing_note=note,
                monitor=LiveMonitor(source, EventStore(db_path, synchronous="NORMAL"), config,
@@ -958,6 +984,55 @@ def _live_pricing_view(monitor: Optional[LiveMonitor], r: Dict[str, Any]) -> Non
                               f"{(labels[k]['legs_label'] or '')[:120]}")
     if pick is not None:
         _model_quote_detail(labels[pick])
+    _settlement_view(selections)
+
+
+def _settlement_view(selections: QuoteSelectionStore) -> None:
+    """How the quotes actually turned out, once the games finished.
+
+    Read-only: ``scripts/settle_live_quotes.py`` computes and writes these
+    rows, deliberately outside the dashboard process so a scoring pass never
+    competes with the poll loop. See ``docs/settlement-tracking.md``.
+    """
+    st.markdown("---")
+    st.subheader("Settlement -- how the quotes turned out")
+    stats = selections.settlement_stats()
+    if not stats:
+        st.info("No quote has been settled yet. Run `python scripts/settle_live_quotes.py` "
+                "after the games finish (scores come from the cached nflverse pull; "
+                "refresh it with `python scripts/refresh_params.py --pull`).")
+        return
+    metrics = selections.settlement_metrics()
+    st.caption("Nothing here was traded -- these are the prices we would have shown. The "
+               "headline is the model's Brier against the naive independent-leg maker's; "
+               "the bid/ask edges are counterfactual.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Settled", f"{stats.get('SETTLED', 0):,}")
+    c2.metric("Void / pending", f"{stats.get('VOID', 0):,} / {stats.get('PENDING', 0):,}")
+    if metrics["brier"] is not None:
+        edge = metrics["edge_vs_naive"] or 0.0
+        c3.metric("Model Brier", f"{metrics['brier']:.4f}",
+                  delta=f"{edge:+.4f} vs naive", delta_color="normal")
+        c4.metric("Combo hit rate", f"{(metrics['hit_rate'] or 0.0):.1%}")
+    else:
+        c3.metric("Model Brier", "-")
+        c4.metric("Combo hit rate", "-")
+    unscorable = stats.get("UNSETTLEABLE", 0)
+    if unscorable:
+        st.caption(f"`UNSETTLEABLE` x{unscorable:,} -- the combo carries a leg no final score "
+                   "settles (a player prop, a half/quarter market, or a non-NFL leg the screen "
+                   "allowed through as an independent multiplier). Terminal, not retried.")
+    rows = selections.list_settlements(limit=LIVE_ROW_LIMIT)
+    table = pd.DataFrame([{
+        "rfq": r["rfq_id"], "status": r["status"], "legs": (r.get("legs_label") or "")[:80],
+        "worth": r["combo_value"], "model fair": r["fair"], "naive": r["naive"],
+        "brier": r["brier"], "naive brier": r["naive_brier"],
+        "settled at": r["settled_at"],
+    } for r in rows])
+    st.dataframe(table, width="stretch", hide_index=True,
+                 column_config={c: st.column_config.NumberColumn(format="%.4f")
+                                for c in ("worth", "model fair", "naive", "brier",
+                                          "naive brier")})
 
 
 # ---------------------------------------------------------------------------

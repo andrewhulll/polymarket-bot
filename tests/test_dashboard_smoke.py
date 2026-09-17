@@ -89,3 +89,15 @@ def test_live_pricing_view_renders_a_real_quote():
     assert "lift over independence" in text            # per-game model detail rendered
     metrics = {m.label: m.value for m in at.metric}
     assert metrics["RFQs priced"] == "2" and metrics["We would quote"] == "1"
+
+
+def test_settlement_section_renders_a_settled_quote():
+    """The settlement view shows the realized value and the Brier pair."""
+    probe = Path(__file__).resolve().parent / "dashboard_pricing_probe.py"
+    at = AppTest.from_file(str(probe))
+    at.run()
+    assert not at.exception, f"settlement view raised: {at.exception!r}"
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Settled"] == "1"
+    assert metrics["Combo hit rate"] == "100.0%"     # the combo hit on BUF 30 DET 20
+    assert metrics["Model Brier"] not in (None, "-")
