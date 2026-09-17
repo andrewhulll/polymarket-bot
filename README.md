@@ -437,12 +437,19 @@ Rules (enforced by tests):
 
 ### Dashboard live monitor
 
-**Live monitor RFQ feed** prefers the polymarket.com quoter gateway (see
-[Live international RFQ feed](#live-international-rfq-feed-quoter-gateway)) when its four
-`POLYMARKET_*` keys are present. It falls back to a `RetailPollingSource` when *both* Retail env
-vars are set and the SDK is installed. Otherwise the dashboard says plainly what is missing and
-shows no RFQs. Credential values are never displayed. On Retail, a 403 on the RFQ endpoints shows
-"RFQ beta access: NOT enabled" while leg books keep refreshing.
+Run the headless capture process first, then open Streamlit in another shell:
+
+```bash
+python3 scripts/capture_live_rfqs.py --data-dir data/live
+streamlit run dashboard/app.py
+```
+
+The capture process owns the quoter-gateway websocket, screening, paper
+pricing and SQLite writes. The **Live monitor RFQ feed** control opens a
+read-only viewer of `data/live/rfq_capture.db`; closing or slowing the page
+does not delay pricing. The dashboard refreshes every 0.75 seconds. Gateway
+credentials come from the environment or the gitignored `.env` file. The
+runner never submits a quote.
 
 ### How live polling works
 
@@ -595,12 +602,10 @@ Rules (enforced by tests):
 
 ### Dashboard
 
-Press **Live monitor RFQ feed**. With keys absent you get a message naming
-the variables; with keys present the adapter starts in a background thread,
-a live status strip shows connection state and RFQ/trade/reconnect counters,
-and every received RFQ flows through `LiveMonitor` into the store and shadow
-engine, so it appears on the RFQs, Pricing, Performance and Engine status
-tabs. **Stop live monitor** closes the websocket.
+Start `scripts/capture_live_rfqs.py` and press **Live monitor RFQ feed** in the
+dashboard. The RFQs, Pricing & quoting, Performance and Engine status views
+read its SQLite database. **Stop live monitor** stops this page's refresh; the
+headless engine continues until stopped in its own shell.
 
 ### Leg markets (combo catalog)
 
@@ -674,19 +679,18 @@ live feed while it happened. The Week 1 RFQs the dashboard's "Run backtest" butt
 (`combo_mm/nfl/week_backtest.py`) are **synthetic**: real closing lines, reconstructed RFQ
 arrivals — not actual RFQ negotiations pulled from Polymarket.
 
-**Going forward**, `scripts/capture_live_rfqs.py` listens on the same receive-only gateway
-adapter the dashboard's live monitor uses and saves every RFQ to disk — no pricing, no dashboard
-wiring, just capture:
+**Going forward**, `scripts/capture_live_rfqs.py` listens on the receive-only gateway
+and saves every RFQ and paper pricing decision to disk:
 
 ```bash
 export POLYMARKET_API_KEY=... POLYMARKET_SECRET=... POLYMARKET_PASSPHRASE=... POLYMARKET_ADDRESS=...
 python3 scripts/capture_live_rfqs.py --data-dir data/live   # run continuously; Ctrl+C to stop
 ```
 
-It writes `data/live/rfq_raw.jsonl` (every event, verbatim — the only place a trade's accepted
-price/size survive, since `normalize()` drops gateway-native fields it doesn't recognize) and
-`data/live/rfq_capture.db` (the same events through the existing normalize/store/screen pipeline,
-so legs resolve against the combo catalog and each RFQ is tagged NFL or not).
+It writes `data/live/rfq_raw.jsonl` for archival export and
+`data/live/rfq_capture.db` for the dashboard. The database includes RFQs,
+screening checks, draft quotes, decline reasons, accepted trade prices,
+engine health and separate wait/compute latency samples.
 
 Once some data has accumulated, pull out just the NFL rows:
 
@@ -697,12 +701,11 @@ python3 scripts/export_nfl_rfqs.py --data-dir data/live --out data/live/nfl_rfqs
 
 ## Pricing a live RFQ (the model quotes)
 
-Every RFQ the screen calls `QUOTABLE` is priced by the NFL correlation model as
-it arrives (and again whenever you press **Quote this RFQ**), and the bid and
-ask we would show are logged to `data/live/quote_selections.db` and to the
-application log. That file is durable — it survives closing the dashboard, and
-each live run appends to it — but nothing scores those quotes once the game
-finishes yet; the plan for that is
+Every RFQ the screen calls `QUOTABLE` is queued for the NFL correlation model
+as it arrives. The bid and ask we would show, or a decline reason, are stored
+in `data/live/rfq_capture.db` and summarized in the application log. Realized
+paper P&L becomes available once leg settlements are recorded; settlement
+ingestion is described in
 [`docs/settlement-tracking.md`](docs/settlement-tracking.md).
 
 ```

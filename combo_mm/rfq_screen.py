@@ -29,6 +29,7 @@ __all__ = [
     "RfqScreen",
     "UNRESOLVED",
     "screen_legs",
+    "screen_checks",
 ]
 
 QUOTABLE = "QUOTABLE"
@@ -74,3 +75,18 @@ def screen_legs(legs: Sequence[Optional[LegMarket]]) -> RfqScreen:
     rank = RANK_QUOTABLE if screen == QUOTABLE else (RANK_HAS_NFL if n_nfl else RANK_OTHER)
     return RfqScreen(screen=screen, rank=rank, n_legs=len(legs), n_resolved=len(resolved),
                      n_nfl_legs=n_nfl, nfl_same_games=nfl_same, other_same_games=other_same)
+
+
+def screen_checks(result: RfqScreen, *, qty_decimal: Optional[float] = None,
+                  min_qty: float = 1.0) -> Dict[str, bool]:
+    """Display the exact live screening rules and the configured share minimum.
+
+    Cash-notional RFQs are sized later by the pricer because share quantity
+    depends on the calculated price.
+    """
+    return {
+        "known legs": result.n_legs > 0 and result.n_resolved == result.n_legs,
+        "NFL same game": bool(result.nfl_same_games),
+        "no unsupported same game": not result.other_same_games,
+        f"at least {min_qty:g} shares": qty_decimal is None or qty_decimal >= min_qty,
+    }

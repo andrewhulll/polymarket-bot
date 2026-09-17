@@ -162,9 +162,10 @@ def test_credentials_from_env_ok():
         assert secret not in redacted
 
 
-def test_credentials_missing_names_the_var():
+def test_credentials_missing_names_the_var(tmp_path):
     with pytest.raises(MissingCredentialsError) as excinfo:
-        GatewayCredentials.from_env(env={"POLYMARKET_API_KEY": "k"})
+        GatewayCredentials.from_env(env={"POLYMARKET_API_KEY": "k"},
+                                    dotenv_path=tmp_path / "absent.env")
     msg = str(excinfo.value)
     assert "POLYMARKET_SECRET" in msg and "POLYMARKET_ADDRESS" in msg
 

@@ -245,7 +245,8 @@ class EventStore:
                     n_nfl_legs INTEGER NOT NULL,
                     screen TEXT NOT NULL,
                     rank INTEGER NOT NULL,
-                    catalog_version INTEGER NOT NULL
+                    catalog_version INTEGER NOT NULL,
+                    checks_json TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_screen_rank_seq ON rfq_screen(rank, seq);
                 CREATE INDEX IF NOT EXISTS idx_screen_unresolved
@@ -269,8 +270,27 @@ class EventStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_latency_over_budget
                     ON quote_latency(over_budget);
+                CREATE TABLE IF NOT EXISTS live_trades (
+                    rfq_id TEXT PRIMARY KEY, price REAL, size REAL,
+                    executed_at TEXT, recorded_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS live_engine_health (
+                    id INTEGER PRIMARY KEY CHECK (id = 1), started_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL, messages_processed INTEGER NOT NULL,
+                    errors INTEGER NOT NULL, gateway_connected INTEGER NOT NULL,
+                    buffer_drops INTEGER NOT NULL
+                );
                 """
             )
+            latency_columns = {r[1] for r in cur.execute(
+                "PRAGMA table_info(quote_latency)").fetchall()}
+            for column in ("started_at", "wait_ms", "compute_ms"):
+                if column not in latency_columns:
+                    cur.execute(f"ALTER TABLE quote_latency ADD COLUMN {column} "
+                                + ("TEXT" if column == "started_at" else "REAL"))
+            screen_columns = {r[1] for r in cur.execute("PRAGMA table_info(rfq_screen)")}
+            if "checks_json" not in screen_columns:
+                cur.execute("ALTER TABLE rfq_screen ADD COLUMN checks_json TEXT")
             # Migration for DBs created before the shadow-engine columns
             # existed: origin / model_version / params_version /
             # input_snapshot_json / decided_by on quotes. (The CHECK
@@ -1086,6 +1106,41 @@ class EventStore:
             return {r["decision"]: r["n"] for r in rows}
 
     # -- quote latency (live only) ---------------------------------------------
+    def record_live_trade(self, rfq_id: str, price: Any, size: Any,
+                          executed_at: Optional[str] = None) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO live_trades VALUES (?, ?, ?, ?, ?)",
+                (rfq_id, _to_float(price), _to_float(size), executed_at, _utcnow_iso()))
+
+    def update_live_health(self, *, started_at: str, messages_processed: int,
+                           errors: int, gateway_connected: bool,
+                           buffer_drops: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO live_engine_health VALUES (1, ?, ?, ?, ?, ?, ?)",
+                (started_at, _utcnow_iso(), messages_processed, errors,
+                 int(gateway_connected), buffer_drops))
+
+    def record_live_latency(self, *, rfq_id: str, posted_at: str,
+                            started_at: str, decided_at: str, quoted: bool,
+                            budget_ms: float = 400.0) -> None:
+        def millis(value: str) -> float:
+            return _parse_ts(value).timestamp() * 1000
+        try:
+            wait_ms = max(0.0, millis(started_at) - millis(posted_at))
+            compute_ms = max(0.0, millis(decided_at) - millis(started_at))
+        except (ValueError, TypeError, AttributeError):
+            return
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO quote_latency "
+                "(rfq_id, event_type, posted_at, started_at, decided_at, "
+                "wait_ms, compute_ms, latency_ms, quoted, over_budget, source) "
+                "VALUES (?, 'rfq_created', ?, ?, ?, ?, ?, ?, ?, ?, 'live_capture')",
+                (rfq_id, posted_at, started_at, decided_at, wait_ms, compute_ms,
+                 wait_ms + compute_ms, int(quoted), int(wait_ms + compute_ms > budget_ms)))
+
     def record_quote_latency(self, *, rfq_id: str, event_type: str,
                              posted_at: str, decided_at: str,
                              latency_ms: float, quoted: bool,
@@ -1138,7 +1193,8 @@ class EventStore:
                           n_nfl_legs: int, screen: str, rank: int, catalog_version: int,
                           direction: Optional[str] = None, side: Optional[str] = None,
                           condition_id: Optional[str] = None,
-                          submission_deadline: Optional[str] = None) -> None:
+                          submission_deadline: Optional[str] = None,
+                          checks_json: Optional[str] = None) -> None:
         """Insert an RFQ's screen, or refresh the screen columns of an existing row.
 
         Gateway extras (direction, deadline, ...) are kept from the first
@@ -1149,9 +1205,9 @@ class EventStore:
                 """
                 INSERT INTO rfq_screen (rfq_id, seq, direction, side, condition_id,
                     submission_deadline, n_legs, n_resolved, n_nfl_legs, screen, rank,
-                    catalog_version)
+                    catalog_version, checks_json)
                 VALUES (?1, COALESCE((SELECT rowid FROM rfq WHERE rfq_id = ?1), 0),
-                        ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                        ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                 ON CONFLICT(rfq_id) DO UPDATE SET
                     direction = COALESCE(excluded.direction, direction),
                     side = COALESCE(excluded.side, side),
@@ -1160,10 +1216,11 @@ class EventStore:
                                                    submission_deadline),
                     n_legs = excluded.n_legs, n_resolved = excluded.n_resolved,
                     n_nfl_legs = excluded.n_nfl_legs, screen = excluded.screen,
-                    rank = excluded.rank, catalog_version = excluded.catalog_version
+                    rank = excluded.rank, catalog_version = excluded.catalog_version,
+                    checks_json = COALESCE(excluded.checks_json, checks_json)
                 """,
                 (rfq_id, direction, side, condition_id, submission_deadline, n_legs,
-                 n_resolved, n_nfl_legs, screen, rank, catalog_version))
+                 n_resolved, n_nfl_legs, screen, rank, catalog_version, checks_json))
 
     def unresolved_screen_rfqs(self, catalog_version: int, limit: int = 5000
                                ) -> List[Dict[str, Any]]:
