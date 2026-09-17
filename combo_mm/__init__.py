@@ -16,6 +16,10 @@ pipeline for the correlation engine: nflverse ingestion, walk-forward score
 covariance estimation, weekly params files, the same-game joint probability
 engine and the synthetic-combo backtest (issue #6).
 
+``combo_mm.intl_gateway`` holds the live international (polymarket.com)
+quoter-gateway adapter: authenticated websocket, strictly receive-only
+(issue #11).
+
 Parked (not implemented here): wiring the correlation model into the live
 pricer, inventory/risk engine, production quoting, formal RFQ backtest.
 """
@@ -56,6 +60,11 @@ from combo_mm.auth import (
 from combo_mm.consumer import ConsumerConfig, PollingConsumer, StreamConsumer
 from combo_mm.sources import EventSource, SimulatedEventSource
 from combo_mm.retail import RetailPollingSource
+from combo_mm.intl_gateway import (
+    GatewayCredentials,
+    InternationalQuoterGatewayAdapter,
+    MissingCredentialsError,
+)
 from combo_mm.recovery import RecoveryReport, recovery_sync
 from combo_mm.books import LegBookCache
 from combo_mm.reference import ReferenceCache
@@ -133,6 +142,9 @@ __all__ = [
     "EventSource",
     "SimulatedEventSource",
     "RetailPollingSource",
+    "GatewayCredentials",
+    "InternationalQuoterGatewayAdapter",
+    "MissingCredentialsError",
     "RecoveryReport",
     "recovery_sync",
     "LegBookCache",

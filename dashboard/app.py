@@ -33,7 +33,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from combo_mm import PipelineConfig, fixtures, paper_backtest  # noqa: E402
-from dashboard import nfl_tab  # noqa: E402
+from dashboard import live_intl, nfl_tab  # noqa: E402
 
 st.set_page_config(page_title="combo_mm dashboard (paper)", layout="wide")
 
@@ -62,10 +62,27 @@ def _run_simulation() -> dict:
     return {"db_path": db_file, "result": result}
 
 
-if st.button("Run simulation", type="primary"):
+# ---------------------------------------------------------------------------
+# Issue #11: live international RFQ source (quoter gateway, receive-only).
+# Delimited block -- keep everything live-source inside dashboard/live_intl.py
+# and this block so parallel branches editing this file merge cleanly. The
+# live feed never merges into the simulation views below (those stay sim-only).
+# ---------------------------------------------------------------------------
+_src_a, _src_b = st.columns(2)
+with _src_a:
+    _run_sim = st.button("Run simulation", type="primary")
+with _src_b:
+    _go_live = st.button("Go live (international)")
+
+if _run_sim:
     with st.spinner("Replaying scripted session through the pipeline..."):
         st.session_state["sim"] = _run_simulation()
     st.success("Simulation complete.")
+
+if _go_live:
+    live_intl.start_live_source()
+
+live_intl.render_live_status()  # no-op unless the live feed is running
 
 view = st.tabs(
     ["RFQs", "Pricing & quoting", "Performance", "Engine status", "NFL correlation"])
