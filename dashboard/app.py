@@ -59,7 +59,6 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from combo_mm import PipelineConfig  # noqa: E402
-from combo_mm import fixtures_nfl  # noqa: E402
 from combo_mm.auth import CredentialsNotConfigured  # noqa: E402
 from combo_mm.combo_markets import ComboMarketCatalog, LegMarket  # noqa: E402
 from combo_mm.intl_gateway import (  # noqa: E402
@@ -98,7 +97,6 @@ RAW_ROOT = REPO / "data" / "raw"
 ESTIMATOR_PATH = REPO / "params" / "estimator.json"
 SEASON, WEEK = week_backtest.BACKTEST_SEASON, week_backtest.BACKTEST_WEEK
 BACKTEST_LABEL = f"NFL {SEASON} Week {WEEK}"
-NFL_FIXTURE_LABEL = "NFL fixture week"
 
 st.set_page_config(page_title="combo_mm dashboard (paper)", layout="wide")
 
@@ -137,25 +135,6 @@ def _run_backtest() -> Dict[str, Any]:
             "naive independent-leg maker, and settles on the final score."),
     }
 
-
-def _run_nfl_fixture() -> Dict[str, Any]:
-    """The committed NFL fixture week (#15): no data pull, no network."""
-    items, combos = fixtures_nfl.build_session()
-    db_path = _new_db("combo_mm_nfl_fixture_")
-    result, _store = run_backtest(items, combos, [], PipelineConfig(paper_mode=True),
-                                  db_path=db_path, base_ts=fixtures_nfl.BASE_TS)
-    return {
-        "mode": "backtest", "label": NFL_FIXTURE_LABEL, "db_path": db_path,
-        "result": result, "trades": [], "meta": {},
-        "caption": (
-            "The committed four-game NFL fixture slate: 40 hand-written RFQs where each one "
-            "exercises a deliberate case (nested and impossible combos, a pushed spread, an "
-            "unknown leg, a cross-game combo, a stale book, a cancel, an expiry, duplicate and "
-            "out-of-order deliveries). Fills are not modelled here, so there are no trades: "
-            "that is the backtest harness's job (#5). Performance counts each RFQ by its "
-            "*last* decision, which for a settled RFQ is the after-the-fact re-check, so read "
-            "the per-request decisions in the Pricing & quoting tab instead."),
-    }
 
 
 MISSING_LIVE_KEYS_MSG = (
@@ -263,7 +242,7 @@ def _stop_live(run: Optional[Dict[str, Any]]) -> None:
 run: Optional[Dict[str, Any]] = st.session_state.get("run")
 live_polling = bool(run and run["mode"] == "live" and run.get("polling"))
 
-c_bt, c_fx, c_live, c_state = st.columns([1.2, 1.1, 1.2, 2.2])
+c_bt, c_live, c_state = st.columns([1.2, 1.2, 2.2])
 with c_bt:
     if st.button(f"Run backtest -- {BACKTEST_LABEL}", type="primary", width="stretch"):
         _stop_live(run)
@@ -271,17 +250,6 @@ with c_bt:
             try:
                 run = _run_backtest()
             except Exception as exc:  # missing pull, no games for the week, ...
-                run = {"mode": "backtest", "db_path": None, "error": f"{type(exc).__name__}: {exc}"}
-        st.session_state["run"] = run
-        live_polling = False
-with c_fx:
-    # Needs no nflverse pull, so this always works on a fresh checkout.
-    if st.button(NFL_FIXTURE_LABEL, width="stretch"):
-        _stop_live(run)
-        with st.spinner("Replaying the committed NFL fixture slate..."):
-            try:
-                run = _run_nfl_fixture()
-            except Exception as exc:
                 run = {"mode": "backtest", "db_path": None, "error": f"{type(exc).__name__}: {exc}"}
         st.session_state["run"] = run
         live_polling = False
@@ -297,8 +265,8 @@ with c_live:
         st.rerun()  # redraw the controls with the refresh timers on
 with c_state:
     if run is None:
-        st.caption(f"Choose a data source: the {BACKTEST_LABEL} backtest (historical), "
-                   f"the {NFL_FIXTURE_LABEL} (committed, no data pull) or the live RFQ feed.")
+        st.caption(f"Choose a data source: the {BACKTEST_LABEL} backtest (historical) "
+                   "or the live RFQ feed.")
     elif run["mode"] == "backtest":
         st.caption(f"Showing: **backtest -- {run.get('label', BACKTEST_LABEL)}** "
                    "(historical RFQ replay).")
@@ -1043,7 +1011,7 @@ def _performance_view(r: Dict[str, Any]) -> None:
         st.write("(no fills)")
 
     if not backtest or not r["trades"]:
-        # The fixture slate models no fills: that is #5's harness, not data.
+        # Live mode models no fills (no executions of our own).
         return
     trades = pd.DataFrame(r["trades"])
     trades["pnl"] = trades["pnl"].fillna(0.0)
@@ -1152,8 +1120,7 @@ def _engine_view(r: Dict[str, Any]) -> None:
 if run is None or not run.get("db_path"):
     for tab in view[:4]:
         with tab:
-            st.info(f'Press "Run backtest -- {BACKTEST_LABEL}" for the historical RFQs, '
-                    f'"{NFL_FIXTURE_LABEL}" for the committed fixture slate (no data pull), '
+            st.info(f'Press "Run backtest -- {BACKTEST_LABEL}" for the historical RFQs '
                     'or "Live monitor RFQ feed" to watch the live feed.')
 else:
     with view[0]:
