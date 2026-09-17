@@ -277,6 +277,8 @@ def test_auth_handshake_shape():
         assert auth["identity"]["maker_address"] == "0xabc"
         assert auth["identity"]["signature_type"] == 0
         assert _wait_for(lambda: adapter.connected), "adapter never connected"
+        assert _wait_for(lambda: adapter.stats()["auth"] == "accepted"), "positive ack not recorded"
+        assert adapter.stats()["auth_error"] is None
     finally:
         adapter.stop()
 
@@ -348,21 +350,48 @@ def test_reconnect_after_drop():
         adapter.stop()
 
 
-def test_auth_rejection_backs_off_without_crash():
-    async def _reject_auth(ws, _msg):
-        await ws.send(json.dumps({"type": "auth", "success": False}))
-        await ws.close()
+def test_gateway_without_auth_ack_streams_rfqs():
+    """The live gateway sends no auth ack: RFQ frames follow the auth frame directly."""
+    async def _no_ack(ws, _msg):
+        await ws.send(json.dumps(_rfq_frame(rfq_id="rfq_noack")))
 
-    gw = _FakeGateway(on_auth=_reject_auth)
+    gw = _FakeGateway(on_auth=_no_ack)
     _, url = _serve_in_thread(gw)
     adapter = _make_adapter(url)
     adapter.start()
     try:
-        assert _wait_for(lambda: len(gw.auth_frames) >= 2, timeout=15), (
-            "adapter did not retry after auth rejection"
-        )
-        assert adapter.stats()["last_error"] == "GatewayAuthError"
-        assert not adapter.connected
+        assert _wait_for(lambda: adapter.stats()["rfqs_seen"] >= 1), "RFQ after auth was dropped"
+        assert adapter.connected
+        stats = adapter.stats()
+        assert stats["last_error"] is None and stats["connects"] == 1 and stats["reconnects"] == 0
+        assert stats["auth"] == "pending"
+        raws = [it["raw"] for it in adapter.poll(datetime.now(timezone.utc))]
+        assert [r["rfq_id"] for r in raws] == ["rfq_noack"]
+    finally:
+        adapter.stop()
+
+
+def test_auth_rejection_is_reported_and_the_public_feed_keeps_streaming():
+    """Live gateway: RFQs arrive before the auth reply and keep coming after a rejection."""
+    async def _reject_mid_stream(ws, _msg):
+        await ws.send(json.dumps(_rfq_frame(rfq_id="rfq_before")))
+        await ws.send(json.dumps({
+            "type": "auth", "success": False,
+            "error": "rpc error: code = PermissionDenied desc = could not validate web socket request"}))
+        await ws.send(json.dumps(_rfq_frame(rfq_id="rfq_after")))
+
+    gw = _FakeGateway(on_auth=_reject_mid_stream)
+    _, url = _serve_in_thread(gw)
+    adapter = _make_adapter(url)
+    adapter.start()
+    try:
+        assert _wait_for(lambda: adapter.stats()["rfqs_seen"] >= 2), "feed stopped after auth rejection"
+        stats = adapter.stats()
+        assert stats["auth"] == "rejected" and "PermissionDenied" in stats["auth_error"]
+        assert stats["connects"] == 1 and stats["reconnects"] == 0 and stats["last_error"] is None
+        assert adapter.connected and len(gw.auth_frames) == 1
+        raws = [it["raw"] for it in adapter.poll(datetime.now(timezone.utc))]
+        assert [r["rfq_id"] for r in raws] == ["rfq_before", "rfq_after"]
     finally:
         adapter.stop()
 

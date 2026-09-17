@@ -299,6 +299,15 @@ def map_rfq_trade(
     }
 
 
+def _auth_reply(raw: Any) -> Optional[Dict[str, Any]]:
+    """The frame as a dict when it is a ``{"type": "auth", ...}`` reply, else None."""
+    try:
+        msg = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return msg if isinstance(msg, dict) and msg.get("type") == "auth" else None
+
+
 class InternationalQuoterGatewayAdapter(EventSource):
     """Live ``RFQ_REQUEST``/``RFQ_TRADE`` feed as a pipeline :class:`EventSource`.
 
@@ -324,7 +333,7 @@ class InternationalQuoterGatewayAdapter(EventSource):
         backoff_jitter: float = 0.25,
         ping_interval_s: float = 20.0,
         silence_watchdog_s: float = 120.0,
-        auth_timeout_s: float = 15.0,
+        auth_timeout_s: float = 15.0,  # unused: the live gateway sends no auth ack
         max_buffer: int = 10_000,
         recent_max: int = 200,
         rng: Optional[random.Random] = None,
@@ -357,6 +366,8 @@ class InternationalQuoterGatewayAdapter(EventSource):
             "buffer_drops": 0,
             "last_frame_at": None,
             "last_error": None,
+            "auth": "pending",      # pending | accepted | rejected (per session)
+            "auth_error": None,     # the gateway's rejection text (never key material)
         }
 
     # ------------------------------------------------------------------
@@ -510,11 +521,16 @@ class InternationalQuoterGatewayAdapter(EventSource):
             backoff = min(backoff * 2.0, self._backoff_max)
 
     async def _session(self, websockets: Any) -> bool:
-        """Run one authenticated read session.
+        """Run one read session; returns True once the socket was open.
 
-        Returns True when the auth handshake completed (the session was
-        healthy up to whatever ended it); False is unreachable -- auth
-        failure raises GatewayAuthError.
+        Observed on the live gateway (2026-09-17): the ``RFQ_REQUEST``
+        broadcast starts right after the auth frame is sent, *before* any
+        auth reply, and keeps flowing after a
+        ``{"type": "auth", "success": false}`` rejection -- the RFQ feed is
+        public; auth only matters for quoting, which this adapter never
+        does. So a session is connected once the auth frame is sent, and an
+        auth reply only updates ``stats()["auth"]`` / ``["auth_error"]``
+        (``accepted`` / ``rejected``) instead of tearing the socket down.
         """
         async with websockets.connect(
             self._url,
@@ -524,30 +540,37 @@ class InternationalQuoterGatewayAdapter(EventSource):
         ) as ws:
             self._ws = ws
             await ws.send(json.dumps(self._auth_frame()))
-            try:
-                raw_ack = await asyncio.wait_for(ws.recv(), timeout=self._auth_timeout)
-            except (asyncio.TimeoutError, TimeoutError) as exc:
-                raise GatewayAuthError("auth ack timed out") from exc
-            try:
-                ack = json.loads(raw_ack)
-            except json.JSONDecodeError as exc:
-                raise GatewayAuthError("auth ack was not JSON") from exc
-            if not isinstance(ack, dict) or ack.get("type") != "auth" or ack.get(
-                "success"
-            ) is not True:
-                raise GatewayAuthError(f"auth rejected: {str(ack)[:120]}")
             with self._lock:
                 self._stats["connects"] += 1
+                self._stats["auth"] = "pending"
+                self._stats["auth_error"] = None
             self._connected.set()
-            log.info("quoter gateway authenticated; streaming RFQ frames")
+            log.info("quoter gateway auth sent; streaming RFQ frames")
             while not self._stop.is_set():
                 try:
                     frame = await asyncio.wait_for(ws.recv(), timeout=self._silence_watchdog)
                 except (asyncio.TimeoutError, TimeoutError):
                     log.warning("quoter gateway silent too long; recycling connection")
                     return True
+                reply = _auth_reply(frame)
+                if reply is not None:
+                    self._note_auth(reply)
+                    continue
                 self._on_frame(frame)
             return True  # stopped cleanly after a healthy session
+
+    def _note_auth(self, reply: Dict[str, Any]) -> None:
+        accepted = reply.get("success") is True
+        # The rejection text is the gateway's own message (e.g. "PermissionDenied ...
+        # could not validate web socket request"); it never echoes our keys.
+        error = None if accepted else str(reply.get("error") or "auth rejected")[:200]
+        with self._lock:
+            self._stats["auth"] = "accepted" if accepted else "rejected"
+            self._stats["auth_error"] = error
+        if accepted:
+            log.info("quoter gateway auth accepted")
+        else:
+            log.warning("quoter gateway auth rejected; continuing on the public RFQ broadcast")
 
     def _on_frame(self, raw: str) -> None:
         try:
@@ -580,8 +603,6 @@ class InternationalQuoterGatewayAdapter(EventSource):
             self._emit(mapped, "trade")
         elif mtype == "RFQ_ERROR":
             log.warning("gateway RFQ_ERROR: %s", str(msg)[:200])
-        elif mtype == "auth":
-            log.debug("gateway auth ack (late duplicate)")
         else:
             log.debug("ignoring gateway frame type %r", mtype)
 

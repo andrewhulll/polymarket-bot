@@ -98,12 +98,20 @@ def _is_newer(candidate: Optional[str], current: Optional[str], *,
 class EventStore:
     """SQLite-backed event store and read-model projections."""
 
-    def __init__(self, path: str = ":memory:") -> None:
+    def __init__(self, path: str = ":memory:", *, synchronous: str = "FULL") -> None:
+        """``synchronous="NORMAL"`` skips the per-commit fsync (WAL mode stays
+        corruption-safe; an OS crash can lose only the last commits). It is
+        ~15x faster on Windows and meant for high-rate paper monitoring, e.g.
+        the live quoter-gateway feed at ~200 RFQs/s; the default stays FULL.
+        """
+        if synchronous not in ("FULL", "NORMAL"):
+            raise ValueError("synchronous must be 'FULL' or 'NORMAL'")
         self._path = path
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._init_schema()
+        self._conn.execute(f"PRAGMA synchronous={synchronous}")
 
     # -- schema -------------------------------------------------------------
     def _init_schema(self) -> None:
