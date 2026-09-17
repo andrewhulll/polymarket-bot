@@ -76,13 +76,14 @@ GAMES_CSV_HEADER = (
 
 def csv_row(game_id, season, week, away, away_score, home, home_score, spread, total,
             game_type="REG", location="Home", ml=("", ""), spread_odds=("-110", "-110"),
-            total_odds=("-110", "-110")) -> str:
+            total_odds=("-110", "-110"), gameday=None, gametime="") -> str:
     """One nflverse-shaped CSV row (unused columns blank)."""
     result = "" if home_score == "" else str(int(home_score) - int(away_score))
     tot = "" if home_score == "" else str(int(home_score) + int(away_score))
     cols = {
         "game_id": game_id, "season": season, "game_type": game_type, "week": week,
-        "gameday": f"{season}-09-10", "away_team": away, "away_score": away_score,
+        "gameday": gameday or f"{season}-09-10", "gametime": gametime,
+        "away_team": away, "away_score": away_score,
         "home_team": home, "home_score": home_score, "location": location, "result": result,
         "total": tot, "overtime": "0", "away_moneyline": ml[0], "home_moneyline": ml[1],
         "spread_line": spread, "away_spread_odds": spread_odds[0], "home_spread_odds": spread_odds[1],
