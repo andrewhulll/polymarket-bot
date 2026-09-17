@@ -21,8 +21,10 @@ verified against the official ``polymarket-client`` PyPI SDK's
   ``requested_size`` (``{"unit": "notional"|"shares", "value_e6"}``),
   ``submission_deadline`` (unix ms).
 - ``RFQ_TRADE``: ``rfq_id``, ``requester_id``, ``condition_id``,
-  ``leg_position_ids[]``, ``direction``, ``side`` -- a confirmed combo
-  trade broadcast, mapped to the pipeline's ``rfq_closed`` ("stop quoting").
+  ``leg_position_ids[]``, ``direction``, ``side``, ``price_e6``,
+  ``size_e6``, ``executed_at`` (unix ms) -- a confirmed combo trade
+  broadcast, mapped to the pipeline's ``rfq_closed`` ("stop quoting") with
+  the accepted price/size kept as raw extras.
 - ``RFQ_ERROR``: logged, never raised to the caller.
 
 Mapping notes (gateway -> pipeline normalized events):
@@ -280,14 +282,17 @@ def map_rfq_trade(
     """Map a gateway ``RFQ_TRADE`` frame to a raw ``rfq_closed`` dict.
 
     A confirmed trade broadcast is a "stop quoting" signal for the RFQ, the
-    same terminal semantics as the US contract's public ``rfq_closed``.
+    same terminal semantics as the US contract's public ``rfq_closed``. The
+    accepted quote rides along as gateway-native extras: ``price`` (accepted
+    blended price) and ``size`` (matched combo shares) as decimal strings,
+    ``executed_at`` as an ISO timestamp, plus ``side`` and ``requester_id``.
     """
     try:
         rfq_id = str(frame["rfq_id"])
     except KeyError as exc:
         raise MappingError(f"RFQ_TRADE missing rfq_id: {exc}") from exc
     ts = received_at or _iso_now()
-    return {
+    raw: Dict[str, Any] = {
         "event_type": "rfq_closed",
         "rfq_id": rfq_id,
         "exchange_ts": ts,
@@ -296,7 +301,18 @@ def map_rfq_trade(
         "updatedTime": ts,
         "direction": str(frame.get("direction") or ""),
         "condition_id": str(frame.get("condition_id") or ""),
+        "side": str(frame.get("side") or ""),
+        "requester_id": str(frame.get("requester_id") or ""),
     }
+    if frame.get("price_e6") is not None:
+        raw["price"] = _e6_to_decimal_str(frame["price_e6"], "price_e6")
+    if frame.get("size_e6") is not None:
+        raw["size"] = _e6_to_decimal_str(frame["size_e6"], "size_e6")
+    executed_ms = frame.get("executed_at")
+    if isinstance(executed_ms, (int, float)) and executed_ms > 0:
+        raw["executed_at"] = (datetime.fromtimestamp(executed_ms / 1000, tz=timezone.utc)
+                              .isoformat().replace("+00:00", "Z"))
+    return raw
 
 
 def _auth_reply(raw: Any) -> Optional[Dict[str, Any]]:

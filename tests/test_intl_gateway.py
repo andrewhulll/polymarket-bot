@@ -118,12 +118,24 @@ def test_map_rfq_trade():
             "leg_position_ids": ["111"],
             "direction": "BUY",
             "side": "YES",
+            "price_e6": "125000",
+            "size_e6": "800000",
+            "executed_at": 1780854786039,
         }
     )
     assert raw["event_type"] == "rfq_closed"
     assert raw["rfq_id"] == "rfq_1"
+    # The accepted quote rides along as raw extras.
+    assert raw["price"] == "0.125" and raw["size"] == "0.8"
+    assert raw["executed_at"] == "2026-06-07T17:53:06.039000Z"
+    assert raw["side"] == "YES" and raw["requester_id"] == "req_9"
     event = normalize(raw)
     assert event.event_type == "rfq_closed"
+
+
+def test_map_rfq_trade_without_price_fields():
+    raw = map_rfq_trade({"type": "RFQ_TRADE", "rfq_id": "rfq_1"})
+    assert "price" not in raw and "size" not in raw and "executed_at" not in raw
 
 
 def test_map_rfq_trade_rejects_missing_id():

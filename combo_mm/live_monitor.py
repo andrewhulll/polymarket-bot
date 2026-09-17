@@ -15,16 +15,21 @@ material) instead of raised.
 from __future__ import annotations
 
 import logging
+import time
+from collections import OrderedDict
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from combo_mm.books import LegBookCache
+from combo_mm.combo_markets import ComboMarketCatalog
 from combo_mm.config import PipelineConfig
 from combo_mm.engine import ShadowQuotingEngine
 from combo_mm.normalize import NormalizeError, normalize
 from combo_mm.pricer import Pricer
+from combo_mm.quote_selections import QuoteSelectionStore
 from combo_mm.reference import ReferenceCache
+from combo_mm.rfq_screen import screen_legs
 from combo_mm.sources import EventSource
 from combo_mm.store import EventStore
 
@@ -43,11 +48,25 @@ class _NoCombos:
 
 
 class LiveMonitor:
-    """Synchronous poll -> store -> shadow engine loop over one source."""
+    """Synchronous poll -> store -> shadow engine loop over one source.
+
+    With a ``catalog`` every new RFQ is screened (:mod:`combo_mm.rfq_screen`)
+    into the store's ``rfq_screen`` table, and RFQs with legs the catalog did
+    not know yet are re-screened as the catalog grows. With ``selections``,
+    trade broadcasts for selected RFQs are stored as accepted quotes; recent
+    trades are also kept in memory so an RFQ picked after it traded still
+    gets its accepted quote (:meth:`select`).
+    """
+
+    RECENT_TRADES_MAX = 50_000
+    RESCREEN_MIN_INTERVAL_S = 10.0
+    RESCREEN_BATCH = 5_000
 
     def __init__(self, source: EventSource, store: EventStore,
                  config: Optional[PipelineConfig] = None, *,
-                 pricer: Optional[Pricer] = None, source_label: str = "live") -> None:
+                 pricer: Optional[Pricer] = None, source_label: str = "live",
+                 catalog: Optional[ComboMarketCatalog] = None,
+                 selections: Optional[QuoteSelectionStore] = None) -> None:
         self.config = config or PipelineConfig(paper_mode=True)
         self.source = source
         self.store = store
@@ -64,6 +83,12 @@ class LiveMonitor:
         self.last_error: Optional[str] = None
         self.last_poll_at: Optional[str] = None
         self.started_at = datetime.now(timezone.utc).isoformat()
+        self.catalog = catalog
+        self.selections = selections
+        self.recent_trades: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self.accepted_recorded = 0
+        self._rescreened_version = -1
+        self._last_rescreen = 0.0
 
     @property
     def rfq_beta_enabled(self) -> Optional[bool]:
@@ -89,7 +114,65 @@ class LiveMonitor:
         ordered = sorted(items, key=lambda item: item.get("kind") != "book")
         for n, item in enumerate(ordered):
             self._dispatch(item, now, n)
+        self._rescreen_unresolved()
         return len(items)
+
+    # -- selection ------------------------------------------------------------
+    def select(self, rfq_id: str, snapshot: Optional[Dict[str, Any]] = None) -> bool:
+        """Mark an RFQ to quote; stores its accepted quote if it already traded."""
+        if self.selections is None:
+            raise RuntimeError("LiveMonitor has no selection store")
+        added = self.selections.select(rfq_id, snapshot)
+        trade = self.recent_trades.get(rfq_id)
+        if trade is not None and self.selections.record_accepted(trade):
+            self.accepted_recorded += 1
+        return added
+
+    # -- screening ------------------------------------------------------------
+    def _screen_new_rfq(self, raw: Dict[str, Any], rfq_id: str) -> None:
+        legs = [str(leg.get("symbol")) for leg in raw.get("comboLegs") or []
+                if isinstance(leg, dict) and leg.get("symbol") is not None]
+        if self.catalog is None or not legs:
+            return
+        result = screen_legs(self.catalog.resolve(legs))
+        self.store.upsert_rfq_screen(
+            rfq_id, n_legs=result.n_legs, n_resolved=result.n_resolved,
+            n_nfl_legs=result.n_nfl_legs, screen=result.screen, rank=result.rank,
+            catalog_version=self.catalog.version,
+            direction=raw.get("direction") or None, side=_combo_side(raw),
+            condition_id=raw.get("condition_id") or None,
+            submission_deadline=raw.get("submission_deadline") or None)
+
+    def _rescreen_unresolved(self) -> None:
+        """Re-screen RFQs whose legs were unknown, once per catalog growth (throttled)."""
+        catalog = self.catalog
+        if catalog is None or catalog.version == self._rescreened_version:
+            return
+        if time.monotonic() - self._last_rescreen < self.RESCREEN_MIN_INTERVAL_S:
+            return
+        version = catalog.version
+        rows = self.store.unresolved_screen_rfqs(version, limit=self.RESCREEN_BATCH)
+        for row in rows:
+            result = screen_legs(catalog.resolve(row["legs"]))
+            self.store.upsert_rfq_screen(
+                row["rfq_id"], n_legs=result.n_legs, n_resolved=result.n_resolved,
+                n_nfl_legs=result.n_nfl_legs, screen=result.screen, rank=result.rank,
+                catalog_version=version)
+        if len(rows) < self.RESCREEN_BATCH:  # backlog drained for this version
+            self._rescreened_version = version
+            self._last_rescreen = time.monotonic()
+
+    def _on_trade(self, raw: Dict[str, Any], rfq_id: str) -> None:
+        if "price" not in raw and "size" not in raw:
+            return  # not a gateway trade broadcast (e.g. a Retail rfq_closed)
+        trade = {k: raw.get(k) for k in ("price", "size", "direction", "side",
+                                         "requester_id", "condition_id", "executed_at")}
+        trade["rfq_id"] = rfq_id
+        self.recent_trades[rfq_id] = trade
+        while len(self.recent_trades) > self.RECENT_TRADES_MAX:
+            self.recent_trades.popitem(last=False)
+        if self.selections is not None and self.selections.record_accepted(trade):
+            self.accepted_recorded += 1
 
     def _dispatch(self, item: Dict[str, Any], now: datetime, n: int) -> None:
         kind = item.get("kind")
@@ -114,7 +197,19 @@ class LiveMonitor:
             return
         if item.get("client_derived"):
             event = replace(event, client_derived=True)
+        if event.event_type == "rfq_closed" and event.rfq_id:
+            # Before apply(): a redelivered trade is still a trade for a late selection.
+            self._on_trade(raw, event.rfq_id)
         if self.store.apply(event, source=self.source_label):
             self.events_applied += 1
+            if event.event_type == "rfq_created" and event.rfq_id:
+                self._screen_new_rfq(raw, event.rfq_id)
             if event.event_type in _QUOTABLE:
                 self.engine.maybe_quote(event)
+
+
+def _combo_side(raw: Dict[str, Any]) -> Optional[str]:
+    """Gateway legs inherit the combo side, so the first leg's side is the combo's."""
+    legs = raw.get("comboLegs") or []
+    side = legs[0].get("side") if legs and isinstance(legs[0], dict) else None
+    return str(side) if side else None
