@@ -240,7 +240,9 @@ def price_combo(
         assert mark is not None
         q = mark if leg.side == "YES" else 1.0 - mark
         q_list.append(q)
-        mid = (leg.bid + leg.ask) / 2.0 if leg.bid and leg.ask else _EPS
+        # A 0.0 bid is a real (empty) side, not a missing one: keep the true
+        # mid rather than collapsing it to _EPS (which made spread_bps ~1e11).
+        mid = (leg.bid + leg.ask) / 2.0
         spread_bps = ((leg.ask - leg.bid) / max(mid, _EPS)) * 10000.0
         total_spread_bps += spread_bps
         total_top_size += (leg.bid_size or 0.0) + (leg.ask_size or 0.0)
@@ -290,11 +292,11 @@ def price_combo(
     raw_sell = fair - half_spread   # our bid
     buy_price = _round_up_to_tick(raw_buy, tick_size)
     sell_price = _round_down_to_tick(raw_sell, tick_size)
-    # Clamp to instrument limits; a side that cannot be quoted -> 0.0.
+    # A side outside instrument limits cannot be quoted -> 0.0. Never clamp
+    # it back inside: clamping the offer down to price_max would sell below
+    # fair + required edge (at fair == 1.0, below fair itself).
     if not (price_min <= buy_price <= price_max):
-        buy_price = 0.0 if buy_price < price_min else price_max
-        if buy_price == 0.0:
-            buy_price = 0.0
+        buy_price = 0.0
     if not (price_min <= sell_price <= price_max):
         sell_price = 0.0
     if buy_price == 0.0 and sell_price == 0.0:
