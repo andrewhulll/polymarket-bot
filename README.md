@@ -258,12 +258,15 @@ The dashboard opens with a PAPER/SHADOW banner and two controls at the top:
   with the better price. Trades produce the full quote lifecycle and a fill, then settle on the
   final score; a pushed leg voids the combo. Needs the cached nflverse pull under `data/raw`
   (`python scripts/refresh_params.py --pull`). Deterministic; about 5 seconds.
-- **Live monitor RFQ feed** — polls the Retail API every `poll_interval_s` through the same store
-  and shadow engine (`combo_mm/live_monitor.py`), auto-refreshing the views; **Stop live monitor**
-  keeps the data. Needs the two retail env vars and `pip install polymarket-us` (see
-  [Retail live data](#retail-live-data)). There is no simulated fallback: without credentials,
-  the SDK, or RFQ beta access, the dashboard says which is missing. Live RFQs are priced by the V1
-  pricer until Polymarket leg symbols are mapped to the NFL model.
+- **Live monitor RFQ feed** — streams live RFQs through the same store and shadow engine
+  (`combo_mm/live_monitor.py`), auto-refreshing the views every `poll_interval_s`; **Stop live
+  monitor** closes the connection and keeps the data. The source is the receive-only polymarket.com
+  quoter gateway when its `POLYMARKET_*` keys are set (see
+  [Live international RFQ feed](#live-international-rfq-feed-quoter-gateway)), else the US Retail
+  API when its two env vars are set (see [Retail live data](#retail-live-data)). There is no
+  simulated fallback: without keys, the needed package, or RFQ beta access, the dashboard says
+  which is missing. Live RFQs are not priced by the NFL model yet: Retail RFQs use the V1 pricer,
+  and gateway legs (on-chain position ids, no leg books) are recorded as `MISSING_LEG` declines.
 
 Views (all read the active run):
 
@@ -379,10 +382,12 @@ Rules (enforced by tests):
 
 ### Dashboard live monitor
 
-**Live monitor RFQ feed** starts a `RetailPollingSource` only if *both* env vars are set and the
-SDK is installed; otherwise the dashboard says plainly what is missing and shows no RFQs.
-Credential values are never displayed. A 403 on the RFQ endpoints shows "RFQ beta access: NOT
-enabled" while leg books keep refreshing.
+**Live monitor RFQ feed** prefers the polymarket.com quoter gateway (see
+[Live international RFQ feed](#live-international-rfq-feed-quoter-gateway)) when its four
+`POLYMARKET_*` keys are present. It falls back to a `RetailPollingSource` when *both* Retail env
+vars are set and the SDK is installed. Otherwise the dashboard says plainly what is missing and
+shows no RFQs. Credential values are never displayed. On Retail, a 403 on the RFQ endpoints shows
+"RFQ beta access: NOT enabled" while leg books keep refreshing.
 
 ### How live polling works
 
@@ -449,7 +454,14 @@ pick up the RFQ beta on the next successful poll.
 export POLYMARKET_US_KEY_ID="..."
 export POLYMARKET_US_SECRET_KEY="..."
 pip install polymarket-us
-# streamlit run dashboard/app.py, then press "Live monitor RFQ feed"
+# dashboard: streamlit run dashboard/app.py, then press "Live monitor RFQ feed"
+# (without the gateway keys set); or drive the source directly:
+python3 -c "
+from combo_mm import EventStore, PollingConsumer, RetailPollingSource
+store = EventStore('retail.db')
+PollingConsumer(RetailPollingSource(), store).poll_once()
+print(store.get_rfq_stats(), store.get_book_stats())
+"
 ```
 
 Tests are all mocked (no network, no real credentials):
@@ -471,6 +483,78 @@ paths (`/v1/rfqs*`) are hand-modeled guesses routed through the SDK's
 authenticated `get()` — verify against the Retail docs / API team before
 treating live RFQ polling as authoritative, and check
 `RetailPollingSource.last_error` after polls.
+
+## Live international RFQ feed (quoter gateway)
+
+The dashboard (and pipeline) can read the **live international RFQ stream**
+on polymarket.com instead of the simulated replay. RFQs arrive over the
+quoter-gateway websocket (`wss://combos-rfq-gateway-quoter.polymarket.com/ws/rfq`);
+the adapter (`combo_mm/intl_gateway.py::InternationalQuoterGatewayAdapter`,
+an `EventSource`) authenticates, reads the `RFQ_REQUEST` / `RFQ_TRADE`
+broadcast feed, and maps frames onto the pipeline's normalized RFQ lifecycle
+events (`rfq_created` / `rfq_closed`). Reconnect uses exponential backoff
+with jitter; `websockets` ping/pong is the heartbeat.
+
+**Receive-only, by construction.** The adapter has no code path that sends
+quotes, orders, or any trading message — there is no quote-submission client
+anywhere in the module, and `tests/test_intl_gateway.py` asserts that
+structurally. The 400 ms quote window is irrelevant to us: we only watch.
+
+### Installation
+
+Core pipeline: Python 3.12, stdlib only, plus `pytest` for tests.
+
+The live gateway feed needs the websocket client (optional dependency —
+the simulated pipeline and all non-gateway tests run without it):
+
+```bash
+pip install websockets
+```
+
+### Credentials
+
+From the **runtime environment only**:
+
+```bash
+export POLYMARKET_API_KEY="..."
+export POLYMARKET_SECRET="..."
+export POLYMARKET_PASSPHRASE="..."
+export POLYMARKET_ADDRESS="0x..."
+```
+
+Create these on polymarket.com (profile → Settings → API keys; requires a
+wallet signature). A gitignored local `.env` file in the repo root is also
+accepted and only fills gaps — real environment variables always win.
+
+Rules (enforced by tests):
+
+- All four values are read at adapter construction and never leave memory.
+- They are never logged (failure paths log the exception *class* only),
+  persisted, displayed, or committed. `GatewayCredentials.__repr__` redacts.
+- **Never commit secrets.** `.env` and `polymarket.keys*` are gitignored.
+  The no-trading-code test (`test_no_trading_code_paths`) scans the adapter
+  for trading wire tokens (`RFQ_QUOTE`, `signed_order`, `maker/quotes`) and
+  trading identifiers, so a quote-submission path cannot be added silently.
+- No private key is needed — gateway auth uses only the API triple plus the
+  wallet address for the identity field.
+
+### Dashboard
+
+Press **Live monitor RFQ feed**. With keys absent you get a message naming
+the variables; with keys present the adapter starts in a background thread,
+a live status strip shows connection state and RFQ/trade/reconnect counters,
+and every received RFQ flows through `LiveMonitor` into the store and shadow
+engine, so it appears on the RFQs, Pricing, Performance and Engine status
+tabs. **Stop live monitor** closes the websocket.
+
+### Mapping notes
+
+- `requested_size.unit == "notional"` → `cashOrderQty`; `"shares"` →
+  `qtyDecimal` (exactly one set, per the normalize XOR rule).
+- Legs carry on-chain **position ids** as `symbol` and inherit the
+  combo-level YES/NO `side` — the gateway provides no per-leg market symbol
+  or side. The RFQ `symbol` is the combo `condition_id`.
+- `RFQ_TRADE` (confirmed trade broadcast) → `rfq_closed`: "stop quoting".
 
 ## Going live — Exchange gRPC checklist (later)
 

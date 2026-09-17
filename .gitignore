@@ -1,5 +1,6 @@
 # Secrets / API keys
 polymarket.keys*
+.env
 
 # NFL pipeline: raw nflverse pulls and backtest outputs are regenerated locally
 data/

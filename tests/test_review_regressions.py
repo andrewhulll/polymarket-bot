@@ -97,6 +97,35 @@ def test_state_digest_reflects_row_contents_not_just_counts():
     assert s1.state_digest() != s2.state_digest()
 
 
+def test_state_digest_changes_when_shadow_columns_change():
+    def _drafted(**over):
+        s = EventStore()
+        kw = dict(quote_id="shdw-R1-1", rfq_id="R1", symbol="S",
+                  fair=0.5, buy_price=0.6, sell_price=0.4,
+                  buy_qty="10", sell_qty="10",
+                  model_version="m1", params_version="p1",
+                  input_snapshot_json='{"a":1}',
+                  # created_time defaults to wall-clock without this.
+                  decided_at="2026-01-01T00:00:00Z")
+        kw.update(over)
+        s.record_shadow_draft(**kw)
+        return s
+
+    base = _drafted().state_digest()
+    assert _drafted(model_version="m2").state_digest() != base
+    assert _drafted(params_version="p2").state_digest() != base
+    assert _drafted(input_snapshot_json='{"a":2}').state_digest() != base
+    assert _drafted().state_digest() == base  # sanity: identical -> identical
+
+    # origin is always 'shadow' via the public API; flip it directly to
+    # prove the digest covers that column too.
+    s = _drafted()
+    with s._conn:
+        s._conn.execute("UPDATE quotes SET origin='live'"
+                        " WHERE quote_id='shdw-R1-1'")
+    assert s.state_digest() != base
+
+
 # -- normalize / dedup -------------------------------------------------------
 def test_quote_event_without_rfq_id_is_rejected_not_misattributed():
     with pytest.raises(NormalizeError):

@@ -90,12 +90,14 @@ def main() -> None:
         print(f"WARNING: only {consumer.events_seen}/{expected} items consumed")
 
     # Fills reconcile exclusively through Drop Copy.
-    n_fills = drain_drop_copy(
+    fills_before = store.get_fill_stats()["fills"]
+    resume_token = drain_drop_copy(
         SimulatedDropCopyTransport(fixtures.build_drop_copy_feed()),
         store,
         now=fixtures.BASE_TS,
     )
-    print(f"drop copy: {n_fills} fills applied")
+    n_fills = store.get_fill_stats()["fills"] - fills_before
+    print(f"drop copy: {n_fills} fills applied (resume_token={resume_token})")
 
     print("\n=== pipeline summary ===")
     print(f"items seen:           {consumer.events_seen}")

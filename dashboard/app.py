@@ -11,12 +11,16 @@ from the repo root. Two controls at the top pick the data behind the views:
   against a naive competitor and settled on the final scores
   (:mod:`combo_mm.nfl.week_backtest`). Needs a cached nflverse pull under
   ``data/raw`` (``python scripts/refresh_params.py --pull``).
-- **Live monitor RFQ feed**: polls the Polymarket US Retail API
-  (:class:`combo_mm.retail.RetailPollingSource`) through the same store and
+- **Live monitor RFQ feed**: streams live RFQs through the same store and
   shadow engine (:class:`combo_mm.live_monitor.LiveMonitor`), refreshing the
-  views every few seconds. Needs ``POLYMARKET_US_KEY_ID`` /
-  ``POLYMARKET_US_SECRET_KEY`` in the environment and ``pip install
-  polymarket-us``. No simulated fallback: without access it says so.
+  views every few seconds. Source: the polymarket.com quoter gateway
+  (:class:`combo_mm.intl_gateway.InternationalQuoterGatewayAdapter`,
+  receive-only) when ``POLYMARKET_API_KEY`` / ``POLYMARKET_SECRET`` /
+  ``POLYMARKET_PASSPHRASE`` / ``POLYMARKET_ADDRESS`` are set (env or a
+  gitignored ``.env``); otherwise the Polymarket US Retail API
+  (:class:`combo_mm.retail.RetailPollingSource`) when ``POLYMARKET_US_KEY_ID``
+  / ``POLYMARKET_US_SECRET_KEY`` are set. No simulated fallback: without
+  access it says what is missing.
 
 Views 1-4 read the active run's SQLite DB:
 
@@ -33,6 +37,7 @@ Views 1-4 read the active run's SQLite DB:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -49,6 +54,12 @@ sys.path.insert(0, str(REPO))
 
 from combo_mm import PipelineConfig  # noqa: E402
 from combo_mm.auth import CredentialsNotConfigured  # noqa: E402
+from combo_mm.intl_gateway import (  # noqa: E402
+    GATEWAY_ENV_VARS,
+    GatewayCredentials,
+    InternationalQuoterGatewayAdapter,
+    MissingCredentialsError,
+)
 from combo_mm.live_monitor import LiveMonitor  # noqa: E402
 from combo_mm.nfl import week_backtest  # noqa: E402
 from combo_mm.paper_backtest import compute_metrics  # noqa: E402
@@ -91,24 +102,61 @@ def _run_backtest() -> Dict[str, Any]:
             "trades": out.trades, "meta": out.meta}
 
 
+MISSING_LIVE_KEYS_MSG = (
+    "Live monitoring needs API keys in the shell that starts Streamlit (or a gitignored `.env` "
+    "in the repo root for the gateway keys): "
+    + ", ".join(f"`{v}`" for v in GATEWAY_ENV_VARS)
+    + f" for the polymarket.com quoter gateway, or `{KEY_ID_ENV}` + `{SECRET_ENV}` "
+    "(plus `pip install polymarket-us`) for the US Retail API. Key values are never displayed. "
+    "No simulated RFQs are shown in live mode."
+)
+
+
+def _live_source(config: PipelineConfig):
+    """(source, label): the quoter gateway if its keys exist, else Retail if its keys exist."""
+    try:
+        creds = GatewayCredentials.from_env()
+    except MissingCredentialsError:
+        creds = None
+    if creds is not None:
+        return InternationalQuoterGatewayAdapter(creds).start(), "quoter gateway"
+    if os.environ.get(KEY_ID_ENV) and os.environ.get(SECRET_ENV):
+        return RetailPollingSource(poll_interval_s=config.poll_interval_s,
+                                   max_requests_per_poll=config.max_requests_per_poll), "retail"
+    return None, None
+
+
 def _start_live() -> Dict[str, Any]:
     config = PipelineConfig(paper_mode=True)
     run: Dict[str, Any] = {"mode": "live", "db_path": None, "monitor": None,
-                           "polling": False, "error": None,
+                           "polling": False, "error": None, "source": None,
                            "poll_interval_s": config.poll_interval_s}
     try:
-        source = RetailPollingSource(poll_interval_s=config.poll_interval_s,
-                                     max_requests_per_poll=config.max_requests_per_poll)
+        source, label = _live_source(config)
     except (CredentialsNotConfigured, RuntimeError) as exc:
-        run["error"] = str(exc)  # names the env vars / SDK only, never values
+        run["error"] = str(exc)  # names env vars / missing packages only, never values
         return run
     except Exception as exc:
-        run["error"] = f"Retail client failed to start ({type(exc).__name__})."
+        run["error"] = f"Live feed failed to start ({type(exc).__name__})."
+        return run
+    if source is None:
+        run["error"] = "No live feed credentials found."
         return run
     db_path = _new_db("combo_mm_live_")
-    run.update(db_path=db_path, polling=True,
-               monitor=LiveMonitor(source, EventStore(db_path), config, source_label="retail"))
+    run.update(db_path=db_path, polling=True, source=label,
+               monitor=LiveMonitor(source, EventStore(db_path), config, source_label=label))
     return run
+
+
+def _stop_live(run: Optional[Dict[str, Any]]) -> None:
+    """Stop polling and any background connection (the gateway owns a websocket thread)."""
+    if not run or run.get("mode") != "live":
+        return
+    run["polling"] = False
+    monitor = run.get("monitor")
+    stop = getattr(monitor.source, "stop", None) if monitor is not None else None
+    if stop is not None:
+        stop()
 
 
 run: Optional[Dict[str, Any]] = st.session_state.get("run")
@@ -117,6 +165,7 @@ live_polling = bool(run and run["mode"] == "live" and run.get("polling"))
 c_bt, c_live, c_state = st.columns([1.2, 1.2, 2.6])
 with c_bt:
     if st.button(f"Run backtest -- {BACKTEST_LABEL}", type="primary", width="stretch"):
+        _stop_live(run)
         with st.spinner(f"Replaying {BACKTEST_LABEL} same-game combos through the pipeline..."):
             try:
                 run = _run_backtest()
@@ -127,10 +176,11 @@ with c_bt:
 with c_live:
     if live_polling:
         if st.button("Stop live monitor", width="stretch"):
-            run["polling"] = False
+            _stop_live(run)
             st.rerun()  # redraw the controls and drop the refresh timers
     elif st.button("Live monitor RFQ feed", width="stretch"):
-        with st.spinner("Connecting to the Retail RFQ feed..."):
+        _stop_live(run)
+        with st.spinner("Connecting to the live RFQ feed..."):
             st.session_state["run"] = _start_live()
         st.rerun()  # redraw the controls with the refresh timers on
 with c_state:
@@ -140,15 +190,13 @@ with c_state:
     elif run["mode"] == "backtest":
         st.caption(f"Showing: **backtest -- {BACKTEST_LABEL}** (historical RFQ replay).")
     else:
-        st.caption("Showing: **live RFQ feed** -- "
+        st.caption(f"Showing: **live RFQ feed ({run.get('source') or 'not connected'})** -- "
                    + ("polling." if live_polling else "stopped (last data kept)."))
 
 if run is not None and run.get("error"):
     st.error(run["error"])
     if run["mode"] == "live":
-        st.info(f"Live monitoring needs `{KEY_ID_ENV}` and `{SECRET_ENV}` set in the shell that "
-                "starts Streamlit, plus `pip install polymarket-us`. The Retail RFQ endpoints are "
-                "beta-gated per key. No simulated RFQs are shown in live mode.")
+        st.info(MISSING_LIVE_KEYS_MSG)
 
 every = run["poll_interval_s"] if live_polling else None
 
@@ -158,20 +206,34 @@ def _live_status() -> None:
     monitor: LiveMonitor = run["monitor"]
     if run.get("polling"):
         monitor.poll_once()
+    source = monitor.source
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Polls", monitor.polls)
-    c2.metric("RFQ events applied", monitor.events_applied)
-    c3.metric("Leg book updates", monitor.books_seen)
-    beta = monitor.rfq_beta_enabled
-    c4.metric("RFQ beta access", "-" if beta is None else ("enabled" if beta else "NOT enabled"))
-    c5.metric("Poll errors", monitor.poll_errors)
-    if beta is False:
-        st.warning("This API key is not enabled for the Retail RFQ beta (403). No RFQs will "
-                   "appear until access is granted; leg books still refresh.")
-    if monitor.last_error:
-        st.caption(f"Last source error: `{monitor.last_error}`")
-    st.caption(f"Last poll: {monitor.last_poll_at} · every {run['poll_interval_s']:.0f}s · "
-               "pricer: V1 independent-leg (live symbols are not mapped to the NFL model yet).")
+    if isinstance(source, InternationalQuoterGatewayAdapter):
+        stats = source.stats()
+        c1.metric("Gateway", "connected" if source.connected else "reconnecting")
+        c2.metric("RFQs seen", stats["rfqs_seen"])
+        c3.metric("Trades seen", stats["trades_seen"])
+        c4.metric("Reconnects", stats["reconnects"])
+        c5.metric("RFQ events applied", monitor.events_applied)
+        if stats.get("last_error"):
+            st.caption(f"Last gateway error: `{stats['last_error']}`")
+        pricing_note = ("gateway legs are on-chain position ids with no leg books, so the shadow "
+                        "engine records them as MISSING_LEG declines until leg pricing is mapped")
+    else:
+        c1.metric("Polls", monitor.polls)
+        c2.metric("RFQ events applied", monitor.events_applied)
+        c3.metric("Leg book updates", monitor.books_seen)
+        beta = monitor.rfq_beta_enabled
+        c4.metric("RFQ beta access", "-" if beta is None else ("enabled" if beta else "NOT enabled"))
+        c5.metric("Poll errors", monitor.poll_errors)
+        if beta is False:
+            st.warning("This API key is not enabled for the Retail RFQ beta (403). No RFQs will "
+                       "appear until access is granted; leg books still refresh.")
+        if monitor.last_error:
+            st.caption(f"Last source error: `{monitor.last_error}`")
+        pricing_note = "V1 independent-leg pricer (live symbols are not mapped to the NFL model yet)"
+    st.caption(f"Source: {run['source']} (receive-only) · last poll: {monitor.last_poll_at} · "
+               f"every {run['poll_interval_s']:.0f}s · {pricing_note}.")
 
 
 if run is not None and run["mode"] == "live" and run.get("monitor") is not None:
@@ -220,7 +282,7 @@ def _rfq_view(r: Dict[str, Any]) -> None:
                 "independent-leg maker, and settles on the final score.")
         else:
             st.header("Live RFQ feed")
-            st.caption("RFQs observed on the Retail feed since the monitor started "
+            st.caption("RFQs observed on the live feed since the monitor started "
                        "(auto-refreshing while polling).")
 
         if not rfqs:
@@ -232,7 +294,8 @@ def _rfq_view(r: Dict[str, Any]) -> None:
         c1.metric("RFQs", len(rfqs))
         c2.metric("Executed (we traded)", statuses.count("EXECUTED"))
         c3.metric("Closed (no trade)", statuses.count("CLOSED"))
-        c4.metric("Open / quoted", statuses.count("OPEN") + statuses.count("QUOTED"))
+        c4.metric("Open / quoted", sum(x not in ("EXECUTED", "CLOSED", "CANCELLED", "EXPIRED")
+                                         for x in statuses))
 
         rows = []
         for x in rfqs:

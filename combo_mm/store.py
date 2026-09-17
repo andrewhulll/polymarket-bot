@@ -74,11 +74,13 @@ def _parse_ts(value: Optional[str]) -> Optional[datetime]:
     return parsed
 
 
-def _is_newer(candidate: Optional[str], current: Optional[str]) -> bool:
+def _is_newer(candidate: Optional[str], current: Optional[str], *,
+              allow_equal: bool = False) -> bool:
     """True if ``candidate`` updatedTime is strictly newer than ``current``.
 
     NULL current always loses to a non-NULL candidate; NULL candidate never
-    wins; equal timestamps are not newer (idempotent replays stay inert).
+    wins; equal timestamps are not newer (idempotent replays stay inert)
+    unless ``allow_equal`` is set.
     """
     if candidate is None:
         return False
@@ -90,7 +92,7 @@ def _is_newer(candidate: Optional[str], current: Optional[str]) -> bool:
     pu = _parse_ts(current)
     if pu is None:
         return True
-    return pc > pu
+    return pc >= pu if allow_equal else pc > pu
 
 
 class EventStore:
@@ -295,6 +297,7 @@ class EventStore:
             "quote_accepted": self._p_quote_accepted,
             "quote_confirmed": self._p_quote_confirmed,
             "quote_executed": self._p_quote_executed,
+            "quote_deleted": self._p_quote_deleted,
             "drop_copy_fill": self._p_drop_copy_fill,
         }.get(etype)
         if handler is None:
@@ -412,7 +415,10 @@ class EventStore:
                  0, target, event.event_key),
             )
             return
-        if not _is_newer(updated_time, row["updated_time"]):
+        # Terminal moves accept an EQUAL updatedTime: RFQs never reopen, so a
+        # close stamped at the same instant as the last update (e.g. a
+        # poll-derived close) is still true. Strictly older ones are ignored.
+        if not _is_newer(updated_time, row["updated_time"], allow_equal=True):
             return
         if rfq_allows(row["status"], target):
             cur.execute(
@@ -493,17 +499,24 @@ class EventStore:
                  client_order_id, created_time, updated_time, last_event_id)
             VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(quote_id) DO UPDATE SET
-                rfq_id=excluded.rfq_id, symbol=excluded.symbol,
-                maker_user_id=excluded.maker_user_id, status=excluded.status,
-                buy_price=excluded.buy_price, sell_price=excluded.sell_price,
-                buy_qty_decimal=excluded.buy_qty_decimal,
-                sell_qty_decimal=excluded.sell_qty_decimal,
-                accepted_side=excluded.accepted_side,
-                confirmation_deadline=excluded.confirmation_deadline,
-                execution_deadline=excluded.execution_deadline,
-                order_id=excluded.order_id,
-                client_order_id=excluded.client_order_id,
-                created_time=excluded.created_time,
+                -- Lifecycle events carry partial payloads (e.g. a confirm
+                -- without acceptedSide): absent fields keep the stored value.
+                rfq_id=COALESCE(excluded.rfq_id, quotes.rfq_id),
+                symbol=COALESCE(excluded.symbol, quotes.symbol),
+                maker_user_id=COALESCE(excluded.maker_user_id, quotes.maker_user_id),
+                status=excluded.status,
+                buy_price=COALESCE(excluded.buy_price, quotes.buy_price),
+                sell_price=COALESCE(excluded.sell_price, quotes.sell_price),
+                buy_qty_decimal=COALESCE(excluded.buy_qty_decimal, quotes.buy_qty_decimal),
+                sell_qty_decimal=COALESCE(excluded.sell_qty_decimal, quotes.sell_qty_decimal),
+                accepted_side=COALESCE(excluded.accepted_side, quotes.accepted_side),
+                confirmation_deadline=COALESCE(excluded.confirmation_deadline,
+                                               quotes.confirmation_deadline),
+                execution_deadline=COALESCE(excluded.execution_deadline,
+                                            quotes.execution_deadline),
+                order_id=COALESCE(excluded.order_id, quotes.order_id),
+                client_order_id=COALESCE(excluded.client_order_id, quotes.client_order_id),
+                created_time=COALESCE(excluded.created_time, quotes.created_time),
                 updated_time=excluded.updated_time,
                 last_event_id=excluded.last_event_id
             """,
@@ -603,6 +616,21 @@ class EventStore:
             log.debug("quote_executed for unknown quote %s: no row created",
                       fields["quote_id"])
         self._advance_rfq_from_quote(cur, event, fields["rfq_id"], "quote_executed")
+
+    def _p_quote_deleted(self, cur: sqlite3.Cursor, event: NormalizedEvent,
+                         p: Dict[str, Any]) -> None:
+        # Terminal for the quote only: the RFQ may still be quoted by others
+        # (or re-quoted by us), so the RFQ row is left alone.
+        fields = self._quote_wire(p)
+        fields["quote_id"] = self._quote_id_for(event, p)
+        fields["rfq_id"] = event.rfq_id or fields["rfq_id"]
+        current = self._current_quote_status(cur, fields["quote_id"])
+        if current is not None:
+            target = quote_target_status("quote_deleted", current)
+            self._upsert_quote(cur, event, fields, target_status=target)
+        else:
+            log.debug("quote_deleted for unknown quote %s: no row created",
+                      fields["quote_id"])
 
     def _quote_blocked_for_terminal_rfq(self, cur: sqlite3.Cursor,
                                         fields: Dict[str, Any]) -> bool:
@@ -720,22 +748,26 @@ class EventStore:
         producer of that event type) and moves the quote/RFQ to EXPIRED
         locally. Returns the expired ``[{rfq_id, quote_id}]`` pairs.
         """
-        now_iso = now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        now_utc = now.astimezone(timezone.utc)
+        now_iso = now_utc.isoformat().replace("+00:00", "Z")
         expired: List[Dict[str, Any]] = []
-        with self._lock, self._conn:
-            cur = self._conn.cursor()
-            rows = cur.execute(
+        with self._lock:
+            rows = self._conn.execute(
                 """
                 SELECT quote_id, rfq_id, symbol, confirmation_deadline
                 FROM quotes
                 WHERE status = 'ACCEPTED'
                   AND maker_user_id = ?
                   AND confirmation_deadline IS NOT NULL
-                  AND confirmation_deadline < ?
                 """,
-                (maker_user_id, now_iso),
+                (maker_user_id,),
             ).fetchall()
             for row in rows:
+                # Compare parsed datetimes: mixed wire precisions/offsets do
+                # not order correctly as strings (see _parse_ts).
+                deadline = _parse_ts(row["confirmation_deadline"])
+                if deadline is None or not deadline < now_utc:
+                    continue
                 payload = {
                     "id": row["rfq_id"],
                     "status": "EXPIRED",
@@ -754,11 +786,12 @@ class EventStore:
                     client_derived=True,
                 )
                 if self.apply(event, source="sweeper"):
-                    cur.execute(
-                        "UPDATE quotes SET status = 'EXPIRED', updated_time = ? "
-                        "WHERE quote_id = ? AND status = 'ACCEPTED'",
-                        (now_iso, row["quote_id"]),
-                    )
+                    with self._conn:
+                        self._conn.execute(
+                            "UPDATE quotes SET status = 'EXPIRED', updated_time = ? "
+                            "WHERE quote_id = ? AND status = 'ACCEPTED'",
+                            (now_iso, row["quote_id"]),
+                        )
                     expired.append(
                         {"rfq_id": row["rfq_id"], "quote_id": row["quote_id"]}
                     )
@@ -1056,10 +1089,10 @@ class EventStore:
             rows = self._conn.execute(
                 "SELECT status, COUNT(*) AS n FROM rfq GROUP BY status"
             ).fetchall()
-            counts = {r["status"]: r["n"] for r in rows}
-            open_n = sum(n for s, n in counts.items()
-                         if s not in RFQ_TERMINAL_STATUSES)
-            return {"OPEN": open_n, **counts}
+            # Plain per-status counts. (Previously an aggregate "OPEN" key
+            # was merged in, which the per-status "OPEN" count silently
+            # overwrote whenever any OPEN row existed.)
+            return {r["status"]: r["n"] for r in rows}
 
     def get_quote_stats(self) -> Dict[str, Any]:
         with self._lock:
@@ -1169,18 +1202,53 @@ class EventStore:
     def state_digest(self) -> str:
         """Byte-for-byte state digest: sha256 over the canonical read model.
 
-        The snapshot is serialized as canonical JSON (sorted keys, compact
-        separators) so two stores holding the same logical state produce the
-        identical 64-char hex digest, regardless of row insertion order.
+        The snapshot covers the entity rows themselves (not just per-status
+        counts, which would hide e.g. a wrong price or a swapped RFQ), sorted
+        by key and serialized as canonical JSON, so two stores holding the
+        same logical state produce the identical 64-char hex digest
+        regardless of insertion order. Bookkeeping columns that may carry
+        wall-clock or ingest-order values (``updated_time`` set by recovery
+        inference, ``last_event_id``, book ``ts``, row ids) are excluded.
+        One caveat: ``quotes.created_time`` is included, and it falls back
+        to wall-clock time when a shadow draft is recorded without
+        ``decided_at``. The engine always passes exchange time
+        (``decided_at=event.event_at``), so engine-produced digests are
+        deterministic; direct ``record_shadow_draft`` calls without
+        ``decided_at`` are not digest-stable across runs.
         """
-        snapshot = {
-            "rfqs": self.get_rfq_stats(),
-            "quotes": self.get_quote_stats(),
-            "fills": self.get_fill_stats(),
-            "books": self.get_book_stats(),
-            "shadow": self.get_shadow_stats(),
-            "drop_copy_token": self.get_drop_copy_token(),
-        }
+        def rows(sql: str) -> List[Dict[str, Any]]:
+            return [dict(r) for r in self._conn.execute(sql).fetchall()]
+
+        with self._lock:
+            snapshot = {
+                "rfqs": rows(
+                    "SELECT rfq_id, symbol, creator_user_id, qty_decimal, "
+                    "cash_order_qty, created_time, rest_remainder, status "
+                    "FROM rfq ORDER BY rfq_id"),
+                "legs": rows(
+                    "SELECT rfq_id, symbol, side, settlement_price "
+                    "FROM rfq_legs ORDER BY rfq_id, rowid"),
+                "quotes": rows(
+                    "SELECT quote_id, rfq_id, symbol, maker_user_id, status, "
+                    "origin, model_version, params_version, input_snapshot_json, "
+                    "buy_price, sell_price, buy_qty_decimal, sell_qty_decimal, "
+                    "accepted_side, confirmation_deadline, execution_deadline, "
+                    "order_id, client_order_id, created_time "
+                    "FROM quotes ORDER BY quote_id"),
+                "fills": rows(
+                    "SELECT fill_id, rfq_id, quote_id, symbol, side, price, "
+                    "qty, executed_time, source, drop_copy_seq "
+                    "FROM fills ORDER BY fill_id"),
+                "books": rows(
+                    "SELECT symbol, bid, ask, bid_size, ask_size, seq "
+                    "FROM books ORDER BY symbol"),
+                "shadow": rows(
+                    "SELECT rfq_id, decision, reason, fair_price, buy_price, "
+                    "sell_price, spread_bps, expected_edge_bps, buy_qty, "
+                    "sell_qty, components_json, ts "
+                    "FROM shadow_decisions ORDER BY rfq_id, ts, id"),
+                "drop_copy_token": self.get_drop_copy_token(),
+            }
         canonical = json.dumps(snapshot, sort_keys=True,
                                separators=(",", ":"), default=str)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
