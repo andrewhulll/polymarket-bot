@@ -11,16 +11,9 @@ from the repo root. Two controls at the top pick the data behind the views:
   against a naive competitor and settled on the final scores
   (:mod:`combo_mm.nfl.week_backtest`). Needs a cached nflverse pull under
   ``data/raw`` (``python scripts/refresh_params.py --pull``).
-- **Live monitor RFQ feed**: streams live RFQs through the same store and
-  shadow engine (:class:`combo_mm.live_monitor.LiveMonitor`), refreshing the
-  views every few seconds. Source: the polymarket.com quoter gateway
-  (:class:`combo_mm.intl_gateway.InternationalQuoterGatewayAdapter`,
-  receive-only) when ``POLYMARKET_API_KEY`` / ``POLYMARKET_SECRET`` /
-  ``POLYMARKET_PASSPHRASE`` / ``POLYMARKET_ADDRESS`` are set (env or a
-  gitignored ``.env``); otherwise the Polymarket US Retail API
-  (:class:`combo_mm.retail.RetailPollingSource`) when ``POLYMARKET_US_KEY_ID``
-  / ``POLYMARKET_US_SECRET_KEY`` are set. No simulated fallback: without
-  access it says what is missing.
+- **Live monitor RFQ feed**: reads ``data/live/rfq_capture.db`` written by
+  ``scripts/capture_live_rfqs.py``. The headless process owns the websocket,
+  screening and paper pricing; Streamlit only refreshes read-only views.
 
 Views 1-4 read the active run's SQLite DB:
 
@@ -80,6 +73,7 @@ from combo_mm.pricing import QUOTED_OK  # noqa: E402
 from combo_mm.rfq_screen import QUOTABLE, UNRESOLVED  # noqa: E402
 from combo_mm.store import EventStore  # noqa: E402
 from dashboard import nfl_tab  # noqa: E402
+from dashboard import live_views  # noqa: E402
 
 # The live quoter gateway broadcasts ~200 RFQs/s, so live views show the newest
 # rows only and take counts from SQL aggregates (the backtest shows everything).
@@ -200,43 +194,18 @@ def _live_quoter(config: PipelineConfig, catalog: ComboMarketCatalog,
 
 
 def _start_live() -> Dict[str, Any]:
-    config = PipelineConfig(paper_mode=True)
-    run: Dict[str, Any] = {"mode": "live", "db_path": None, "monitor": None,
-                           "polling": False, "error": None, "source": None,
-                           "poll_interval_s": config.poll_interval_s}
-    try:
-        source, label = _live_source(config)
-    except (CredentialsNotConfigured, RuntimeError) as exc:
-        run["error"] = str(exc)  # names env vars / missing packages only, never values
-        return run
-    except Exception as exc:
-        run["error"] = f"Live feed failed to start ({type(exc).__name__})."
-        return run
-    if source is None:
-        run["error"] = "No live feed credentials found."
-        return run
-    db_path = _new_db("combo_mm_live_")
-    quoter, note = _live_quoter(config, _combo_catalog(), _quote_selections())
-    run.update(db_path=db_path, polling=True, source=label, pricing_note=note,
-               monitor=LiveMonitor(source, EventStore(db_path, synchronous="NORMAL"), config,
-                                   source_label=label, catalog=_combo_catalog(),
-                                   selections=_quote_selections(), quoter=quoter))
-    return run
+    db_path = LIVE_DATA / "rfq_capture.db"
+    return {"mode": "live", "db_path": str(db_path) if db_path.exists() else None,
+            "monitor": None, "polling": True, "source": "headless capture",
+            "error": None if db_path.exists() else
+            "Start `python scripts/capture_live_rfqs.py --data-dir data/live` first."}
 
 
 def _stop_live(run: Optional[Dict[str, Any]]) -> None:
-    """Stop polling and any background connection (the gateway owns a websocket thread)."""
+    """Stop this viewer's refresh; the headless engine keeps running."""
     if not run or run.get("mode") != "live":
         return
     run["polling"] = False
-    monitor = run.get("monitor")
-    if monitor is None:
-        return
-    if monitor.quoter is not None:
-        monitor.quoter.stop()
-    stop = getattr(monitor.source, "stop", None)
-    if stop is not None:
-        stop()
 
 
 run: Optional[Dict[str, Any]] = st.session_state.get("run")
@@ -276,10 +245,8 @@ with c_state:
 
 if run is not None and run.get("error"):
     st.error(run["error"])
-    if run["mode"] == "live":
-        st.info(MISSING_LIVE_KEYS_MSG)
 
-every = run["poll_interval_s"] if live_polling else None
+every = None
 
 
 @st.fragment(run_every=every)
@@ -365,11 +332,13 @@ def _live_status() -> None:
 if run is not None and run["mode"] == "live" and run.get("monitor") is not None:
     _live_status()
 
-view = st.tabs(["RFQs", "Pricing & quoting", "Performance", "Engine status", "NFL correlation"])
+view = (st.tabs(["RFQs", "Pricing & quoting", "Performance", "Engine status", "NFL correlation"])
+        if run is None or run["mode"] != "live" else None)
 
 # The NFL correlation view reads offline backtest files and does not need a run.
-with view[4]:
-    nfl_tab.render()
+if view is not None:
+    with view[4]:
+        nfl_tab.render()
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -1117,7 +1086,14 @@ def _engine_view(r: Dict[str, Any]) -> None:
 
 # The run-dependent views render once a control above has produced a DB (and
 # stay inert in bare mode, ``python -c "import dashboard.app"``).
-if run is None or not run.get("db_path"):
+if run is not None and run["mode"] == "live" and run.get("db_path"):
+    @st.fragment(run_every=0.75 if live_polling else None)
+    def _live_readonly_view() -> None:
+        live_views.render(run["db_path"], nfl_tab)
+    _live_readonly_view()
+elif run is not None and run["mode"] == "live":
+    st.info("The headless capture runner will create the live database when it starts.")
+elif run is None or not run.get("db_path"):
     for tab in view[:4]:
         with tab:
             st.info(f'Press "Run backtest -- {BACKTEST_LABEL}" for the historical RFQs '

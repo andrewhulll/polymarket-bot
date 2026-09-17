@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from capture_live_rfqs import RfqCapture  # noqa: E402
 from export_nfl_rfqs import build_rows, load_trade_extras  # noqa: E402
+from combo_mm.quote_selections import QuoteSelectionStore
 
 NOW = datetime(2026, 9, 18, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -100,6 +101,21 @@ def test_handle_ignores_book_items(tmp_path):
     capture.handle({"kind": "book", "symbol": "100", "bid": 0.5, "ask": 0.51}, NOW)
     assert capture.rfqs_seen == 0
     assert capture.raw_path.read_text() == ""
+    capture.stop()
+
+
+def test_rescreen_records_decline_when_pricing_unavailable(tmp_path):
+    from combo_mm.combo_markets import parse_catalog_page
+
+    capture = RfqCapture(tmp_path)
+    capture.selections = QuoteSelectionStore(tmp_path / "rfq_capture.db")
+    capture.handle({"kind": "event", "raw": _rfq_request("late", ["100", "101"])}, NOW)
+    assert capture.store.get_rfq_screen("late")["screen"] == "UNRESOLVED"
+    capture.catalog.merge(parse_catalog_page({"markets": [NFL_GAME]}))
+    capture.rescreen_unresolved()
+    assert capture.store.get_rfq_screen("late")["screen"] == "QUOTABLE"
+    quote = capture.selections.list_priced_quotes(rfq_id="late")[0]
+    assert quote["reason_code"] == "PRICING_UNAVAILABLE"
     capture.stop()
 
 

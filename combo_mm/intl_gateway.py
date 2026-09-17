@@ -245,6 +245,22 @@ def map_rfq_request(
         raise MappingError(f"RFQ_REQUEST unknown size unit: {unit!r}")
 
     ts = received_at or _iso_now()
+    # Gateway deployments that include an exchange posting time let us
+    # measure the full posted -> engine wait. Older broadcasts have no such
+    # field; receipt time is the observable lower bound in that case.
+    posted = frame.get("created_at") or frame.get("createdAt") or frame.get("timestamp")
+    if posted is not None:
+        try:
+            if isinstance(posted, (int, float)) or str(posted).isdigit():
+                value = float(posted)
+                if value > 1e12:
+                    value /= 1000
+                posted = datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+            else:
+                posted = datetime.fromisoformat(str(posted).replace("Z", "+00:00")).isoformat()
+            ts = str(posted)
+        except (ValueError, OverflowError, OSError):
+            pass
     raw: Dict[str, Any] = {
         "event_type": "rfq_created",
         "rfq_id": rfq_id,
@@ -367,6 +383,7 @@ class InternationalQuoterGatewayAdapter(EventSource):
         self._buf: Deque[Dict[str, Any]] = collections.deque()
         self._recent: Deque[Dict[str, Any]] = collections.deque(maxlen=recent_max)
         self._lock = threading.Lock()
+        self._items_ready = threading.Event()
         self._stop = threading.Event()
         self._connected = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -393,7 +410,13 @@ class InternationalQuoterGatewayAdapter(EventSource):
         """Drain buffered raw events into the pipeline item envelope."""
         with self._lock:
             raws = [self._buf.popleft() for _ in range(len(self._buf))]
+            if not self._buf:
+                self._items_ready.clear()
         return [{"kind": "event", "raw": raw} for raw in raws]
+
+    def wait_for_items(self, timeout: float = 1.0) -> bool:
+        """Wake a headless consumer as soon as a websocket frame is buffered."""
+        return self._items_ready.wait(timeout)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -638,6 +661,7 @@ class InternationalQuoterGatewayAdapter(EventSource):
                 self._buf.popleft()
                 self._stats["buffer_drops"] += 1
             self._buf.append(raw)
+            self._items_ready.set()
             self._recent.append(summary)
             if kind == "rfq":
                 self._stats["rfqs_seen"] += 1

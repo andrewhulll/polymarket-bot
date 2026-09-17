@@ -40,10 +40,12 @@ class LiveQuoter:
 
     def __init__(self, pricer: NflLivePricer, store: QuoteSelectionStore, *,
                  max_queue: int = 500, start_worker: bool = True,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 on_decision: Optional[Callable[[LiveRfq, LiveQuote, datetime, datetime], None]] = None) -> None:
         self.pricer = pricer
         self.store = store
         self._clock = clock
+        self.on_decision = on_decision
         self._queue: "queue.Queue[tuple[LiveRfq, str]]" = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -94,6 +96,7 @@ class LiveQuoter:
             with self._lock:
                 self._seen.discard(key)
             log.warning("live quoter queue full; dropped rfq=%s", rfq.rfq_id)
+            # The caller records a durable queue-full decline if needed.
             return False
         self.submitted += 1
         return True
@@ -132,7 +135,8 @@ class LiveQuoter:
                 self._queue.task_done()
 
     def _handle(self, rfq: LiveRfq, trigger: str) -> LiveQuote:
-        quote = self.pricer.price(rfq, now=self._clock())
+        started = self._clock()
+        quote = self.pricer.price(rfq, now=started)
         self.priced += 1
         self.last_quote = quote
         if quote.quoted:
@@ -155,6 +159,13 @@ class LiveQuoter:
             self.errors += 1
             self.last_error = f"store {type(exc).__name__}"
             log.warning("failed to store priced quote: %s", type(exc).__name__)
+        if self.on_decision is not None:
+            try:
+                self.on_decision(rfq, quote, started, self._clock())
+            except Exception as exc:
+                self.errors += 1
+                self.last_error = f"decision {type(exc).__name__}"
+                log.warning("failed to record live decision: %s", type(exc).__name__)
         return quote
 
     def stats(self) -> Dict[str, Any]:
