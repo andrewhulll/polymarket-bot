@@ -16,7 +16,8 @@ module estimates ``Sigma`` (shape) from history.
    mean, so residual moments are the conditional moments the pricer needs.
 2. **Recency-weighted trailing window.** Only games strictly before the
    ``as_of`` (season, week) cutoff are used -- no future information by
-   construction. Within the trailing ``window_seasons`` each game gets weight
+   construction. Within the trailing ``window_seasons`` (``None`` = all prior
+   history) each game gets weight
    ``0.5 ** (age_in_seasons / half_life_seasons)``. At least ``min_seasons``
    of prior seasons are required.
 3. **Variance model.** ``league_constant``: one weighted variance.
@@ -81,7 +82,7 @@ class InsufficientHistory(ValueError):
 @dataclass(frozen=True)
 class EstimatorConfig:
     variance_model: str = "mean_linear"
-    window_seasons: int = 4          # trailing full seasons (+ current season to date)
+    window_seasons: Optional[int] = 4   # trailing full seasons (+ current season to date); None = all history
     min_seasons: int = 3             # prior seasons required in the window
     half_life_seasons: float = 2.0
     shrink_k_games: float = 5.0
@@ -96,7 +97,7 @@ class EstimatorConfig:
     def __post_init__(self) -> None:
         if self.variance_model not in VARIANCE_MODELS:
             raise ValueError(f"variance_model must be one of {VARIANCE_MODELS}")
-        if self.min_seasons < 1 or self.window_seasons < self.min_seasons:
+        if self.min_seasons < 1 or (self.window_seasons is not None and self.window_seasons < self.min_seasons):
             raise ValueError("need 1 <= min_seasons <= window_seasons")
         if self.var_shrink_multiplier < 0 or self.ratio_cap <= 1.0:
             raise ValueError("var_shrink_multiplier must be >= 0 and ratio_cap > 1")
@@ -208,7 +209,7 @@ def estimate_params(games_or_table, season: int, week: int,
     cfg = config or EstimatorConfig()
     table = games_or_table if isinstance(games_or_table, ResidualTable) else ResidualTable.build(games_or_table)
 
-    first_season = season - cfg.window_seasons
+    first_season = season - cfg.window_seasons if cfg.window_seasons is not None else -10 ** 6
     mask = table.before(season, week) & (table.season >= first_season)
     prior_seasons = sorted({int(s) for s in table.season[mask] if s < season})
     if len(prior_seasons) < cfg.min_seasons:

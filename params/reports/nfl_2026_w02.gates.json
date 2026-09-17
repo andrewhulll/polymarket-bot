@@ -7,15 +7,15 @@
   "estimator": {
     "factor_max": 1.6,
     "factor_min": 0.6,
-    "half_life_seasons": 2.0,
+    "half_life_seasons": 1.0,
     "min_seasons": 3,
     "offseason_regression": 0.5,
     "ratio_cap": 9.0,
     "shrink_k_games": 5.0,
     "sigma_max": 16.0,
     "sigma_min": 5.0,
-    "var_shrink_multiplier": 3.0,
-    "variance_model": "mean_linear",
+    "var_shrink_multiplier": 1.0,
+    "variance_model": "league_constant",
     "window_seasons": 4
   },
   "gates": [
@@ -26,7 +26,7 @@
     },
     {
       "detail": {
-        "candidate_brier": 0.1874020817609119,
+        "candidate_brier": 0.1872801891627879,
         "n_combos": 1080,
         "naive_brier": 0.18728026342634826,
         "previous_file": null,
@@ -37,7 +37,7 @@
     },
     {
       "detail": {
-        "bytes": 14181
+        "bytes": 14020
       },
       "name": "determinism",
       "passed": true

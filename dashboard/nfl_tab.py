@@ -140,12 +140,12 @@ def render() -> None:
         _empty_state()
         return
     combos, games, history, meta = loaded
-    filtered_combos, filtered_games, primary = _filters(combos, games, meta)
+    filtered_combos, filtered_games, primary, both_splits = _filters(combos, games, meta)
 
     views = st.tabs(["Overview", "Combo pricing", "Calibration", "Correlation structure",
                      "Sensitivity & P&L", "Combo explorer", "Params & data"])
     with views[0]:
-        _overview(filtered_combos, filtered_games, meta, primary)
+        _overview(filtered_combos, filtered_games, meta, primary, both_splits)
     with views[1]:
         _combo_pricing(filtered_combos, primary)
     with views[2]:
@@ -169,7 +169,7 @@ def _empty_state() -> None:
     have_data = latest_pull(RAW_ROOT) is not None
     c1, c2 = st.columns(2)
     with c1:
-        first, last = st.slider("Seasons", 2003, 2025, (2010, 2025), key="nfl_empty_seasons")
+        first, last = st.slider("Seasons", 2003, 2025, (2006, 2025), key="nfl_empty_seasons")
     with c2:
         st.write("")
         st.write("")
@@ -184,6 +184,23 @@ def _empty_state() -> None:
 def _filters(combos: pd.DataFrame, games: pd.DataFrame, meta: Dict):
     seasons = sorted(combos["season"].unique())
     models = [m for m in meta["config"]["variance_models"]]
+    has_split = "split" in combos.columns
+    sample = "All"
+    if has_split:
+        split = meta.get("split", {})
+        train, test = split.get("train"), split.get("test")
+        c1, c2 = st.columns([1, 2.2], vertical_alignment="center")
+        with c1:
+            sample = st.segmented_control(
+                "Sample", ["Test", "Train", "All"], default="Test", key="nfl_f_split",
+                help="Chronological 80/20 split. Estimator settings were tuned on the train seasons only; "
+                     "test seasons were scored once with the frozen settings.") or "Test"
+        with c2:
+            tuned = meta.get("tuned_estimator")
+            boundaries = f"**Train** {train[0]}–{train[1]} · **Test** {test[0]}–{test[1]}. " if train and test else ""
+            tuning = (f"Estimator tuned on {tuned['train_seasons'][0]}–{tuned['train_seasons'][1]} only."
+                      if tuned else "⚠ Estimator not tuned (defaults).")
+            st.caption(boundaries + "Walk-forward everywhere: each week's params use only earlier games. " + tuning)
     with st.expander("Filters (apply to every view except the explorer)", expanded=False, icon=":material/tune:"):
         c1, c2, c3 = st.columns([2, 2, 1.2])
         with c1:
@@ -213,14 +230,55 @@ def _filters(combos: pd.DataFrame, games: pd.DataFrame, meta: Dict):
         want_po = "Playoffs" in types
         sel &= (combos["game_type"] == "REG") & want_reg | (combos["game_type"] != "REG") & want_po
         gsel &= (games["game_type"] == "REG") & want_reg | (games["game_type"] != "REG") & want_po
-    return combos[sel], games[gsel], primary
+    both_combos = combos[sel]
+    if has_split and sample != "All":
+        sel &= combos["split"] == sample.lower()
+        gsel &= games["split"] == sample.lower()
+    return combos[sel], games[gsel], primary, both_combos
 
 
 # ---------------------------------------------------------------------------
 # 1. Overview
 # ---------------------------------------------------------------------------
 
-def _overview(combos: pd.DataFrame, games: pd.DataFrame, meta: Dict, primary: str) -> None:
+def _train_vs_test(both: pd.DataFrame, meta: Dict, primary: str) -> None:
+    """Out-of-sample check: the same scores on the train and test periods side by side."""
+    if "split" not in both.columns or both["split"].nunique() < 2:
+        return
+    st.subheader("Train vs test (out-of-sample check)")
+    col = bt.model_col(primary)
+    rows = []
+    for split in (bt.TRAIN, bt.TEST):
+        sub = both[both["split"] == split]
+        if (~sub["pushed"]).sum() == 0:
+            continue
+        seasons = sorted(sub["season"].unique())
+        for label, part in (("All combos", sub), ("Excluding nested", sub[~sub["nested"]]),
+                            ("Spread x total", sub[sub["family"] == "spread x total"])):
+            if (~part["pushed"]).sum() == 0:
+                continue
+            sc = bt.score_table(part, [col]).set_index("model")
+            m = col.removeprefix("p_")
+            rows.append({"split": f"{split.title()} {seasons[0]}–{seasons[-1]}", "combos": label,
+                         "games": part["game_id"].nunique(), "n": int(sc.loc[m, "n"]),
+                         "brier_naive": sc.loc["naive", "brier"], "brier_model": sc.loc[m, "brier"],
+                         "skill": sc.loc[m, "brier_skill_vs_naive"], "t": sc.loc[m, "t_stat"]})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+                 column_config={"split": "Period", "combos": "Combos", "games": "Games", "n": "Scored",
+                                "brier_naive": st.column_config.NumberColumn("Brier naive", format="%.5f"),
+                                "brier_model": st.column_config.NumberColumn("Brier model", format="%.5f"),
+                                "skill": st.column_config.NumberColumn("Skill vs naive", format="percent"),
+                                "t": st.column_config.NumberColumn("t", format="%.1f")})
+    est = meta["config"].get("estimator", {})
+    st.caption(
+        f"Frozen estimator ({MODEL_LABELS.get(primary, primary)}): window "
+        f"{est.get('window_seasons') or 'all history'} seasons, half-life {est.get('half_life_seasons')} seasons, "
+        f"variance shrink ×{est.get('var_shrink_multiplier')}. Filters above apply; the Sample selector does not."
+    )
+
+
+def _overview(combos: pd.DataFrame, games: pd.DataFrame, meta: Dict, primary: str,
+              both_splits: Optional[pd.DataFrame] = None) -> None:
     vintage = meta.get("data_vintage", {})
     c = st.columns(3) + st.columns(3)
     c[0].metric("Games", f"{games['game_id'].nunique():,}")
@@ -292,6 +350,9 @@ def _overview(combos: pd.DataFrame, games: pd.DataFrame, meta: Dict, primary: st
         err = base.mark_rule(color="black").encode(x="lo:Q", x2="hi:Q")
         rule = alt.Chart(pd.DataFrame({"x": [0]})).mark_rule(strokeDash=[4, 3]).encode(x="x:Q")
         _chart((bars + err + rule).properties(height=300))
+
+    if both_splits is not None:
+        _train_vs_test(both_splits, meta, primary)
 
     st.subheader("Key findings (computed from the filtered data)")
     for line in _findings(combos, games, meta, primary):
@@ -621,7 +682,7 @@ def _structure(games: pd.DataFrame, history: pd.DataFrame, meta: Dict) -> None:
 
 def _sensitivity(combos: pd.DataFrame, meta: Dict, primary_filter: str) -> None:
     cfg = meta["config"]
-    primary = cfg["primary_model"]
+    primary = cfg.get("sensitivity_model") or cfg["primary_model"]
     st.markdown(
         f"Re-price every combo with the **{MODEL_LABELS[primary]}** model while scaling all modeled dependence "
         "by *c*: ρ → c·ρ and the favorite/underdog variance asymmetry → c×. **c = 0** makes margin and total "
@@ -963,6 +1024,34 @@ def _params_and_data(meta: Dict) -> None:
     if b[2].button("Re-run backtest", key="nfl_rerun", type="primary"):
         _run_script(["scripts/nfl_backtest.py"], "Running walk-forward backtest")
         st.rerun()
+
+    st.subheader("Estimator tuning (train period only)")
+    selection = PARAMS_DIR / "estimator.json"
+    grid_path = REPO / "results" / "nfl_tuning" / "grid.csv"
+    if selection.exists():
+        sel = json.loads(selection.read_text())
+        t = st.columns(4)
+        t[0].metric("Tuned on", f"{sel['train_seasons'][0]}–{sel['train_seasons'][1]}")
+        t[1].metric("Selected model", MODEL_LABELS.get(sel["variance_model"], sel["variance_model"]))
+        t[2].metric("Train Brier", f"{sel['train_brier']:.5f}", help=f"Naive: {sel['train_brier_naive']:.5f}")
+        t[3].metric("Candidates", sel["n_candidates"])
+        st.caption(f"Frozen estimator: `{json.dumps(sel['estimator'])}` — used by the backtest's test period and the "
+                   "weekly refresh. Test-season games are removed from the input before tuning runs.")
+    else:
+        st.info("No tuned estimator yet: `python scripts/nfl_tune.py` (train-period grid search).")
+    if grid_path.exists():
+        grid = pd.read_csv(grid_path)
+        grid["window_seasons"] = grid["window_seasons"].map(lambda w: "all" if pd.isna(w) else f"{int(w)}")
+        grid["variance_model"] = grid["variance_model"].map(lambda m: MODEL_LABELS.get(m, m))
+        with st.expander(f"Tuning grid — {len(grid)} candidates ranked by train Brier", expanded=False):
+            st.dataframe(grid.drop(columns=["grid_index"]), hide_index=True, width="stretch",
+                         column_config={"brier": st.column_config.NumberColumn("Brier", format="%.5f"),
+                                        "brier_naive": st.column_config.NumberColumn("Brier naive", format="%.5f"),
+                                        "brier_skill": st.column_config.NumberColumn("Skill", format="percent"),
+                                        "brier_skill_non_nested": st.column_config.NumberColumn("Skill (non-nested)", format="percent"),
+                                        "brier_skill_spread_total": st.column_config.NumberColumn("Skill (spread x total)", format="percent"),
+                                        "log_loss": st.column_config.NumberColumn("Log loss", format="%.5f"),
+                                        "t_stat": st.column_config.NumberColumn("t", format="%.1f")})
 
     files = list_params(PARAMS_DIR)
     st.subheader("Weekly params files")

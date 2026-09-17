@@ -1,0 +1,48 @@
+{
+  "data_vintage": {
+    "pull_date": "2026-09-16",
+    "sha256": "0ac6de43583d7d321e159dc75b0855896813de2f484df8341da5b43cac32ffd6"
+  },
+  "estimator": {
+    "factor_max": 1.6,
+    "factor_min": 0.6,
+    "half_life_seasons": 1.0,
+    "min_seasons": 3,
+    "offseason_regression": 0.5,
+    "ratio_cap": 9.0,
+    "shrink_k_games": 5.0,
+    "sigma_max": 16.0,
+    "sigma_min": 5.0,
+    "var_shrink_multiplier": 1.0,
+    "variance_model": "league_constant",
+    "window_seasons": 4
+  },
+  "grid": {
+    "half_life_seasons": [
+      1.0,
+      2.0,
+      4.0
+    ],
+    "var_shrink_multiplier": [
+      1.0,
+      3.0
+    ],
+    "window_seasons": [
+      4,
+      8,
+      null
+    ]
+  },
+  "metric": "brier_all_combos",
+  "n_candidates": 36,
+  "runner_up_brier": 0.16804850689562212,
+  "selected_by": "scripts/nfl_tune.py (train period only)",
+  "train_brier": 0.16804812086567789,
+  "train_brier_naive": 0.17602495643415195,
+  "train_brier_skill": 0.0453165035803208,
+  "train_seasons": [
+    2006,
+    2021
+  ],
+  "variance_model": "league_constant"
+}
