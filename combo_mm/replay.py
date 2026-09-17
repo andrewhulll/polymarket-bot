@@ -16,7 +16,7 @@ and the demo script. Returns the state digest plus counters.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from combo_mm.books import LegBookCache
@@ -53,8 +53,15 @@ def replay_session(session: List[Dict[str, Any]],
                    enable_shadow: bool = True,
                    include_stream_invisible: bool = True,
                    drain_drop_copy_records: Optional[List[Dict[str, Any]]] = None,
+                   base_ts: Optional[datetime] = None,
                    ) -> Dict[str, Any]:
-    """Replay a scripted session deterministically."""
+    """Replay a scripted session deterministically.
+
+    ``base_ts`` is the virtual clock's origin, which ``t`` offsets are
+    measured from; a generated NFL dataset passes its own (see
+    :mod:`combo_mm.nfl.rfq_sim`), and the scripted fixtures use theirs.
+    """
+    base_ts = base_ts or BASE_TS
     transport = SimulatedTransport(session, self_user_id, combos)
     books = books or LegBookCache(staleness_ms=config.staleness_ms)
     reference = ReferenceCache(transport, ttl_s=config.reference_ttl_s)
@@ -83,7 +90,7 @@ def replay_session(session: List[Dict[str, Any]],
             continue
         if not include_stream_invisible and not item.get("stream", True):
             continue
-        now = BASE_TS + timedelta(milliseconds=item.get("t", 0))
+        now = base_ts + timedelta(milliseconds=item.get("t", 0))
         event = normalize(item["raw"], now=now)
         if store.apply(event):
             counters["events"] += 1
@@ -97,7 +104,7 @@ def replay_session(session: List[Dict[str, Any]],
 
     if drain_drop_copy_records is not None:
         drain_drop_copy(SimulatedDropCopyTransport(drain_drop_copy_records),
-                        store, now=BASE_TS)
+                        store, now=base_ts)
 
     counters["digest"] = state_digest(store)
     return counters
