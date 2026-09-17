@@ -150,6 +150,7 @@ class ComboMarketCatalog:
         self._refresh_interval = refresh_interval_s
         self._max_pages = max_pages
         self._index: Dict[str, LegMarket] = {}
+        self._by_game: Dict[str, Dict[str, LegMarket]] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -169,6 +170,11 @@ class ComboMarketCatalog:
     def resolve(self, position_ids: Iterable[str]) -> List[Optional[LegMarket]]:
         return [self._index.get(str(pid)) for pid in position_ids]
 
+    def markets_for_game(self, game: str) -> List[LegMarket]:
+        """Every known position on one sports game (both outcomes of each market)."""
+        with self._lock:
+            return list(self._by_game.get(game, {}).values())
+
     def merge(self, markets: Iterable[LegMarket]) -> int:
         """Add or refresh entries; returns how many were merged."""
         batch = {m.position_id: m for m in markets}
@@ -176,6 +182,9 @@ class ComboMarketCatalog:
             return 0
         with self._lock:
             self._index.update(batch)
+            for m in batch.values():
+                if m.game:
+                    self._by_game.setdefault(m.game, {})[m.position_id] = m
             self.version += 1
         return len(batch)
 

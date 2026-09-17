@@ -25,6 +25,8 @@ from combo_mm.books import LegBookCache
 from combo_mm.combo_markets import ComboMarketCatalog
 from combo_mm.config import PipelineConfig
 from combo_mm.engine import ShadowQuotingEngine
+from combo_mm.live_quoter import LiveQuoter
+from combo_mm.nfl.live_pricer import LiveRfq
 from combo_mm.normalize import NormalizeError, normalize
 from combo_mm.pricer import Pricer
 from combo_mm.quote_selections import QuoteSelectionStore
@@ -56,6 +58,12 @@ class LiveMonitor:
     trade broadcasts for selected RFQs are stored as accepted quotes; recent
     trades are also kept in memory so an RFQ picked after it traded still
     gets its accepted quote (:meth:`select`).
+
+    With a ``quoter`` (:class:`combo_mm.live_quoter.LiveQuoter`), every RFQ
+    the screen calls QUOTABLE is handed to the NFL pricing model, which logs
+    the bid and ask we would show; picking an RFQ prices it again on demand.
+    Pricing runs on the quoter's own thread, so the poll loop keeps up with
+    the feed.
     """
 
     RECENT_TRADES_MAX = 50_000
@@ -66,7 +74,8 @@ class LiveMonitor:
                  config: Optional[PipelineConfig] = None, *,
                  pricer: Optional[Pricer] = None, source_label: str = "live",
                  catalog: Optional[ComboMarketCatalog] = None,
-                 selections: Optional[QuoteSelectionStore] = None) -> None:
+                 selections: Optional[QuoteSelectionStore] = None,
+                 quoter: Optional[LiveQuoter] = None) -> None:
         self.config = config or PipelineConfig(paper_mode=True)
         self.source = source
         self.store = store
@@ -85,6 +94,7 @@ class LiveMonitor:
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.catalog = catalog
         self.selections = selections
+        self.quoter = quoter
         self.recent_trades: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.accepted_recorded = 0
         self._rescreened_version = -1
@@ -126,7 +136,31 @@ class LiveMonitor:
         trade = self.recent_trades.get(rfq_id)
         if trade is not None and self.selections.record_accepted(trade):
             self.accepted_recorded += 1
+        self._submit_for_pricing(self.rfq_for_pricing(rfq_id), trigger="manual")
         return added
+
+    # -- pricing --------------------------------------------------------------
+    def rfq_for_pricing(self, rfq_id: str) -> Optional[LiveRfq]:
+        """Rebuild a :class:`LiveRfq` from the store (legs, side, size, deadline)."""
+        rfq = self.store.get_rfq(rfq_id)
+        if rfq is None:
+            return None
+        screen = self.store.get_rfq_screen(rfq_id) or {}
+        return LiveRfq(
+            rfq_id=rfq_id,
+            leg_position_ids=tuple(str(leg["symbol"]) for leg in rfq.get("legs") or []),
+            side=str(screen.get("side") or "YES"),
+            direction=str(screen.get("direction") or "BUY"),
+            qty_decimal=(str(rfq["qty_decimal"]) if rfq.get("qty_decimal") is not None else None),
+            cash_order_qty=(str(rfq["cash_order_qty"])
+                            if rfq.get("cash_order_qty") is not None else None),
+            submission_deadline_ms=_deadline_ms(screen.get("submission_deadline")),
+            received_at=rfq.get("created_time"))
+
+    def _submit_for_pricing(self, rfq: Optional[LiveRfq], trigger: str = "auto") -> None:
+        if self.quoter is None or rfq is None or not rfq.leg_position_ids:
+            return
+        self.quoter.submit(rfq, trigger)
 
     # -- screening ------------------------------------------------------------
     def _screen_new_rfq(self, raw: Dict[str, Any], rfq_id: str) -> None:
@@ -142,6 +176,8 @@ class LiveMonitor:
             direction=raw.get("direction") or None, side=_combo_side(raw),
             condition_id=raw.get("condition_id") or None,
             submission_deadline=raw.get("submission_deadline") or None)
+        if result.quotable:
+            self._submit_for_pricing(_live_rfq_from_raw(raw, rfq_id, legs))
 
     def _rescreen_unresolved(self) -> None:
         """Re-screen RFQs whose legs were unknown, once per catalog growth (throttled)."""
@@ -152,12 +188,19 @@ class LiveMonitor:
             return
         version = catalog.version
         rows = self.store.unresolved_screen_rfqs(version, limit=self.RESCREEN_BATCH)
+        now_ms = time.time() * 1000
         for row in rows:
             result = screen_legs(catalog.resolve(row["legs"]))
             self.store.upsert_rfq_screen(
                 row["rfq_id"], n_legs=result.n_legs, n_resolved=result.n_resolved,
                 n_nfl_legs=result.n_nfl_legs, screen=result.screen, rank=result.rank,
                 catalog_version=version)
+            if result.quotable:
+                # The catalog caught up: price it, unless its quote window has closed.
+                rfq = self.rfq_for_pricing(row["rfq_id"])
+                deadline = rfq.submission_deadline_ms if rfq else None
+                if deadline is None or deadline >= now_ms:
+                    self._submit_for_pricing(rfq)
         if len(rows) < self.RESCREEN_BATCH:  # backlog drained for this version
             self._rescreened_version = version
             self._last_rescreen = time.monotonic()
@@ -206,6 +249,24 @@ class LiveMonitor:
                 self._screen_new_rfq(raw, event.rfq_id)
             if event.event_type in _QUOTABLE:
                 self.engine.maybe_quote(event)
+
+
+def _deadline_ms(value: Any) -> Optional[int]:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _live_rfq_from_raw(raw: Dict[str, Any], rfq_id: str, legs: List[str]) -> LiveRfq:
+    """Build pricer input straight from the gateway payload (no store round trip)."""
+    return LiveRfq(
+        rfq_id=rfq_id, leg_position_ids=tuple(legs),
+        side=_combo_side(raw) or "YES", direction=str(raw.get("direction") or "BUY"),
+        qty_decimal=(str(raw["qtyDecimal"]) if raw.get("qtyDecimal") is not None else None),
+        cash_order_qty=(str(raw["cashOrderQty"]) if raw.get("cashOrderQty") is not None else None),
+        submission_deadline_ms=_deadline_ms(raw.get("submission_deadline")),
+        received_at=raw.get("createdTime"))
 
 
 def _combo_side(raw: Dict[str, Any]) -> Optional[str]:

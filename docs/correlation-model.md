@@ -262,7 +262,75 @@ the headline gain comes from.
 - The earlier (pre-split) version of this analysis chose the default model after seeing 2010–2025
   results. The numbers above replace it: settings now come from train-only tuning.
 
-## 5. Module map
+## 5. Live pricing: from an RFQ to a bid and an ask
+
+Sections 1-4 are the model and its evidence; this is how a live RFQ gets a price
+(`combo_mm/nfl/live_pricer.py`, issue #2).
+
+```
+leg position ids --combo catalog--> markets --markets.py--> canonical score legs, grouped by game
+                 --CLOB / Gamma books--> market marginals q_i
+game's main spread + total ----calibrate_means----> (mu_h, mu_a)     [location]
+current params file --matchup_covariance--> Sigma                    [shape]
+                      GameModel --> P_model(all legs), P_model(leg_i)
+fair = prod(q_i) * P_model(all) / prod P_model(leg_i)  -> Frechet clamp -> spread -> bid / ask
+```
+
+**Which legs.** Only full-game moneyline, spread, total and team totals map to the
+score model. The registry parses Polymarket's slug grammar
+(`nfl-{away}-{home}-{date}[-spread-{home|away}-{x}pt{y} | -total-{x}pt{y} |
+-team-total-{team}-{x}pt{y}]`) and each market's outcome index into the canonical
+leg; period markets (`1h-`, `1q-`) and player props are reported as unsupported
+rather than approximated. Every mapping row is pinned by a unit test that settles
+it against a hand-scored game.
+
+**Which fair value.** Two are computed on every RFQ:
+
+| method | fair | property |
+|---|---|---|
+| `model_joint` | `P_model(all legs)` | the model's own joint; inherits its moneyline marginal error (§4.4 #2) |
+| `market_lift` (default) | `prod(q_i) x P_model(all) / prod P_model(leg_i)` | market marginals exact, dependence from the model |
+
+`market_lift` is the default for the reason §4.4 #2 gives: the model's
+favourite-win probability misses the market moneyline by ~2 points, and that
+error belongs in neither the marginal nor the combo. Both are logged, so the
+choice can be re-scored later on recorded live flow. The fair value is clamped
+into the Frechet bounds `[max(0, sum q_i - (n-1)), min_i q_i]`: a combo can
+never be worth more than its cheapest leg.
+
+**Guards.** A leg whose model marginal is more than 4 cents from its market price
+declines (`MODEL_MARKET_DISAGREE`) rather than quoting a disagreement we cannot
+explain; an empty joint region declines (`CONTRADICTORY_LEGS`); a started game,
+stale books, or params older than 9 days decline. Confidence falls with the
+marginal gap, leg count, book width, big favourites, non-converged calibration
+and params age; below 0.4 we do not quote.
+
+**Spread on top of the V1 stack** (all configurable, all recorded with a
+sentence of explanation for the dashboard):
+
+| component | default | why |
+|---|---|---|
+| `corr_model_risk_bps` | 0.10 x \|fair - naive\| | the further we move off naive, the more model risk we carry |
+| `marginal_gap_bps` | 0.5 x gap | model and market disagree on a leg |
+| `key_number_bps` | 40 | ML x spread near 3 or 7, where a normal margin misprices (§4.4 #1) |
+| `big_favorite_bps` | 30 | margin/total dependence for 10+ point favourites is unmodeled (§4.4 #3) |
+| `tail_bps` | 25 per leg beyond 2 | thin Gaussian tails (§4.4 #4) |
+| `params_age_bps` | 5 per day beyond 7 | covariance drifting out of date |
+
+**Cost.** The weekly params file and the game's calibration are cached, and
+`GameModel` memoizes regions, so a second RFQ on a calibrated game costs ~2 ms
+(the issue's budget was 20 ms). A cold game costs ~1.5 s, almost all of it the
+two HTTP round trips for leg books, which is why pricing runs on its own thread
+off the feed's poll loop.
+
+**What it says on real flow.** Priced against the live DET @ BUF book
+(2026-09-17): *Bills ML + Bills −4.5* = 0.528 against a naive 0.368; *Bills ML +
+Lions +4.5* = 0.168 against a naive 0.329 — the two combos §4.2 shows the naive
+product getting most wrong (realized 49.8% and 16.9% in the test period), and
+*Bills −4.5 + over 54.5* reproduces the naive product exactly, as the tuned
+`league_constant` model implies.
+
+## 6. Module map
 
 | File | Role |
 |---|---|
@@ -274,4 +342,9 @@ the headline gain comes from.
 | `combo_mm/nfl/tuning.py`, `scripts/nfl_tune.py` | train-only hyperparameter grid search → `params/estimator.json` |
 | `combo_mm/nfl/refresh.py`, `scripts/refresh_params.py` | weekly refresh + gates |
 | `scripts/nfl_backtest.py` | backtest CLI (parallel across seasons) |
+| `combo_mm/nfl/markets.py` | Polymarket NFL slug -> canonical score leg registry (stdlib) |
+| `combo_mm/nfl/params_provider.py` | current weekly params file for live pricing, with version + age (stdlib) |
+| `combo_mm/leg_books.py` | live leg books for combo legs: CLOB via Gamma token ids, Gamma fallback |
+| `combo_mm/nfl/live_pricer.py` | live RFQ -> fair value -> bid/ask, with decline codes and explanations |
+| `combo_mm/live_quoter.py` | prices quotable live RFQs off the feed's thread and logs every quote |
 | `dashboard/nfl_tab.py` | Streamlit "NFL correlation" tab |

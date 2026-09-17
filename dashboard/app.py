@@ -29,7 +29,10 @@ Views 1-4 read the active run's SQLite DB:
    from the combo catalog, quotable NFL same-game RFQs first, a button to
    pick RFQs to quote, and the durable picked list with accepted quotes.
 2. Pricing & quoting -- fair price (model vs naive), quoted buy/sell, size,
-   expected edge, and each pricing adjustment.
+   expected edge, and each pricing adjustment. Live: the NFL correlation
+   model's own bid/ask for every quotable RFQ
+   (:mod:`combo_mm.nfl.live_pricer`), with its calibration and spread
+   components.
 3. Performance -- quote/fill counts, expected vs realized P&L, swings,
    exposure, and (backtest) results by combo family, size and game.
 4. Engine status -- shadow quoting engine health and stored draft quotes.
@@ -64,11 +67,16 @@ from combo_mm.intl_gateway import (  # noqa: E402
     InternationalQuoterGatewayAdapter,
     MissingCredentialsError,
 )
+from combo_mm.leg_books import LiveLegBooks  # noqa: E402
 from combo_mm.live_monitor import LiveMonitor  # noqa: E402
+from combo_mm.live_quoter import LiveQuoter  # noqa: E402
 from combo_mm.nfl import week_backtest  # noqa: E402
+from combo_mm.nfl.live_pricer import NflLivePricer  # noqa: E402
+from combo_mm.nfl.params_provider import ParamsProvider  # noqa: E402
 from combo_mm.paper_backtest import BacktestResult  # noqa: E402
 from combo_mm.quote_selections import QuoteSelectionStore  # noqa: E402
 from combo_mm.retail import KEY_ID_ENV, SECRET_ENV, RetailPollingSource  # noqa: E402
+from combo_mm.pricing import QUOTED_OK  # noqa: E402
 from combo_mm.rfq_screen import QUOTABLE, UNRESOLVED  # noqa: E402
 from combo_mm.store import EventStore  # noqa: E402
 from dashboard import nfl_tab  # noqa: E402
@@ -155,6 +163,33 @@ def _quote_selections() -> QuoteSelectionStore:
     return QuoteSelectionStore(LIVE_DATA / "quote_selections.db")
 
 
+def _live_quoter(config: PipelineConfig, catalog: ComboMarketCatalog,
+                 store: QuoteSelectionStore) -> tuple[Optional[LiveQuoter], Optional[str]]:
+    """(quoter, note): the NFL pricing model behind the live feed, or why it is off.
+
+    Needs numpy/scipy (``requirements-nfl.txt``) and a weekly params file
+    (``python scripts/refresh_params.py``). Without either, the live feed
+    still runs -- it just does not price.
+    """
+    params = ParamsProvider(REPO / "params")
+    try:
+        handle = params.current()
+    except Exception as exc:
+        return None, f"params unreadable ({type(exc).__name__}); no live pricing."
+    if handle is None:
+        return None, ("no weekly params file in `params/`; run "
+                      "`python scripts/refresh_params.py` to price live RFQs.")
+    try:
+        import numpy  # noqa: F401
+        import scipy  # noqa: F401
+    except ImportError:
+        return None, "numpy/scipy missing (`pip install -r requirements-nfl.txt`); no live pricing."
+    pricer = NflLivePricer(catalog, LiveLegBooks(), params, config=config)
+    quoter = LiveQuoter(pricer, store)
+    return quoter, (f"NFL same-game correlation model on `{handle.version}` (paper: prices are "
+                    "logged, never sent)")
+
+
 def _start_live() -> Dict[str, Any]:
     config = PipelineConfig(paper_mode=True)
     run: Dict[str, Any] = {"mode": "live", "db_path": None, "monitor": None,
@@ -172,10 +207,11 @@ def _start_live() -> Dict[str, Any]:
         run["error"] = "No live feed credentials found."
         return run
     db_path = _new_db("combo_mm_live_")
-    run.update(db_path=db_path, polling=True, source=label,
+    quoter, note = _live_quoter(config, _combo_catalog(), _quote_selections())
+    run.update(db_path=db_path, polling=True, source=label, pricing_note=note,
                monitor=LiveMonitor(source, EventStore(db_path, synchronous="NORMAL"), config,
                                    source_label=label, catalog=_combo_catalog(),
-                                   selections=_quote_selections()))
+                                   selections=_quote_selections(), quoter=quoter))
     return run
 
 
@@ -185,7 +221,11 @@ def _stop_live(run: Optional[Dict[str, Any]]) -> None:
         return
     run["polling"] = False
     monitor = run.get("monitor")
-    stop = getattr(monitor.source, "stop", None) if monitor is not None else None
+    if monitor is None:
+        return
+    if monitor.quoter is not None:
+        monitor.quoter.stop()
+    stop = getattr(monitor.source, "stop", None)
     if stop is not None:
         stop()
 
@@ -254,8 +294,7 @@ def _live_status() -> None:
             st.caption(f"{stats['buffer_drops']:,} RFQs dropped by the adapter buffer (feed outpaced polling).")
         if stats.get("last_error"):
             st.caption(f"Last gateway error: `{stats['last_error']}`")
-        pricing_note = ("gateway legs are on-chain position ids with no leg books, so the shadow "
-                        "engine records them as MISSING_LEG declines until leg pricing is mapped")
+        pricing_note = run.get("pricing_note") or "live pricing off"
     else:
         c1.metric("Polls", monitor.polls)
         c2.metric("RFQ events applied", monitor.events_applied)
@@ -268,9 +307,28 @@ def _live_status() -> None:
                        "appear until access is granted; leg books still refresh.")
         if monitor.last_error:
             st.caption(f"Last source error: `{monitor.last_error}`")
-        pricing_note = "V1 independent-leg pricer (live symbols are not mapped to the NFL model yet)"
+        pricing_note = run.get("pricing_note") or "live pricing off"
     st.caption(f"Source: {run['source']} (receive-only) · last poll: {monitor.last_poll_at} · "
                f"every {run['poll_interval_s']:.0f}s · {pricing_note}.")
+    quoter = monitor.quoter
+    if quoter is not None:
+        stats = quoter.stats()
+        q1, q2, q3, q4, q5 = st.columns(5)
+        q1.metric("RFQs priced", f"{stats['priced']:,}")
+        q2.metric("Quotes made", f"{stats['quoted']:,}")
+        q3.metric("No quote", f"{stats['declined']:,}")
+        q4.metric("Waiting to price", f"{stats['queued']:,}")
+        q5.metric("Dropped / errors", f"{stats['dropped'] + stats['errors']:,}")
+        last = quoter.last_quote
+        if last is not None and last.quoted:
+            st.caption(f"Last quote: `{last.rfq_id}` {last.legs_label} -> bid **{last.bid:.3f}** / "
+                       f"ask **{last.ask:.3f}** (fair {last.fair:.4f} vs naive "
+                       f"{last.naive_yes:.4f}) -- not sent.")
+        elif last is not None:
+            st.caption(f"Last pricing attempt: `{last.rfq_id}` -> `{last.reason_code}` "
+                       f"({last.reason_detail}).")
+        if stats["last_error"]:
+            st.caption(f"Last pricing error: `{stats['last_error']}`")
     catalog = monitor.catalog
     if catalog is not None:
         state = ("crawling" if catalog.refreshing else
@@ -365,6 +423,78 @@ def _selected_view(selections: QuoteSelectionStore) -> None:
         column_config={"accepted price": st.column_config.NumberColumn(format="%.4f")})
 
 
+def _model_quote_rows(quotes: list) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "priced at": q["priced_at"], "rfq_id": q["rfq_id"], "trigger": q["trigger"],
+        "legs": q["legs_label"], "side": q["side"], "requester": q["direction"],
+        "size": q["size"], "unit": q["size_unit"],
+        "naive": q["naive"], "model fair": q["fair"],
+        "corr adj (bps)": q["corr_adjustment_bps"],
+        "our bid": q["bid"], "our ask": q["ask"],
+        "we would": (f"{q['response_action']} @ {q['response_price']:.3f}"
+                     if q["response_price"] is not None else "-"),
+        "confidence": q["confidence"], "result": q["reason_code"],
+    } for q in quotes])
+
+
+_PRICE_COLS = ("naive", "model fair", "our bid", "our ask")
+
+
+def _model_quote_detail(q: Dict[str, Any]) -> None:
+    """One priced quote: what we would show, why, and on what data."""
+    detail = q.get("detail") or {}
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Our bid (we buy)", _f(q["bid"], ".3f"))
+        st.metric("Our ask (we sell)", _f(q["ask"], ".3f"))
+        st.write(f"Requester `{q['direction']}` `{q['side']}` -> we "
+                 f"**{q['response_action'] or '-'}** @ `{_f(q['response_price'], '.3f')}`")
+    with c2:
+        st.metric("Model fair", _f(q["fair"]))
+        st.metric("Naive product", _f(q["naive"]))
+        st.metric("Correlation adjustment",
+                  _f(q["corr_adjustment_bps"], ".0f") + " bps"
+                  if q["corr_adjustment_bps"] is not None else "-")
+    with c3:
+        st.metric("Result", q["reason_code"])
+        st.metric("Confidence", _f(q["confidence"], ".2f"))
+        st.write(f"Params: `{q['params_version'] or '-'}`")
+        st.write(f"Model: `{q['model_version']}` - {_f(q['latency_ms'], '.1f')} ms"
+                 + (" - priced after the deadline" if q["after_deadline"] else ""))
+    if q["reason_detail"]:
+        st.info(q["reason_detail"])
+    for line in detail.get("explanations") or []:
+        st.write("- " + line)
+    legs = detail.get("legs") or []
+    if legs:
+        st.markdown("**Legs: market vs model**")
+        st.dataframe(pd.DataFrame([{
+            "leg": leg["label"], "game": leg["game"], "in model": leg["modeled"],
+            "canonical": leg["canonical"], "bid": leg["bid"], "ask": leg["ask"],
+            "market q": leg["q_market"], "model p": leg["p_model"],
+            "book": leg["book_source"],
+        } for leg in legs]), width="stretch", hide_index=True)
+    for game in detail.get("games") or []:
+        st.markdown(f"**Game model: {game['away']} @ {game['home']}**")
+        st.write(f"Calibrated on `{game['calibration_spread']}` ({game['p_home_cover']:.3f}) and "
+                 f"`{game['calibration_total']}` ({game['p_over']:.3f}) -> implied mean score "
+                 f"{game['home']} {game['mu_home']:.1f}, {game['away']} {game['mu_away']:.1f} "
+                 f"(sigma {game['sigma_home']:.2f}/{game['sigma_away']:.2f}, "
+                 f"rho {game['rho']:+.3f}, "
+                 f"corr(margin,total) {game['corr_margin_total']:+.3f})")
+        st.write(f"Model joint `{game['model_joint']:.4f}` - lift over independence "
+                 f"`{game['lift']:.3f}` - naive `{game['naive']:.4f}` -> fair `{game['fair']:.4f}`"
+                 + (" (Frechet-clamped)" if game["frechet_clamped"] else ""))
+    components = detail.get("components") or {}
+    if components:
+        with st.expander("Spread components (bps)"):
+            st.table([{"component": k, "bps": _f(v, ".2f")}
+                      for k, v in sorted(components.items())
+                      if k.endswith("_bps") and isinstance(v, (int, float))])
+            st.write(f"Total spread `{_f(components.get('spread_bps_total'), '.2f')}` bps "
+                     f"=> half-spread `{_f(components.get('half_spread'))}` around fair.")
+
+
 def _live_rfq_detail(x: Dict[str, Any], legs: list, markets: list,
                      monitor: Optional[LiveMonitor], conn: sqlite3.Connection) -> None:
     rfq_id = x["rfq_id"]
@@ -419,6 +549,16 @@ def _live_rfq_detail(x: Dict[str, Any], legs: list, markets: list,
                          for row, m in zip(leg_rows, markets)],
             })
             st.rerun()
+
+    quotes = (monitor.selections.list_priced_quotes(rfq_id=rfq_id)
+              if monitor is not None and monitor.selections is not None else [])
+    st.markdown("**Pricing model**")
+    if not quotes:
+        st.write("Not priced yet: the model prices every RFQ the screen calls QUOTABLE, "
+                 "and any RFQ you pick.")
+    for q in quotes:
+        st.caption(f"{q['trigger']} - {q['priced_at']}")
+        _model_quote_detail(q)
 
     st.markdown("**Lifecycle events**")
     events = conn.execute(
@@ -636,8 +776,16 @@ def _rfq_view(r: Dict[str, Any]) -> None:
 def _pricing_view(r: Dict[str, Any]) -> None:
     conn = _connect(r["db_path"])
     try:
-        st.header("Pricing & quoting (shadow pricer)")
+        st.header("Pricing & quoting")
         backtest = r["mode"] == "backtest"
+        monitor: Optional[LiveMonitor] = r.get("monitor")
+        if not backtest:
+            _live_pricing_view(monitor, r)
+            st.divider()
+            st.subheader("Shadow engine decisions (V1 independent-leg pricer)")
+            st.caption("The always-on engine still prices every RFQ independently, for comparison. "
+                       "Gateway legs carry no books on the pipeline's own feed, so these are mostly "
+                       "MISSING_LEG declines; the NFL model above fetches its own leg books.")
         query = ("SELECT d.*, r.symbol AS combo_symbol, r.status AS rfq_status "
                  "FROM shadow_decisions d JOIN rfq r ON r.rfq_id = d.rfq_id ")
         decisions = [dict(d) for d in (
@@ -710,6 +858,56 @@ def _pricing_view(r: Dict[str, Any]) -> None:
             st.write("(no leg marks recorded)")
     finally:
         conn.close()
+
+
+def _live_pricing_view(monitor: Optional[LiveMonitor], r: Dict[str, Any]) -> None:
+    """The NFL correlation model's bid/ask for the live RFQs we wanted to quote."""
+    st.subheader("NFL correlation model -- live quotes")
+    selections = monitor.selections if monitor is not None else None
+    if selections is None:
+        st.info("No live run.")
+        return
+    note = r.get("pricing_note")
+    if monitor is not None and monitor.quoter is None:
+        st.warning(f"Live pricing is off: {note}")
+        return
+    st.caption(f"Pricer: {note}. Every RFQ the screen calls QUOTABLE is priced as it arrives "
+               "(and again when you pick it): the joint model's fair value, the bid and ask we "
+               "would show, and the reason when we would not quote. Paper -- nothing is sent.")
+    quotes = selections.list_priced_quotes(limit=LIVE_ROW_LIMIT)
+    stats = selections.priced_quote_stats()
+    if not quotes:
+        st.info("No RFQ has been priced yet. The model prices quotable NFL same-game RFQs as "
+                "they arrive on the feed.")
+        return
+    quoted = stats.get(QUOTED_OK, 0)
+    total = sum(stats.values())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("RFQs priced", f"{total:,}")
+    c2.metric("We would quote", f"{quoted:,}")
+    c3.metric("No quote", f"{total - quoted:,}")
+    edges = [q["corr_adjustment_bps"] for q in quotes
+             if q["status"] == "QUOTED" and q["corr_adjustment_bps"] is not None]
+    c4.metric("Median |correlation edge|",
+              f"{sorted(abs(e) for e in edges)[len(edges) // 2]:,.0f} bps" if edges else "-")
+    st.dataframe(_model_quote_rows(quotes), width="stretch", hide_index=True,
+                 column_config={c: st.column_config.NumberColumn(format="%.3f")
+                                for c in _PRICE_COLS}
+                 | {"corr adj (bps)": st.column_config.NumberColumn(format="%.0f"),
+                    "confidence": st.column_config.NumberColumn(format="%.2f")})
+    if total > len(quotes):
+        st.caption(f"Showing the newest {len(quotes):,} of {total:,}.")
+    reasons = {k: v for k, v in sorted(stats.items(), key=lambda kv: -kv[1]) if k != QUOTED_OK}
+    if reasons:
+        st.caption("Why we did not quote: "
+                   + ", ".join(f"`{k}` x{v}" for k, v in reasons.items()))
+    labels = {q["rfq_id"] + "|" + q["trigger"]: q for q in quotes}
+    pick = st.selectbox(
+        "Quote detail", list(labels), key="model_quote_pick",
+        format_func=lambda k: f"{labels[k]['rfq_id']} - {labels[k]['reason_code']} - "
+                              f"{(labels[k]['legs_label'] or '')[:120]}")
+    if pick is not None:
+        _model_quote_detail(labels[pick])
 
 
 # ---------------------------------------------------------------------------

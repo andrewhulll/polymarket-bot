@@ -85,12 +85,14 @@ Sensitivity to correlation.
 - **Retail live-data adapter** — polling the Polymarket US Retail REST API for RFQ state and leg
   books, with beta-gate handling (see below). Simulated feed remains the default.
 
+- **Step 2 — correlation-aware live pricing.** The NFL same-game model now prices live RFQs: legs
+  resolve to canonical score legs, leg books come from the CLOB/Gamma, the game's main spread and
+  total calibrate the score distribution against the current weekly params file, and the bid/ask we
+  would show is logged per RFQ — see [Pricing a live RFQ](#pricing-a-live-rfq-the-model-quotes),
+  [NFL correlation pipeline](#nfl-correlation-pipeline-issue-6) and `docs/correlation-model.md`.
+
 **Parked for later**
 
-- **Step 2 (full)** — wiring the NFL same-game correlation model into the live pricer / shadow
-  quoter. The estimation methodology, weekly params files, joint-probability engine and historical
-  backtest now exist offline — see [NFL correlation pipeline](#nfl-correlation-pipeline-issue-6)
-  and `docs/correlation-model.md`.
 - **Step 3** — inventory & risk management on $50k capital (widen/skew/reduce/reject as inventory
   grows; hard limits; kill switch).
 - **Step 5 (full)** — formal backtest report (results by market type and combo size, sensitivity to
@@ -599,6 +601,65 @@ This records intent only: nothing is sent to the gateway.
 - `RFQ_TRADE` (confirmed trade broadcast) → `rfq_closed`: "stop quoting". The
   accepted `price_e6` / `size_e6` / `executed_at` ride along as raw `price` /
   `size` / `executed_at` extras for the accepted-quote record.
+
+### Pricing a live RFQ (the model quotes)
+
+Every RFQ the screen calls `QUOTABLE` is priced by the NFL correlation model as
+it arrives (and again whenever you press **Quote this RFQ**), and the bid and
+ask we would show are logged to `data/live/quote_selections.db` and to the
+application log:
+
+```
+QUOTE rfq=0x8f2… BUY YES 25 shares | bid 0.480 / ask 0.576
+      (fair 0.5284, naive 0.3681, corr +1602 bps, confidence 0.89) | NOT SENT (paper)
+```
+
+How one RFQ is priced (`combo_mm/nfl/live_pricer.py`):
+
+1. **Resolve the legs** — position id → catalog market → `combo_mm/nfl/markets.py`
+   parses the slug into a canonical score leg (`nfl-det-buf-2026-09-18-spread-home-4pt5`
+   outcome 0 → "home margin > 4.5"). Full-game moneyline, spread, total and team
+   totals only; a first-half line or a player prop on the same game is declined
+   (`UNSUPPORTED_LEG`), never guessed at.
+2. **Leg books** — the gateway sends no prices and the CLOB does not know combo
+   position ids, so `combo_mm/leg_books.py` maps the catalog market id through
+   Gamma (`/markets?id=…`, giving `clobTokenIds` and `gameStartTime`) to the
+   CLOB's own book (`POST /books`, top of book with sizes), falling back to
+   Gamma's `bestBid`/`bestAsk`. Books are cached for 3 s, metadata for 10 min.
+3. **Locate the distribution** — the game's main spread and total (nearest
+   50/50, whether or not they are RFQ legs) pin `(μ_home, μ_away)` via
+   `calibrate_means`; the covariance shape comes from the current weekly params
+   file (`ParamsProvider`, version recorded as `nfl_2026_w02.json@<sha12>`).
+4. **Fair value** — `fair = Π q_i × P_model(all legs) / Π P_model(leg_i)`
+   ("market lift"): each leg keeps its own market price and only the
+   *dependence* comes from the model, which avoids importing the model's
+   moneyline marginal error (`docs/correlation-model.md` §4.4 #2). The result is
+   clamped into the Fréchet bounds. `model_joint` (the model's own joint) is
+   computed and logged alongside for comparison. Legs from other games multiply
+   in as independent.
+5. **Bid/ask** — the V1 spread stack (`price_combo`) plus model-risk add-ons:
+   a haircut proportional to how far the model moved off naive, a
+   model-vs-market marginal gap term, key-number (3/7) and big-favourite
+   charges, a per-extra-leg tail charge, and a stale-params charge. A requester
+   who wants to BUY trades against our ask, one who wants to SELL against our
+   bid.
+
+Declines are logged with the same detail as quotes: `UNRESOLVED_LEG`,
+`UNSUPPORTED_LEG`, `OTHER_SAME_GAME`, `NO_NFL_SAME_GAME`, `GAME_STARTED`,
+`MISSING_CALIBRATION_MARKET`, `CONTRADICTORY_LEGS` (e.g. "Lions win *and* Bills
+cover −4.5"), `MODEL_MARKET_DISAGREE`, `LOW_CONFIDENCE`, `PARAMS_STALE`,
+`PARAMS_UNAVAILABLE`, plus the V1 book checks (`MISSING_LEG`, `STALE_LEG`).
+
+Pricing runs on its own thread (`combo_mm/live_quoter.py`) with a bounded
+queue, so the ~200 RFQ/s feed is never blocked by a book fetch; warm pricing of
+an already-calibrated game takes ~2 ms, a cold game ~1.5 s (two HTTP round
+trips). **Paper only**: there is no code path from the pricer to a quote
+submission, and `tests/test_live_quoter.py` asserts that structurally.
+
+The dashboard's **Pricing & quoting** tab lists these quotes (naive vs model
+fair, correlation adjustment in bps, our bid/ask, confidence, decline reason)
+and, per quote, the calibrated means, each leg's market price vs model
+probability, and every spread component.
 
 ## Going live — Exchange gRPC checklist (later)
 
