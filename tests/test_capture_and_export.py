@@ -74,21 +74,30 @@ def _build_capture(tmp_path):
     return capture
 
 
-def test_handle_writes_raw_jsonl_and_screens_nfl(tmp_path):
+def test_handle_writes_raw_jsonl_only_for_eligible_rfqs(tmp_path):
     capture = _build_capture(tmp_path)
     capture.handle({"kind": "event", "raw": _rfq_request("rfq_nfl", ["100", "101"])}, NOW)
     capture.handle({"kind": "event", "raw": _rfq_request("rfq_soccer", ["200", "201"], "0xsoccer")}, NOW)
     capture.handle({"kind": "event", "raw": _rfq_trade("rfq_nfl")}, NOW)
+    capture.handle({"kind": "event", "raw": _rfq_trade("rfq_soccer")}, NOW)
 
     assert capture.rfqs_seen == 2
     assert capture.nfl_rfqs_seen == 1
-    assert capture.trades_seen == 1
+    assert capture.trades_seen == 2
 
+    # Only the screen-eligible RFQ's frames are kept raw: its request and
+    # its trade. The ineligible soccer RFQ leaves no raw trace.
     raw_lines = capture.raw_path.read_text().splitlines()
-    assert len(raw_lines) == 3
-    first = json.loads(raw_lines[0])
-    assert first["raw"]["rfq_id"] == "rfq_nfl"
+    assert len(raw_lines) == 2
+    frames = [json.loads(line) for line in raw_lines]
+    assert frames[0]["raw"]["rfq_id"] == "rfq_nfl"
+    assert frames[0]["raw"]["event_type"] == "rfq_created"
+    assert frames[1]["raw"]["rfq_id"] == "rfq_nfl"
+    assert frames[1]["raw"]["event_type"] == "rfq_closed"
 
+    # Slim parsed records still capture everything, including the decline.
+    assert capture.store.get_rfq("rfq_soccer") is not None
+    assert capture.store.get_rfq("rfq_nfl") is not None
     nfl_screen = capture.store.get_rfq_screen("rfq_nfl")
     soccer_screen = capture.store.get_rfq_screen("rfq_soccer")
     assert nfl_screen["n_nfl_legs"] == 2
