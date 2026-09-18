@@ -12,12 +12,15 @@ README "Historical RFQ data"); the gateway stream delivers only new events.
 
 Writes, under ``--data-dir`` (default ``data/live``):
 
-- ``rfq_raw.jsonl``     -- every RFQ_REQUEST / RFQ_TRADE event, one JSON
-  object per line, exactly what the gateway adapter emits. This is the only
-  place a trade's accepted price/size survive: the structured store below
-  only keeps the fields ``normalize()`` recognizes (see
-  ``combo_mm/normalize.py``), which does not include gateway-native trade
-  extras.
+- ``rfq_raw.jsonl``     -- one JSON object per line, exactly what the gateway
+  adapter emits, but only for RFQs that pass the screen (eligible to quote)
+  and for trades on those RFQs. Everything else still lands in slim parsed
+  form in ``rfq_capture.db`` below, so the tuning dataset (decisions,
+  decline reasons, fair values) stays complete while the raw-frame log
+  stops growing with every unrelated RFQ on the gateway. A trade's
+  accepted price/size also survive in the ``live_trades`` table; the JSONL
+  keeps any gateway-native trade extras ``normalize()`` does not recognize
+  (see ``combo_mm/normalize.py``).
 - ``rfq_capture.db``    -- the same events run through the existing
   normalize + ``EventStore`` + ``rfq_screen`` pipeline, giving queryable
   RFQ/leg/screen tables and NFL leg resolution via the combo catalog.
@@ -104,6 +107,11 @@ class RfqCapture:
         self.trades_seen = 0
         self.nfl_rfqs_seen = 0
         self._rescreened_version = -1
+        self._raw_eligible: set[str] = set()
+        # RFQ ids whose raw gateway frames are worth keeping on disk. An id
+        # lands here when its RFQ passes the screen; the raw JSONL then keeps
+        # that RFQ's frame and any later trade frame for it. Everything else
+        # is captured only in slim parsed form in the SQLite store.
 
     def start(self) -> None:
         self.catalog.start()
@@ -153,16 +161,16 @@ class RfqCapture:
             gateway_connected=adapter.connected,
             buffer_drops=stats["buffer_drops"])
 
+    def _write_raw_frame(self, now: datetime, raw: Dict[str, Any]) -> None:
+        """Append one raw gateway frame to the JSONL log."""
+        self._raw_file.write(
+            json.dumps({"received_at": now.isoformat(), "raw": raw}) + "\n")
+        self._raw_file.flush()
+
     def handle(self, item: Dict[str, Any], now: datetime) -> None:
         if item.get("kind") != "event":
             return
         raw = dict(item["raw"])
-        # Write the raw frame FIRST and unconditionally: this is the
-        # lossless record, independent of whether normalize()/apply()
-        # accept it.
-        self._raw_file.write(
-            json.dumps({"received_at": now.isoformat(), "raw": raw}) + "\n")
-        self._raw_file.flush()
         try:
             event = normalize(raw, now=now)
         except NormalizeError:
@@ -174,7 +182,7 @@ class RfqCapture:
             return
         if event.event_type == "rfq_created" and event.rfq_id:
             self.rfqs_seen += 1
-            self._screen(raw, event.rfq_id)
+            self._screen(raw, event.rfq_id, now)
         elif event.event_type == "rfq_closed" and "price" in raw:
             # Only gateway RFQ_TRADE broadcasts carry price/size (see
             # combo_mm.intl_gateway.map_rfq_trade); a plain rfq_closed
@@ -182,8 +190,12 @@ class RfqCapture:
             self.trades_seen += 1
             self.store.record_live_trade(event.rfq_id, raw.get("price"), raw.get("size"),
                                          raw.get("executed_at"))
+            # Keep the raw trade frame only for RFQs we engaged with; the
+            # price/size itself is already in the live_trades table.
+            if event.rfq_id in self._raw_eligible:
+                self._write_raw_frame(now, raw)
 
-    def _screen(self, raw: Dict[str, Any], rfq_id: str) -> None:
+    def _screen(self, raw: Dict[str, Any], rfq_id: str, now: datetime) -> None:
         legs = [str(leg.get("symbol")) for leg in raw.get("comboLegs") or []
                 if isinstance(leg, dict) and leg.get("symbol") is not None]
         if not legs:
@@ -197,6 +209,12 @@ class RfqCapture:
         checks = screen_checks(result, qty_decimal=qty,
                                min_qty=PipelineConfig().min_qty)
         eligible = result.quotable and all(checks.values())
+        if eligible:
+            # This RFQ is worth quoting on: keep its raw gateway frame so a
+            # later tuning/backtest pass has the full context, and remember
+            # it so a later trade frame for it is kept too.
+            self._raw_eligible.add(rfq_id)
+            self._write_raw_frame(now, raw)
         if result.n_nfl_legs:
             self.nfl_rfqs_seen += 1
         self.store.upsert_rfq_screen(
