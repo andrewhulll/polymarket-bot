@@ -1429,7 +1429,9 @@ class EventStore:
         """Consistent inputs for a rebuildable inventory snapshot."""
         with self._lock:
             rfqs = [dict(r) for r in self._conn.execute(
-                "SELECT rfq_id, symbol, status, updated_time FROM rfq ORDER BY rfq_id")]
+                "SELECT r.rfq_id, r.symbol, r.status, r.updated_time, "
+                "s.submission_deadline FROM rfq r LEFT JOIN rfq_screen s "
+                "ON s.rfq_id=r.rfq_id ORDER BY r.rfq_id")]
             for rfq in rfqs:
                 rfq["legs"] = [dict(r) for r in self._conn.execute(
                     "SELECT symbol, side, settlement_price FROM rfq_legs "

@@ -5,9 +5,9 @@ $("fills-prev").addEventListener("click", () => { if (state.fillsPage > 1) { sta
 $("fills-next").addEventListener("click", () => { state.fillsPage++; refreshFills(); });
 
 async function refreshPerformance() {
-  const [perf, fills, exp, risk] = await Promise.all([
+  const [perf, fills, inv, risk] = await Promise.all([
     get("/api/performance"), get(`/api/fills?page=${state.fillsPage}`),
-    get("/api/exposure").catch(() => null), get("/api/risk").catch(() => null),
+    get("/api/inventory").catch(() => null), get("/api/risk").catch(() => null),
   ]);
 
   const kw = perf.win_rate != null ? badge(perf.win_rate >= 0.5 ? "q" : "warn",
@@ -20,8 +20,8 @@ async function refreshPerformance() {
     kpi("Realized P&L", fmtMoney(perf.realized_pnl), perf.realized_pnl >= 0 ? "good" : "bad") +
     kpi("Max downswing", fmtMoney(perf.max_downswing), "bad") +
     kpi("Max upswing", fmtMoney(perf.max_upswing), "good") +
-    kpi("Net notional", fmtMoney(perf.net_notional)) +
-    kpi("Equity", exp && exp.latest ? fmtMoney(exp.latest.equity) : "—");
+    kpi("Assumed paper net notional", fmtMoney(perf.net_notional)) +
+    kpi("Equity", inv ? fmtMoney(inv.equity) : "—");
 
   $("killswitch-badge").classList.toggle("hidden",
     !(risk && risk.kill_switch && risk.kill_switch.state === "engaged"));
@@ -75,7 +75,7 @@ function refreshFillsTable(fills) {
     `<td class="dim">${esc(r.game || "—")}</td>` +
     `<td>${esc(r.family || "—")}</td>` +
     `<td>${esc(r.response_action || r.side || "—")}</td>` +
-    `<td class="num">${esc(r.size || "")}</td>` +
+    `<td class="num">${esc(r.size || "")}${r.capacity_limited ? ' <span class="badge warn" title="Paper fill reduced to stay within equity">CAPPED</span>' : ""}</td>` +
     `<td class="num">${fmtPrice(r.naive)}</td>` +
     `<td class="num">${fmtPrice(r.fair)}</td>` +
     `<td class="num"><b>${fmtPrice(r.our_price)}</b></td>` +
@@ -111,6 +111,7 @@ function toggleFillDetail(tr, r) {
       <dt>Net notional</dt><dd>${fmtMoney(r.net_notional)}</dd>
       <dt>Settlement</dt><dd>${r.settled_legs ?? "?"}/${r.total_legs ?? "?"} legs settled</dd>
       <dt>Size</dt><dd>${esc(r.size || "")} ${esc(r.size_unit || "")}</dd>
+      ${r.capacity_limited ? `<dt>Original size</dt><dd>${esc(r.original_size)} ${esc(r.size_unit || "")} — reduced to stay within equity</dd>` : ""}
     </dl>
     <p><a href="#" onclick="event.preventDefault();openPricingDrawer('${esc(r.rfq_id)}')">Open full decision detail →</a></p>`;
 }

@@ -1,30 +1,22 @@
 """Headless paper quoting engine and capture of live Polymarket RFQs.
 
-The websocket adapter wakes this process on each frame. It stores RFQs,
-screens them, and prices eligible requests on a worker thread. Streamlit only
+The websocket adapter wakes this process on each frame. It screens RFQs and
+prices eligible requests on a worker thread. Only quoted RFQs are stored. The dashboard
 reads the resulting SQLite database. No order is submitted. Uses the
 receive-only quoter-gateway adapter
 (``combo_mm.intl_gateway.InternationalQuoterGatewayAdapter``). Run it
 continuously (e.g. in a background process/tmux/systemd unit) to build a
-real RFQ dataset over time. There is no way to backfill RFQs from before
+paper quote dataset over time. There is no way to backfill RFQs from before
 this script was running -- Polymarket has no historical RFQ endpoint (see
 README "Historical RFQ data"); the gateway stream delivers only new events.
 
 Writes, under ``--data-dir`` (default ``data/live``):
 
-- ``rfq_raw.jsonl``     -- one JSON object per line, exactly what the gateway
-  adapter emits, but only for RFQs that pass the screen (eligible to quote)
-  and for trades on those RFQs. Everything else still lands in slim parsed
-  form in ``rfq_capture.db`` below, so the tuning dataset (decisions,
-  decline reasons, fair values) stays complete while the raw-frame log
-  stops growing with every unrelated RFQ on the gateway. A trade's
-  accepted price/size also survive in the ``live_trades`` table; the JSONL
-  keeps any gateway-native trade extras ``normalize()`` does not recognize
-  (see ``combo_mm/normalize.py``).
-- ``rfq_capture.db``    -- the same events run through the existing
-  normalize + ``EventStore`` + ``rfq_screen`` pipeline, giving queryable
-  RFQ/leg/screen tables and NFL leg resolution via the combo catalog.
-- ``combo_markets.json`` -- the leg catalog cache (same cache the dashboard
+- ``rfq_raw.jsonl``     -- raw request and trade frames for RFQs we actually
+  paper quote. The trade's accepted price/size also survive in ``live_trades``.
+- ``rfq_capture.db``    -- quoted RFQs, their screens, paper drafts and trades,
+  plus one live health row. Rejected and declined RFQs remain in memory only.
+- ``combo_markets.json.gz`` -- compressed leg catalog cache (same cache the dashboard
   uses, so a restart resolves legs immediately either way).
 
 Usage::
@@ -39,13 +31,16 @@ close cleanly so a restart resumes without losing anything already written.
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import logging
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -63,13 +58,12 @@ from combo_mm.nfl.params_provider import ParamsProvider
 from combo_mm.nfl.tuning import SELECTION_PATH, load_selection
 from combo_mm.quote_selections import QuoteSelectionStore
 from combo_mm.capture_process import CaptureLock
+from combo_mm.inventory import InventoryProvider
+from combo_mm.risk_config import RiskConfig
+from combo_mm.risk_policy import InventoryRiskCheck
+from combo_mm.risk import RiskVerdict
 
 log = logging.getLogger("capture_live_rfqs")
-
-# Keep catalog backfill small so old unresolved RFQs cannot stall the live
-# websocket drain and health heartbeat on a large capture database.
-RESCREEN_BATCH = 25
-
 
 def _live_pricer_config(repo: Path) -> NflLivePricerConfig:
     """``corr_scale`` from the frozen train-only tuning selection, default 1.0.
@@ -103,10 +97,23 @@ class RfqCapture:
         self._raw_file = self.raw_path.open("a", encoding="utf-8")
         self.store = EventStore(str(data_dir / "rfq_capture.db"), synchronous="NORMAL")
         self.selections = QuoteSelectionStore(data_dir / "rfq_capture.db") if price_live else None
-        self.catalog = ComboMarketCatalog(cache_path=data_dir / "combo_markets.json")
+        self.catalog = ComboMarketCatalog(cache_path=data_dir / "combo_markets.json.gz")
         self.started_at = datetime.now(timezone.utc).isoformat()
         self.errors = 0
         self.quoter = None
+        self._pending: dict[str, dict[str, Any]] = {}
+        self._quoted: set[str] = set()
+        self._lock = threading.RLock()
+        self._risk_config = PipelineConfig(risk=RiskConfig(policy="inventory"))
+        self._risk = InventoryRiskCheck(self._risk_config.risk)
+        self._inventory = InventoryProvider(self.store,
+                                            capital=self._risk_config.initial_capital,
+                                            game_resolver=self._resolve_game)
+        # Only quoted RFQs are durable. Reload their ids so trade broadcasts
+        # after a restart can still be joined to the saved quotes.
+        with self.store._lock:
+            self._quoted.update(row[0] for row in self.store._conn.execute(
+                "SELECT rfq_id FROM quotes WHERE status = 'shadow'"))
         if price_live:
             repo = Path(__file__).resolve().parents[1]
             params = ParamsProvider(repo / "params")
@@ -122,16 +129,11 @@ class RfqCapture:
                                        config=PipelineConfig(paper_mode=True),
                                        model_config=_live_pricer_config(repo))
                 self.quoter = LiveQuoter(pricer, self.selections, workers=quoter_workers,
-                                         on_decision=self._record_decision)
+                                         on_decision=self._record_decision,
+                                         store_declines=False)
         self.rfqs_seen = 0
         self.trades_seen = 0
         self.nfl_rfqs_seen = 0
-        self._rescreened_version = -1
-        self._raw_eligible: set[str] = set()
-        # RFQ ids whose raw gateway frames are worth keeping on disk. An id
-        # lands here when its RFQ passes the screen; the raw JSONL then keeps
-        # that RFQ's frame and any later trade frame for it. Everything else
-        # is captured only in slim parsed form in the SQLite store.
 
     def start(self) -> None:
         self.catalog.start()
@@ -147,13 +149,23 @@ class RfqCapture:
 
     def _record_decision(self, rfq: LiveRfq, quote: Any,
                          started: datetime, decided: datetime) -> None:
-        self.store.record_shadow_decision(
-            rfq_id=rfq.rfq_id, decision=quote.reason_code,
-            reason=quote.reason_detail or "",
-            fair_price=quote.fair, buy_price=quote.ask,
-            sell_price=quote.bid, buy_qty=quote.ask_qty,
-            sell_qty=quote.bid_qty, ts=decided.isoformat())
-        if quote.quoted:
+        with self._lock:
+            pending = self._pending.pop(rfq.rfq_id, None)
+            if not quote.quoted or pending is None:
+                return
+            if not self._check_quote_risk(rfq, quote, decided):
+                return
+            self.store.apply(pending["event"], source="live_capture",
+                             record_inventory=False)
+            screen = pending["screen"]
+            self.store.upsert_rfq_screen(rfq.rfq_id, **screen)
+            self._write_raw_frame(pending["now"], pending["raw"])
+            self.store.record_shadow_decision(
+                rfq_id=rfq.rfq_id, decision=quote.reason_code,
+                reason=quote.reason_detail or "",
+                fair_price=quote.fair, buy_price=quote.ask,
+                sell_price=quote.bid, buy_qty=quote.ask_qty,
+                sell_qty=quote.bid_qty, ts=decided.isoformat())
             self.store.record_shadow_draft(
                 quote_id=f"paper:{rfq.rfq_id}:auto", rfq_id=rfq.rfq_id,
                 fair=quote.fair, buy_price=quote.ask or 0,
@@ -163,16 +175,107 @@ class RfqCapture:
                 params_version=quote.params_version,
                 input_snapshot_json=json.dumps(quote.to_dict(), sort_keys=True),
                 decided_by="headless-paper", decided_at=decided.isoformat())
-        if rfq.received_at:
-            components = quote.components or {}
-            self.store.record_live_latency(
-                rfq_id=rfq.rfq_id, posted_at=rfq.received_at,
-                started_at=started.isoformat(),
-                decided_at=decided.isoformat(),
-                quoted=quote.quoted,
-                fetch_ms=components.get("book_fetch_ms"),
-                solve_ms=components.get("solve_ms"),
-                local_received_at=rfq.local_received_at)
+            self._quoted.add(rfq.rfq_id)
+            if rfq.received_at:
+                components = quote.components or {}
+                self.store.record_live_latency(
+                    rfq_id=rfq.rfq_id, posted_at=rfq.received_at,
+                    started_at=started.isoformat(),
+                    decided_at=decided.isoformat(), quoted=True,
+                    fetch_ms=components.get("book_fetch_ms"),
+                    solve_ms=components.get("solve_ms"),
+                    local_received_at=rfq.local_received_at)
+            if pending.get("trade"):
+                trade, trade_event, trade_now = pending["trade"]
+                self._save_trade(trade, trade_event, trade_now)
+
+    def _resolve_game(self, position_id: str) -> Optional[str]:
+        market = self.catalog.resolve((position_id,))[0]
+        return market.game if market is not None else None
+
+    def _check_quote_risk(self, rfq: LiveRfq, quote: Any,
+                          decided: datetime) -> bool:
+        """Reserve capacity before a paper quote becomes visible to other workers."""
+        def decline(code: str, message: str, game_id: str = "") -> bool:
+            quote.status, quote.reason_code, quote.reason_detail = "DECLINED", code, message
+            quote.bid = quote.ask = quote.response_price = None
+            quote.bid_qty = quote.ask_qty = None
+            self.store.record_risk_event(
+                ts=decided.isoformat(), rfq_id=rfq.rfq_id, quote_id="",
+                game_id=game_id,
+                verdict=RiskVerdict(False, "0", "0", code,
+                                    {"message": message, "source": "live_capture"},
+                                    action="reject"))
+            return False
+
+        games = {self._resolve_game(position_id) for position_id in rfq.leg_position_ids}
+        if None in games or len(games) != 1:
+            return decline("RISK_GAME_UNRESOLVED", "a single game must resolve for inventory limits")
+        game = next(iter(games))
+        bid, ask = float(quote.bid or 0), float(quote.ask or 0)
+        buy_qty = max(0, int(float(quote.ask_qty or 0)))
+        sell_qty = max(0, int(float(quote.bid_qty or 0)))
+        notional = max(buy_qty * ask, sell_qty * bid)
+        if notional <= 0:
+            return decline("RISK_SIZE_REDUCED", "quote has no positive notional", game)
+        if notional > self._risk_config.max_per_rfq_notional:
+            factor = self._risk_config.max_per_rfq_notional / notional
+            buy_qty = math.floor(buy_qty * factor)
+            sell_qty = math.floor(sell_qty * factor)
+        if not buy_qty and not sell_qty:
+            return decline("RISK_SIZE_REDUCED", "RFQ size falls below one share at the $1,000 limit", game)
+        notional = max(buy_qty * ask, sell_qty * bid)
+        inventory = self._inventory(decided.isoformat())
+        used = inventory.notional_by_game.get(game, 0.0)
+        if used + notional > self._risk_config.max_per_game_notional + 1e-9:
+            return decline("RISK_GAME_EXPOSURE",
+                           f"game quoted notional ${used + notional:.2f} exceeds "
+                           f"${self._risk_config.max_per_game_notional:.2f}", game)
+        draft = SimpleNamespace(fair_value=quote.fair,
+                                extra={"buy_qty": str(buy_qty), "sell_qty": str(sell_qty),
+                                       "buy_price": ask, "sell_price": bid,
+                                       "markets": rfq.leg_position_ids})
+        verdict = self._risk.check(draft, notional, inventory, game)
+        if not verdict.ok:
+            message = (f"game maximum loss ${inventory.exposures.get(game, 0):.2f} / "
+                       f"${self._risk_config.risk.max_game_loss:.2f} leaves no quotable size"
+                       if verdict.reason == "RISK_GAME_EXPOSURE" else
+                       "no quotable size fits inventory limits")
+            return decline(verdict.reason, message, game)
+        buy_qty, sell_qty = int(verdict.adjusted_buy_qty), int(verdict.adjusted_sell_qty)
+        quote.ask = verdict.adjusted_buy_price if buy_qty else None
+        quote.bid = verdict.adjusted_sell_price if sell_qty else None
+        final_notional = max(buy_qty * (quote.ask or 0),
+                             sell_qty * (quote.bid or 0))
+        if final_notional > self._risk_config.max_per_rfq_notional + 1e-9:
+            factor = self._risk_config.max_per_rfq_notional / final_notional
+            buy_qty, sell_qty = math.floor(buy_qty * factor), math.floor(sell_qty * factor)
+            if not buy_qty and not sell_qty:
+                return decline("RISK_SIZE_REDUCED", "adjusted RFQ size falls below one share", game)
+            if not buy_qty:
+                quote.ask = None
+            if not sell_qty:
+                quote.bid = None
+            final_notional = max(buy_qty * (quote.ask or 0),
+                                 sell_qty * (quote.bid or 0))
+        if used + final_notional > self._risk_config.max_per_game_notional + 1e-9:
+            return decline("RISK_GAME_EXPOSURE", "adjusted quote exceeds $5,000 game limit", game)
+        quote.ask_qty, quote.bid_qty = str(buy_qty), str(sell_qty)
+        quote.response_price = quote.ask if rfq.direction == "BUY" else quote.bid
+        if quote.response_price is None:
+            return decline("RISK_SIZE_REDUCED", "requested RFQ side has no capacity", game)
+        quote.components["risk"] = {
+            "game": game, "action": verdict.action, "notional_before": notional,
+            "game_notional_before": used, "game_loss_before": inventory.exposures.get(game, 0),
+            "game_loss_limit": self._risk_config.risk.max_game_loss,
+        }
+        return True
+
+    def _save_trade(self, raw: Dict[str, Any], event: Any, now: datetime) -> None:
+        if self.store.apply(event, source="live_capture", record_inventory=False):
+            self.store.record_live_trade(event.rfq_id, raw.get("price"), raw.get("size"),
+                                         raw.get("executed_at"))
+            self._write_raw_frame(now, raw)
 
     def heartbeat(self, adapter: InternationalQuoterGatewayAdapter) -> None:
         stats = adapter.stats()
@@ -199,27 +302,22 @@ class RfqCapture:
             self.errors += 1
             log.warning("dropping malformed frame", exc_info=True)
             return
-        # This receive-only feed has no fills or live inventory. Rebuilding
-        # inventory on each close scans every stored RFQ and stalls capture.
-        applied = self.store.apply(event, source="live_capture", record_inventory=False)
-        if not applied:
-            return
         if event.event_type == "rfq_created" and event.rfq_id:
             self.rfqs_seen += 1
-            self._screen(raw, event.rfq_id, now)
+            self._screen(raw, event, now)
         elif event.event_type == "rfq_closed" and "price" in raw:
             # Only gateway RFQ_TRADE broadcasts carry price/size (see
             # combo_mm.intl_gateway.map_rfq_trade); a plain rfq_closed
             # (deleted, no quote accepted) does not.
             self.trades_seen += 1
-            self.store.record_live_trade(event.rfq_id, raw.get("price"), raw.get("size"),
-                                         raw.get("executed_at"))
-            # Keep the raw trade frame only for RFQs we engaged with; the
-            # price/size itself is already in the live_trades table.
-            if event.rfq_id in self._raw_eligible:
-                self._write_raw_frame(now, raw)
+            with self._lock:
+                if event.rfq_id in self._quoted:
+                    self._save_trade(raw, event, now)
+                elif event.rfq_id in self._pending:
+                    self._pending[event.rfq_id]["trade"] = (raw, event, now)
 
-    def _screen(self, raw: Dict[str, Any], rfq_id: str, now: datetime) -> None:
+    def _screen(self, raw: Dict[str, Any], event: Any, now: datetime) -> None:
+        rfq_id = event.rfq_id
         legs = [str(leg.get("symbol")) for leg in raw.get("comboLegs") or []
                 if isinstance(leg, dict) and leg.get("symbol") is not None]
         if not legs:
@@ -233,30 +331,23 @@ class RfqCapture:
         checks = screen_checks(result, qty_decimal=qty,
                                min_qty=PipelineConfig().min_qty)
         eligible = result.quotable and all(checks.values())
-        if eligible:
-            # This RFQ is worth quoting on: keep its raw gateway frame so a
-            # later tuning/backtest pass has the full context, and remember
-            # it so a later trade frame for it is kept too.
-            self._raw_eligible.add(rfq_id)
-            self._write_raw_frame(now, raw)
         if result.n_nfl_legs:
             self.nfl_rfqs_seen += 1
-        self.store.upsert_rfq_screen(
-            rfq_id, n_legs=result.n_legs, n_resolved=result.n_resolved,
-            n_nfl_legs=result.n_nfl_legs,
-            screen=result.screen if eligible or not result.quotable else "BELOW_MIN_SIZE",
-            rank=result.rank if eligible or not result.quotable else 2,
-            catalog_version=self.catalog.version,
-            direction=raw.get("direction") or None, side=_combo_side(raw),
-            condition_id=raw.get("condition_id") or None,
-            submission_deadline=raw.get("submission_deadline") or None,
-            checks_json=json.dumps(checks))
-        if eligible and self.selections is not None:
-            if self.quoter is None:
-                self.selections.record_priced_quote({
-                    "rfq_id": rfq_id, "priced_at": datetime.now(timezone.utc).isoformat(),
-                    "status": "DECLINED", "reason_code": "PRICING_UNAVAILABLE"})
-            else:
+        if eligible and self.quoter is not None:
+            with self._lock:
+                if rfq_id in self._quoted or rfq_id in self._pending:
+                    return
+                self._pending[rfq_id] = {
+                    "raw": raw, "event": event, "now": now,
+                    "screen": dict(
+                        n_legs=result.n_legs, n_resolved=result.n_resolved,
+                        n_nfl_legs=result.n_nfl_legs, screen=result.screen,
+                        rank=result.rank, catalog_version=self.catalog.version,
+                        direction=raw.get("direction") or None, side=_combo_side(raw),
+                        condition_id=raw.get("condition_id") or None,
+                        submission_deadline=raw.get("submission_deadline") or None,
+                        checks_json=json.dumps(checks))}
+            try:
                 rfq = LiveRfq(
                     rfq_id=rfq_id, leg_position_ids=tuple(legs),
                     side=_combo_side(raw) or "YES",
@@ -268,51 +359,15 @@ class RfqCapture:
                     received_at=raw.get("createdTime") or raw.get("exchange_ts"),
                     local_received_at=now.isoformat())
                 if not self.quoter.submit(rfq):
-                    self.selections.record_priced_quote({
-                        "rfq_id": rfq_id, "priced_at": datetime.now(timezone.utc).isoformat(),
-                        "status": "DECLINED", "reason_code": "QUEUE_FULL"})
+                    with self._lock:
+                        self._pending.pop(rfq_id, None)
+            except Exception:
+                with self._lock:
+                    self._pending.pop(rfq_id, None)
+                raise
 
     def rescreen_unresolved(self) -> None:
-        """Re-screen RFQs whose legs were unknown, once per catalog growth."""
-        version = self.catalog.version
-        if version == self._rescreened_version:
-            return
-        rows = self.store.unresolved_screen_rfqs(version, limit=RESCREEN_BATCH)
-        for row in rows:
-            result = screen_legs(self.catalog.resolve(row["legs"]))
-            rfq = self.store.get_rfq(row["rfq_id"]) or {}
-            checks = screen_checks(result, qty_decimal=rfq.get("qty_decimal"),
-                                   min_qty=PipelineConfig().min_qty)
-            eligible = result.quotable and all(checks.values())
-            if result.n_nfl_legs:
-                self.nfl_rfqs_seen += 1
-            self.store.upsert_rfq_screen(
-                row["rfq_id"], n_legs=result.n_legs, n_resolved=result.n_resolved,
-                n_nfl_legs=result.n_nfl_legs,
-                screen=result.screen if eligible or not result.quotable else "BELOW_MIN_SIZE",
-                rank=result.rank if eligible or not result.quotable else 2,
-                catalog_version=version, checks_json=json.dumps(checks))
-            if eligible and self.selections is not None:
-                if self.quoter is None:
-                    self.selections.record_priced_quote({
-                        "rfq_id": row["rfq_id"],
-                        "priced_at": datetime.now(timezone.utc).isoformat(),
-                        "status": "DECLINED", "reason_code": "PRICING_UNAVAILABLE"})
-                    continue
-                accepted = self.quoter.submit(LiveRfq(
-                    rfq_id=row["rfq_id"], leg_position_ids=tuple(row["legs"]),
-                    side=(self.store.get_rfq_screen(row["rfq_id"]) or {}).get("side") or "YES",
-                    direction=(self.store.get_rfq_screen(row["rfq_id"]) or {}).get("direction") or "BUY",
-                    qty_decimal=str(rfq["qty_decimal"]) if rfq.get("qty_decimal") is not None else None,
-                    cash_order_qty=str(rfq["cash_order_qty"]) if rfq.get("cash_order_qty") is not None else None,
-                    received_at=rfq.get("created_time")))
-                if not accepted:
-                    self.selections.record_priced_quote({
-                        "rfq_id": row["rfq_id"],
-                        "priced_at": datetime.now(timezone.utc).isoformat(),
-                        "status": "DECLINED", "reason_code": "QUEUE_FULL"})
-        if len(rows) < RESCREEN_BATCH:  # backlog drained for this version
-            self._rescreened_version = version
+        """Compatibility no-op: unquoted RFQs are intentionally not stored."""
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -328,8 +383,6 @@ def main(argv: Optional[list] = None) -> int:
                         help="stop after N seconds (default: run until interrupted)")
     parser.add_argument("--quoter-workers", type=int, default=4,
                         help="pricing worker threads draining the RFQ queue (default: 4)")
-    parser.add_argument("--no-rescreen", action="store_true",
-                        help="skip historical unresolved-RFQ backfill for a fresh live run")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO,
@@ -376,8 +429,6 @@ def main(argv: Optional[list] = None) -> int:
             now = datetime.now(timezone.utc)
             for item in adapter.poll(now):
                 capture.handle(item, now)
-            if not args.no_rescreen:
-                capture.rescreen_unresolved()
             capture.heartbeat(adapter)
             if time.monotonic() - last_log >= args.log_every:
                 quoter_stats = capture.quoter.stats() if capture.quoter else {}

@@ -49,6 +49,7 @@ class LiveQuoter:
 
     def __init__(self, pricer: NflLivePricer, store: QuoteSelectionStore, *,
                  max_queue: int = 500, workers: int = 1, start_worker: bool = True,
+                 store_declines: bool = True,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  on_decision: Optional[Callable[[LiveRfq, LiveQuote, datetime, datetime], None]] = None) -> None:
         if workers < 1:
@@ -58,6 +59,7 @@ class LiveQuoter:
         self.workers = workers
         self._clock = clock
         self.on_decision = on_decision
+        self.store_declines = store_declines
         self._queue: "queue.Queue[tuple[LiveRfq, str]]" = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
         self._warmed = threading.Event()
@@ -166,6 +168,19 @@ class LiveQuoter:
         # writes below. Otherwise "compute" latency would fold in SQLite write
         # time and cross-worker lock contention, not just the pricing itself.
         decided = self._clock()
+        if self.on_decision is not None:
+            try:
+                self.on_decision(rfq, quote, started, decided)
+            except Exception as exc:
+                # Capture risk and persistence must fail closed.
+                quote.status, quote.reason_code = "DECLINED", "RISK_ERROR"
+                quote.reason_detail = f"decision {type(exc).__name__}"
+                quote.bid = quote.ask = quote.response_price = None
+                quote.bid_qty = quote.ask_qty = None
+                with self._lock:
+                    self.errors += 1
+                    self.last_error = quote.reason_detail
+                log.warning("failed to record live decision: %s", type(exc).__name__)
         with self._lock:
             self.priced += 1
             if quote.quoted:
@@ -185,21 +200,14 @@ class LiveQuoter:
         else:
             log.info("no quote rfq=%s reason=%s (%s)", rfq.rfq_id, quote.reason_code,
                      quote.reason_detail)
-        try:
-            self.store.record_priced_quote(quote.to_dict(), trigger)
-        except Exception as exc:  # storage trouble must not kill the worker
-            with self._lock:
-                self.errors += 1
-                self.last_error = f"store {type(exc).__name__}"
-            log.warning("failed to store priced quote: %s", type(exc).__name__)
-        if self.on_decision is not None:
+        if quote.quoted or self.store_declines:
             try:
-                self.on_decision(rfq, quote, started, decided)
-            except Exception as exc:
+                self.store.record_priced_quote(quote.to_dict(), trigger)
+            except Exception as exc:  # storage trouble must not kill the worker
                 with self._lock:
                     self.errors += 1
-                    self.last_error = f"decision {type(exc).__name__}"
-                log.warning("failed to record live decision: %s", type(exc).__name__)
+                    self.last_error = f"store {type(exc).__name__}"
+                log.warning("failed to store priced quote: %s", type(exc).__name__)
         return quote
 
     def stats(self) -> Dict[str, Any]:
