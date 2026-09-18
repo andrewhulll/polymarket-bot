@@ -1,0 +1,18 @@
+# Runs the heartbeat check every 5 minutes.
+#
+# Install (after replacing __REPO_DIR__ in the .service file):
+#   cp polymarket-bot-heartbeat-check.service polymarket-bot-heartbeat-check.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now polymarket-bot-heartbeat-check.timer
+# Uninstall:
+#   systemctl --user disable --now polymarket-bot-heartbeat-check.timer polymarket-bot-heartbeat-check.service
+#   rm ~/.config/systemd/user/polymarket-bot-heartbeat-check.service ~/.config/systemd/user/polymarket-bot-heartbeat-check.timer
+[Unit]
+Description=Run RFQ capture heartbeat check every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

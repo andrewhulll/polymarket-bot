@@ -1,0 +1,12 @@
+# Dead-man's heartbeat check (Linux, oneshot). Run by
+# polymarket-bot-heartbeat-check.timer every 5 minutes. A stale heartbeat
+# exits non-zero and is journaled; this catches the wedged case
+# Restart=always cannot: a process that is alive but no longer writing
+# heartbeats. See docs/always-on.md.
+[Unit]
+Description=Check RFQ capture heartbeat freshness
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/usr/bin/env python3 __REPO_DIR__/scripts/check_heartbeat.py --data-dir __REPO_DIR__/data/live

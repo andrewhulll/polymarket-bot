@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from combo_mm.capture_process import DEFAULT_MAX_HEARTBEAT_AGE_S
 from combo_mm.config import PipelineConfig
 from dashboard import live_view_models as vm
 
@@ -158,6 +159,16 @@ def _engine(conn) -> None:
         c2.metric("Messages processed", health["messages_processed"])
         c3.metric("Errors", health["errors"])
         c4.metric("Gateway", "connected" if health["gateway_connected"] else "disconnected")
+        try:
+            hb_age_s = (datetime.now(timezone.utc) - datetime.fromisoformat(
+                str(health["heartbeat_at"]).replace("Z", "+00:00"))).total_seconds()
+        except (TypeError, ValueError):
+            hb_age_s = None
+        if hb_age_s is not None and hb_age_s > DEFAULT_MAX_HEARTBEAT_AGE_S:
+            st.warning(
+                f"Capture heartbeat is stale — last beat {hb_age_s / 60:.0f} min ago "
+                f"(threshold {int(DEFAULT_MAX_HEARTBEAT_AGE_S // 60)} min). "
+                "The capture process may be down; see docs/always-on.md.")
         st.caption(f"Last heartbeat: {health['heartbeat_at']} · Buffer drops: {health['buffer_drops']}")
     st.subheader("Quote latency · 400 ms budget")
     st.caption("Wait starts at the exchange posting timestamp when the gateway supplies it; "

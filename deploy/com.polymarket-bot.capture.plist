@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Always-on supervision for the headless RFQ capture process (macOS).
+
+  Install (replace __REPO_DIR__ with your checkout path first, e.g. via
+  sed -i '' "s|__REPO_DIR__|$HOME/polymarket-bot|g" this file):
+      cp com.polymarket-bot.capture.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.polymarket-bot.capture.plist
+  Uninstall:
+      launchctl bootout gui/$(id -u)/com.polymarket-bot.capture
+      rm ~/Library/LaunchAgents/com.polymarket-bot.capture.plist
+
+  KeepAlive restarts the capture whenever it exits (crash, kill, reboot via
+  RunAtLoad). The process takes the rfq_capture.lock on start, so the
+  dashboard's auto-start (ensure_capture_running) never launches a duplicate.
+  Credentials come from the environment or the gitignored repo-root .env —
+  never put secrets in this file. See docs/always-on.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.polymarket-bot.capture</string>
+    <!-- /usr/bin/env finds python3 on launchd's minimal PATH. If your
+         dependencies live under a Homebrew or venv python, replace these
+         two strings with that interpreter's absolute path. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>__REPO_DIR__/scripts/capture_live_rfqs.py</string>
+        <string>--data-dir</string>
+        <string>__REPO_DIR__/data/live</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>__REPO_DIR__/data/live/capture.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_DIR__/data/live/capture.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

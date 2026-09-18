@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Dead-man's heartbeat check (macOS). Runs scripts/check_heartbeat.py every
+  5 minutes; a stale heartbeat exits non-zero and is logged to
+  data/live/heartbeat-check.log. This catches the wedged case KeepAlive
+  cannot: a process that is alive but no longer writing heartbeats.
+
+  Install (replace __REPO_DIR__ first, same sed as the capture plist):
+      cp com.polymarket-bot.heartbeat-check.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.polymarket-bot.heartbeat-check.plist
+  Uninstall:
+      launchctl bootout gui/$(id -u)/com.polymarket-bot.heartbeat-check
+      rm ~/Library/LaunchAgents/com.polymarket-bot.heartbeat-check.plist
+
+  See docs/always-on.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.polymarket-bot.heartbeat-check</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>__REPO_DIR__/scripts/check_heartbeat.py</string>
+        <string>--data-dir</string>
+        <string>__REPO_DIR__/data/live</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>StandardOutPath</key>
+    <string>__REPO_DIR__/data/live/heartbeat-check.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_DIR__/data/live/heartbeat-check.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

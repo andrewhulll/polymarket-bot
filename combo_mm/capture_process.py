@@ -54,21 +54,43 @@ class CaptureLock:
         self.file = None
 
 
-def _recent_heartbeat(db_path: Path, max_age_s: float = 10.0) -> bool:
-    """Recognize a reader started before the process lock was introduced."""
+#: Heartbeat older than this means the capture process is dead or wedged.
+#: Shared default for scripts/check_heartbeat.py, the dashboard Engine-status
+#: tab, and docs/always-on.md.
+DEFAULT_MAX_HEARTBEAT_AGE_S = 10 * 60
+
+
+def read_heartbeat_age_s(db_path: Path) -> Optional[float]:
+    """Seconds since the last capture heartbeat, or None when unknown.
+
+    None covers: no database yet, no health row yet, or an unreadable /
+    unparsable heartbeat. Callers treat None as "no evidence of life".
+    """
     if not db_path.exists():
-        return False
+        return None
     try:
         with sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True,
                              timeout=0.2) as db:
-            row = db.execute("SELECT heartbeat_at FROM live_engine_health WHERE id=1").fetchone()
-        if row is None:
-            return False
-        age = (datetime.now(timezone.utc) -
-               datetime.fromisoformat(row[0].replace("Z", "+00:00"))).total_seconds()
-        return age < max_age_s
+            row = db.execute(
+                "SELECT heartbeat_at FROM live_engine_health WHERE id=1").fetchone()
+        if row is None or row[0] is None:
+            return None
+        beat = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - beat).total_seconds()
     except (OSError, sqlite3.Error, ValueError, TypeError):
-        return False
+        return None
+
+
+def heartbeat_is_fresh(db_path: Path,
+                       max_age_s: float = DEFAULT_MAX_HEARTBEAT_AGE_S) -> bool:
+    """True when a heartbeat was recorded within ``max_age_s`` seconds."""
+    age = read_heartbeat_age_s(db_path)
+    return age is not None and age < max_age_s
+
+
+def _recent_heartbeat(db_path: Path, max_age_s: float = 10.0) -> bool:
+    """Recognize a reader started before the process lock was introduced."""
+    return heartbeat_is_fresh(db_path, max_age_s)
 
 
 def ensure_capture_running(repo: Path) -> Optional[str]:
