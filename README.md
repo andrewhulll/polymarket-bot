@@ -248,10 +248,18 @@ python3 -m pytest tests/ -q
 # Demo: scripted session through the consumer, incl. a mid-stream disconnect
 python3 scripts/run_pipeline.py
 
-# Dashboard (demo/observability — not production); NFL deps first
+# Dashboard (demo/observability — not production); NFL deps first for the NFL tab
 pip install -r requirements-nfl.txt
-streamlit run dashboard/app.py
+python3 -m dashboard.server --data-dir data/live --port 8000
 ```
+The dashboard is a stdlib HTTP server plus a static page: the page stays loaded and
+polls small JSON endpoints, so live tables update in place with no full refresh, no
+lost scroll position, and no rerun of the whole script. It has five tabs — RFQs,
+Pricing, Performance, Engine, and NFL correlation (the full research suite: overview,
+combo pricing, calibration, correlation structure, sensitivity & P&L, combo explorer,
+and params & data, rendered with vendored Vega-Lite). It opens the capture database
+read-only; the headless capture process remains the sole writer. The legacy Streamlit
+app (`streamlit run dashboard/app.py`) is kept as a one-release fallback.
 
 The dashboard opens with a PAPER/SHADOW banner and two controls at the top:
 
@@ -439,8 +447,16 @@ Rules (enforced by tests):
 Start the dashboard from the repo root:
 
 ```bash
-streamlit run dashboard/app.py
+python3 -m dashboard.server --data-dir data/live --port 8000
 ```
+
+Then open http://127.0.0.1:8000. The page polls the server's JSON endpoints
+(RFQs, Pricing, Performance, Engine every few seconds; the NFL correlation tab
+loads its research views on demand) and patches the tables in place — nothing
+ever full-refreshes, so scroll position, selected rows, filters, and the active
+tab survive the feed. It opens `data/live/rfq_capture.db` read-only; closing or
+slowing the page does not delay pricing. The legacy Streamlit app
+(`streamlit run dashboard/app.py`) remains as a one-release fallback.
 
 When the dashboard starts, it starts the headless capture process if no reader
 is running. A process lock prevents duplicate readers, including when multiple
@@ -519,8 +535,7 @@ pick up the RFQ beta on the next successful poll.
 export POLYMARKET_US_KEY_ID="..."
 export POLYMARKET_US_SECRET_KEY="..."
 pip install polymarket-us
-# dashboard: streamlit run dashboard/app.py, then press "Live monitor RFQ feed"
-# (without the gateway keys set); or drive the source directly:
+# dashboard: python3 -m dashboard.server --data-dir data/live (without the gateway keys set); or drive the source directly:
 python3 -c "
 from combo_mm import EventStore, PollingConsumer, RetailPollingSource
 store = EventStore('retail.db')

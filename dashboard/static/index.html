@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Combo RFQ bot — live</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="dot" id="health-dot" title="capture database"></span>
+    <h1>Combo RFQ bot <span class="sub">live · paper only</span></h1>
+  </div>
+  <nav id="tabs">
+    <button data-tab="rfqs" class="active">RFQs</button>
+    <button data-tab="pricing">Pricing</button>
+    <button data-tab="performance">Performance</button>
+    <button data-tab="engine">Engine</button>
+    <button data-tab="nfl">NFL correlation</button>
+  </nav>
+  <div class="meta"><span id="killswitch-badge" class="hidden">KILL SWITCH</span><span id="updated">—</span><span id="paused" class="hidden">paused</span></div>
+</header>
+<main>
+  <section id="tab-rfqs" class="tab active">
+    <div class="toolbar">
+      <label class="toggle"><input type="checkbox" id="only-quotable"> quotable only</label>
+      <select id="screen-filter"><option value="">all screens</option></select>
+      <input type="search" id="rfq-search" placeholder="search id / symbol…">
+      <span class="spacer"></span>
+      <button id="rfq-prev">‹</button><span id="rfq-page-label" class="page-label"></span><button id="rfq-next">›</button>
+    </div>
+    <p class="caption" id="rfq-count"></p>
+    <div class="table-wrap"><table id="rfq-table">
+      <thead><tr><th>RFQ</th><th class="num">Age</th><th>Screen</th><th class="num">Legs</th><th>Side</th><th>Size</th><th>Deadline</th><th>Status</th><th>Posted</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <section id="tab-pricing" class="tab">
+    <div class="kpis" id="pricing-kpis"></div>
+    <div class="toolbar">
+      <span class="spacer"></span>
+      <button id="pricing-prev">‹</button><span id="pricing-page-label" class="page-label"></span><button id="pricing-next">›</button>
+    </div>
+    <p class="caption" id="pricing-count"></p>
+    <div class="table-wrap"><table id="pricing-table">
+      <thead><tr><th>RFQ</th><th>Priced</th><th>Decision</th><th>Reason</th><th class="num">Our</th><th class="num">Fair</th><th class="num">Naive</th><th class="num">Market</th><th class="num">Q edge</th><th class="num">M edge</th><th class="num">Wait</th><th class="num">Compute</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <section id="tab-performance" class="tab">
+    <div class="kpis" id="perf-kpis"></div>
+    <h2>Shadow fills <span class="h-sub">every booked quote, all four prices</span></h2>
+    <div class="toolbar"><span class="spacer"></span>
+      <button id="fills-prev">‹</button><span id="fills-page-label" class="page-label"></span><button id="fills-next">›</button>
+    </div>
+    <div class="table-wrap"><table id="fills-table">
+      <thead><tr><th></th><th>Time</th><th>RFQ</th><th>Game</th><th>Family</th><th>Side</th><th class="num">Size</th><th class="num">Naive</th><th class="num">Fair</th><th class="num">Our</th><th class="num">Market</th><th class="num">Q edge</th><th class="num">Exp P&amp;L</th><th class="num">Real P&amp;L</th><th>Settled</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div class="charts">
+      <div class="chart"><h3>Cumulative realized P&amp;L</h3><svg id="chart-realized" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
+      <div class="chart"><h3>Net notional exposure</h3><svg id="chart-equity" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
+    </div>
+    <div class="breakdowns" id="perf-breakdowns"></div>
+  </section>
+
+  <section id="tab-engine" class="tab">
+    <div class="kpis" id="engine-kpis"></div>
+    <div id="engine-alerts"></div>
+    <h2>Quote latency <span class="h-sub" id="latency-budget"></span></h2>
+    <div class="charts">
+      <div class="chart"><h3>Wait: posted → engine started</h3><svg id="hist-wait" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
+      <div class="chart"><h3>Compute: engine started → decision</h3><svg id="hist-compute" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
+    </div>
+    <div class="table-wrap"><table id="latency-table">
+      <thead><tr><th>Stage</th><th class="num">p50</th><th class="num">p95</th><th class="num">max</th></tr></thead><tbody></tbody>
+    </table></div>
+    <h2>Decline &amp; skip reasons</h2>
+    <div class="table-wrap"><table id="reasons-table">
+      <thead><tr><th>Reason</th><th class="num">n</th><th class="num">share</th><th></th></tr></thead><tbody></tbody>
+    </table></div>
+    <h2>Risk events</h2>
+    <div class="table-wrap"><table id="risk-table">
+      <thead><tr><th>Time</th><th>RFQ</th><th>Action</th><th>Reason</th></tr></thead><tbody></tbody>
+    </table></div>
+    <h2>Stored draft quotes</h2>
+    <div class="table-wrap"><table id="drafts-table">
+      <thead><tr><th>Quote</th><th>RFQ</th><th class="num">Buy</th><th class="num">Sell</th><th>Qty</th><th>Created</th></tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+
+  <section id="tab-nfl" class="tab">
+    <div class="toolbar">
+      <div id="nfl-subtabs" class="subtabs"></div>
+      <span class="spacer"></span>
+      <button id="nfl-run-params">Refresh params</button>
+      <button id="nfl-run-backtest">Run backtest</button>
+    </div>
+    <div id="nfl-filters" class="filterbar"></div>
+    <div id="nfl-notes"></div>
+    <div id="nfl-charts"></div>
+    <div id="nfl-tables"></div>
+    <pre id="nfl-run-output" class="hidden"></pre>
+  </section>
+
+  <div id="waiting" class="waiting hidden">Waiting for the headless capture database…</div>
+</main>
+
+<aside id="drawer" class="hidden">
+  <div class="drawer-head"><h2 id="drawer-title"></h2><button id="drawer-close">✕</button></div>
+  <div id="drawer-body"></div>
+</aside>
+<div id="drawer-scrim" class="hidden"></div>
+
+<script src="/static/js/core.js"></script>
+<script src="/static/js/rfqs.js"></script>
+<script src="/static/js/pricing.js"></script>
+<script src="/static/js/performance.js"></script>
+<script src="/static/js/engine.js"></script>
+<script src="/static/js/nfl.js"></script>
+</body>
+</html>
