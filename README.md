@@ -1,10 +1,12 @@
 # polymarket-bot
 
 Paper-trading combo RFQ pipeline for Polymarket, built for Totalis (a prediction-markets startup).
-Listens for combo RFQs, stores raw messages and normalized records, prices combos with a minimal
-V1 independent-leg model, shadow-quotes without ever submitting, and replays sessions
-deterministically. The simulated feed is the default; Retail REST polling is supported for live
-market data; the Exchange gRPC adapter is stubbed for later.
+Listens for combo RFQs, stores raw messages and normalized records, prices NFL same-game combos
+with a joint correlation model (`combo_mm/nfl/`), shadow-quotes without ever submitting, and
+replays sessions deterministically. The minimal V1 independent-leg model remains as the fallback
+pricer and the naive baseline the correlation model is scored against. Live sources are the
+receive-only international quoter gateway and US Retail REST polling; the Exchange gRPC adapter
+is stubbed for later.
 
 > Nothing in this repo places orders. Paper mode is the default and the pipeline refuses to
 > submit quotes: draft quotes are computed, stored, and logged — never sent.
@@ -67,36 +69,34 @@ Results by market type and combo size,
 
 Sensitivity to correlation.
 
-## Scope of this PR
+## Status against the Totalis brief
 
-**Implemented in this PR**
+One row per brief step, kept current — if a PR changes a step's status, update this table
+(see `.github/pull_request_template.md`). Roadmap: #17.
 
-- **Step 1 — RFQ listener and storage.** Full event model + normalizer, append-only SQLite event
-  store (raw messages + normalized projections), stream consumer with safe reconnect and durable
-  recovery reads, simulated feed, and deterministic replay fixtures proving idempotent recovery.
-- **Dashboard (observability, Streamlit).** Three views: RFQs (expandable full detail), Pricing &
-  quoting (V1 fair price, quoted buy/sell, size, expected edge, per-adjustment explanations), and
-  Performance (a step-5-style replay tab over the fixture dataset — RFQs received/quoted/rejected/
-  expired/executed, quote and execution rates, expected vs realized P&L, max downswing/upswing,
-  inventory/exposure over time). Clearly labeled PAPER/SHADOW.
-- **Minimal V1 pricer + shadow quoting** — just enough to make the dashboard real (independent-leg
-  product model, spread components, tick rounding, structured reason codes; drafts stored, never
-  submitted).
-- **Retail live-data adapter** — polling the Polymarket US Retail REST API for RFQ state and leg
-  books, with beta-gate handling (see below). Simulated feed remains the default.
+| Brief step | Status | Where (modules) | Tracking |
+|---|---|---|---|
+| 1. RFQ listener and storage | Done | `consumer.py`, `store.py`, `normalize.py`, `recovery.py` | #1 |
+| 2. Pricing and correlation | Done on the live path; not on the shadow-engine path | `nfl/live_pricer.py`, `live_quoter.py`; `ShadowQuotingEngine` still defaults to `V1NaivePricer` (`engine.py`) | #2 |
+| 3. Inventory and risk ($50k capital) | Hard caps only | `risk.py` `ConservativeRiskCheck`; inventory never populated | #3 |
+| 4. Shadow quoting | Done | `engine.py`, `eligibility.py` | #4 |
+| 5. Backtest | Partial — historical backtest + correlation sensitivity + settlement scoring done; unified runner over the simulated RFQ dataset missing | `nfl/synthetic_backtest.py`, `scripts/nfl_backtest.py`, `docs/settlement-tracking.md` | #5 |
+| Live dashboard (five tabs) | Done (closed) | `dashboard/`, `combo_mm/intl_gateway.py` | #11 |
+| Always-on supervision | In progress | `combo_mm/capture_process.py`; `scripts/check_heartbeat.py` and `deploy/` planned | #34 |
 
-- **Step 2 — correlation-aware live pricing.** The NFL same-game model now prices live RFQs: legs
-  resolve to canonical score legs, leg books come from the CLOB/Gamma, the game's main spread and
-  total calibrate the score distribution against the current weekly params file, and the bid/ask we
-  would show is logged per RFQ — see [Pricing a live RFQ](#pricing-a-live-rfq-the-model-quotes),
-  [NFL correlation pipeline](#nfl-correlation-pipeline-issue-6) and `docs/correlation-model.md`.
+## Known limitations
 
-**Parked for later**
-
-- **Step 3** — inventory & risk management on $50k capital (widen/skew/reduce/reject as inventory
-  grows; hard limits; kill switch).
-- **Step 5 (full)** — formal backtest report (results by market type and combo size, sensitivity to
-  correlation). The dashboard Performance tab is a lightweight replay summary, not the full report.
+- **US Retail RFQ access.** `polymarket-us` 0.1.2 exposes no RFQ resource; the `/v1/rfqs*`
+  paths are hand-modeled guesses (see [Endpoint status](#endpoint-status-2026-09-16)) — do not
+  treat live Retail RFQ polling as authoritative.
+- **Paper only.** Nothing in this repo submits orders or quotes; draft quotes are computed,
+  stored, and logged — never sent.
+- **Push/tie settlement unverified.** The backtest voids the whole combo when a leg pushes;
+  whether the real rule voids the leg or the combo is unconfirmed.
+- **Correlation model errors.** Ranked known errors and next steps live in
+  `docs/correlation-model.md` §4.4 ("Known model errors").
+- **Cold-game pricing latency.** A cold game costs ~1.5 s (two HTTP round trips) against the
+  200 ms RFQ window; warm games price in ~2 ms (#2).
 
 ## Components (`combo_mm/`)
 
@@ -242,17 +242,18 @@ python3 -m pytest tests/test_shadow_engine.py -q   # determinism + safety tests
 ## Running
 
 ```bash
-# Tests (stdlib only + pytest; no network)
+# Tests (stdlib only + pytest; no network) — 491 tests
 python3 -m pytest tests/ -q
 
 # Demo: scripted session through the consumer, incl. a mid-stream disconnect
 python3 scripts/run_pipeline.py
 
-# Dashboard (demo/observability — not production)
+# Dashboard (demo/observability — not production); NFL deps first
+pip install -r requirements-nfl.txt
 streamlit run dashboard/app.py
 ```
 
-The dashboard opens with a PAPER/SHADOW banner and three controls at the top:
+The dashboard opens with a PAPER/SHADOW banner and two controls at the top:
 
 - **Run backtest — NFL 2026 Week 1** — replays every same-game combo (2–3 legs of ML / spread /
   total, 17 combo types) from the week's 16 games as RFQs through the real pipeline
@@ -263,11 +264,6 @@ The dashboard opens with a PAPER/SHADOW banner and three controls at the top:
   with the better price. Trades produce the full quote lifecycle and a fill, then settle on the
   final score; a pushed leg voids the combo. Needs the cached nflverse pull under `data/raw`
   (`python scripts/refresh_params.py --pull`). Deterministic; about 5 seconds.
-- **NFL fixture week** — replays the committed four-game fixture slate
-  (`combo_mm/fixtures_nfl.py`, see [NFL RFQ datasets](#nfl-rfq-datasets-issue-15)). Needs no data
-  pull, so it works on a fresh checkout. Fills are not modelled, so there are no trades: the
-  Performance tab counts each RFQ by its last decision, which for a settled RFQ is the
-  after-the-fact re-check, so read the per-request decisions in **Pricing & quoting**.
 - **Live monitor RFQ feed** — streams live RFQs through the same store and shadow engine
   (`combo_mm/live_monitor.py`), auto-refreshing the views every `poll_interval_s`; **Stop live
   monitor** closes the connection and keeps the data. The source is the receive-only polymarket.com
@@ -275,8 +271,10 @@ The dashboard opens with a PAPER/SHADOW banner and three controls at the top:
   [Live international RFQ feed](#live-international-rfq-feed-quoter-gateway)), else the US Retail
   API when its two env vars are set (see [Retail live data](#retail-live-data)). There is no
   simulated fallback: without keys, the needed package, or RFQ beta access, the dashboard says
-  which is missing. Live RFQs are not priced by the NFL model yet: Retail RFQs use the V1 pricer,
-  and gateway legs (on-chain position ids, no leg books) are recorded as `MISSING_LEG` declines.
+  which is missing. Live RFQs are priced by the NFL correlation model: both the dashboard's
+  live monitor and the headless `scripts/capture_live_rfqs.py` build `LiveQuoter` around
+  `NflLivePricer` (see [Pricing a live RFQ](#pricing-a-live-rfq-the-model-quotes)). Legs the
+  catalog cannot resolve still decline (`UNRESOLVED_LEG`).
 
 Views (all read the active run):
 
@@ -391,8 +389,9 @@ risk or engine module so much as mentions it.
 `combo_mm/fixtures_nfl.py` is a committed four-game slate of 40 hand-written RFQs, one deliberate
 case each (nested and impossible combos, a pushed integer spread, a moneyline tie, an overtime
 settlement, a missing main total, an unknown leg, a cross-game combo, a stale book, a cancel, an
-expiry, duplicate and out-of-order deliveries). It needs no data pull and no numpy/scipy, so the
-dashboard's **NFL fixture week** button works on a fresh checkout.
+expiry, duplicate and out-of-order deliveries). It needs no data pull and no numpy/scipy, so it
+runs on a fresh checkout (exercised by `tests/test_fixtures_nfl.py`; the dashboard button was
+removed).
 
 ## Retail live data
 
