@@ -62,7 +62,7 @@ def _dump_quotes(store):
     return json.dumps(rows, sort_keys=True, default=str)
 
 
-def test_v1_catalog_guardrail_widens_and_declines_nested_legs():
+def test_v1_catalog_guardrail_declines_nested_legs():
     catalog = ComboMarketCatalog()
     catalog.merge(parse_catalog_page(catalog_payload()))
     ml = position(GAME, 1)
@@ -75,8 +75,9 @@ def test_v1_catalog_guardrail_widens_and_declines_nested_legs():
     widened = guarded.price([leg(ml), leg(total)], rfq_id="R", qty_decimal="10")
     baseline = V1NaivePricer().price([leg(ml), leg(total)], rfq_id="R", qty_decimal="10")
     assert widened.quotable
-    assert widened.extra["components"]["same_game_haircut_bps"] == 150
-    assert widened.extra["spread_bps_total"] == baseline.extra["spread_bps_total"] + 150
+    # the markup is identical with or without the catalog: the spread is
+    # copied from the legs' books, and the guardrail only declines.
+    assert widened.extra["spread_bps_total"] == baseline.extra["spread_bps_total"]
     assert guarded.price([leg(ml), leg(spread)], rfq_id="R", qty_decimal="10").unquotable_reason == SAME_GAME_NESTED
     assert V1NaivePricer(resolver=catalog.lookup, same_game_max_qty=5).price(
         [leg(ml), leg(total)], rfq_id="R", qty_decimal="10").unquotable_reason == SAME_GAME_TOO_LARGE

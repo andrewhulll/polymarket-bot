@@ -205,5 +205,5 @@ def test_zero_bid_leg_does_not_explode_spread():
                                   bid_size=5, ask_size=5)],
                     rfq_id="x", qty_decimal="10")
     assert d.reason_code != "QUOTED_OK" or d.buy_price < 0.999
-    if d.components.get("model_uncertainty_bps") is not None:
-        assert d.components["model_uncertainty_bps"] < 1e6
+    # the markup is capped: the total spread never exceeds 100 bps
+    assert d.components["spread_bps_total"] <= 100.0

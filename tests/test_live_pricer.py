@@ -140,8 +140,9 @@ def test_model_joint_method_matches_the_joint_engine_directly():
 def test_three_legs_and_team_totals_price():
     quote = price(build(), ML_HOME, FAV_COVER, TEAM_TOTAL)
     assert quote.reason_code == QUOTED_OK
-    assert quote.components["tail_bps"] == 25.0        # one leg beyond two
     assert len(quote.legs) == 3
+    # the Gaussian-tail blind spot is still explained, just no longer priced
+    assert any("Tails" in e for e in quote.explanations)
 
 
 def test_legs_from_another_game_multiply_in_as_independent():
@@ -166,7 +167,11 @@ def test_bid_and_ask_straddle_fair_and_sit_on_the_tick():
     for p in (quote.bid, quote.ask):
         assert round(p / 0.001) == pytest.approx(p / 0.001, abs=1e-6)
     assert quote.spread_bps_total > 0
-    assert quote.components["corr_model_risk_bps"] > 0     # deviating from naive costs spread
+    # markup: half-spread = 2 x avg leg half-spread, total never over 100 bps
+    comps = quote.components
+    assert comps["half_spread_bps"] == pytest.approx(
+        min(50.0, 2.0 * comps["avg_leg_half_spread_bps"]))
+    assert comps["spread_bps_total"] <= 100.0
 
 
 def test_the_response_side_follows_the_requester_direction():

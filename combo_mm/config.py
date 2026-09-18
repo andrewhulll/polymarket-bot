@@ -34,13 +34,12 @@ class PipelineConfig:
     # it (live monitor only -- see combo_mm.live_monitor). Missing this
     # budget means we likely lose the RFQ to a faster maker.
     quote_latency_budget_ms: int = 400
-    # --- V1 pricer knobs (spread components, basis points unless noted) ---
-    base_edge_bps: float = 15.0
-    uncertainty_per_leg_bps: float = 5.0
-    width_weight: float = 0.5          # multiplier on summed leg spread (bps)
-    depth_slope_bps: float = 20.0     # depth impact slope vs top-of-book size
-    event_risk_bps: float = 5.0
-    operational_buffer_bps: float = 5.0
+    # --- Markup knobs: the combo spread is copied from the legs' own books.
+    # half_spread = min(max_half_spread_bps,
+    #                   leg_width_multiplier * avg leg half-spread).
+    leg_width_multiplier: float = 2.0  # the one knob
+    max_half_spread_bps: float = 50.0   # total spread never exceeds 100 bps
+    max_leg_spread_bps: float = 1000.0  # decline when a leg book is wider
     tick_size: float = 0.001
     price_min: float = 0.001
     price_max: float = 0.999
@@ -83,9 +82,8 @@ class PipelineConfig:
         if (not isinstance(self.quote_latency_budget_ms, int)
                 or self.quote_latency_budget_ms <= 0):
             raise ValueError("quote_latency_budget_ms must be a positive int")
-        for name in ("base_edge_bps", "uncertainty_per_leg_bps", "width_weight",
-                     "depth_slope_bps", "event_risk_bps",
-                     "operational_buffer_bps"):
+        for name in ("leg_width_multiplier", "max_half_spread_bps",
+                     "max_leg_spread_bps"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or value < 0:
                 raise ValueError(f"{name} must be a non-negative number")
