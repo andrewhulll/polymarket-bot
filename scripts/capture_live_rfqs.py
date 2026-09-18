@@ -78,7 +78,8 @@ def _combo_side(raw: Dict[str, Any]) -> Optional[str]:
 class RfqCapture:
     """Persist live events and, when enabled, make paper pricing decisions."""
 
-    def __init__(self, data_dir: Path, *, price_live: bool = False) -> None:
+    def __init__(self, data_dir: Path, *, price_live: bool = False,
+                 quoter_workers: int = 1) -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = data_dir
         self.raw_path = data_dir / "rfq_raw.jsonl"
@@ -101,7 +102,7 @@ class RfqCapture:
             else:
                 pricer = NflLivePricer(self.catalog, LiveLegBooks(), params,
                                        config=PipelineConfig(paper_mode=True))
-                self.quoter = LiveQuoter(pricer, self.selections,
+                self.quoter = LiveQuoter(pricer, self.selections, workers=quoter_workers,
                                          on_decision=self._record_decision)
         self.rfqs_seen = 0
         self.trades_seen = 0
@@ -301,6 +302,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="progress log interval, seconds")
     parser.add_argument("--duration", type=float, default=None,
                         help="stop after N seconds (default: run until interrupted)")
+    parser.add_argument("--quoter-workers", type=int, default=4,
+                        help="pricing worker threads draining the RFQ queue (default: 4)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO,
@@ -323,7 +326,8 @@ def main(argv: Optional[list] = None) -> int:
         return 0
 
     try:
-        capture = RfqCapture(Path(args.data_dir), price_live=True)
+        capture = RfqCapture(Path(args.data_dir), price_live=True,
+                           quoter_workers=args.quoter_workers)
         capture.start()
         adapter.start()
     except BaseException:
