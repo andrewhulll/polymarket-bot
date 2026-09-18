@@ -51,12 +51,9 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
                p.status, p.reason_code, p.reason_detail, p.response_price,
                p.response_action, p.size, p.size_unit, p.fair, p.naive,
                p.detail_json,
-               COALESCE(t.price, (SELECT CASE WHEN s.direction = 'BUY'
-                   THEN MIN(q.buy_price) ELSE MAX(q.sell_price) END
-                   FROM quotes q WHERE q.rfq_id = r.rfq_id AND q.origin = 'live'))
-                   AS market_price,
+               COALESCE(t.price, p.naive) AS market_price,
                CASE WHEN t.price IS NOT NULL THEN 'accepted trade'
-                    ELSE 'best observed competitor' END AS market_source,
+                    ELSE 'leg-implied (naive)' END AS market_source,
                t.size AS market_size,
                l.wait_ms, l.compute_ms
         FROM rfq_screen s JOIN rfq r USING (rfq_id)
@@ -81,11 +78,21 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
 
 
 def performance(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Paper fills: our quote would have beaten the observed RFQ trade price."""
+    """Paper fills: our quote would have beaten the observed market price.
+
+    The market is the accepted RFQ trade when one is observed; otherwise the
+    leg-implied (naive) price stored at decision time. Accepted trades are
+    participant-private on the quoter gateway, so the naive fallback is the
+    common case in live operation.
+    """
     candidates = _rows(conn, """
-        SELECT p.*, t.price AS market_price, t.executed_at, r.created_time, s.n_legs
-        FROM priced_quotes p JOIN live_trades t USING (rfq_id)
-        JOIN rfq r USING (rfq_id) JOIN rfq_screen s USING (rfq_id)
+        SELECT p.*,
+               COALESCE(t.price, p.naive) AS market_price,
+               CASE WHEN t.price IS NOT NULL THEN 'accepted trade'
+                    ELSE 'leg-implied (naive)' END AS market_source,
+               t.executed_at, r.created_time, s.n_legs
+        FROM priced_quotes p LEFT JOIN live_trades t ON t.rfq_id = p.rfq_id
+        JOIN rfq r ON r.rfq_id = p.rfq_id JOIN rfq_screen s ON s.rfq_id = p.rfq_id
         WHERE p.trigger = 'auto' AND p.status = 'QUOTED'
           AND EXISTS (SELECT 1 FROM quotes q WHERE q.rfq_id = p.rfq_id
                       AND q.status = 'shadow')
@@ -134,7 +141,8 @@ def performance(conn: sqlite3.Connection) -> dict[str, Any]:
                       "expected_pnl": sign * (float(row["fair"] or price) - price) * qty,
                       "realized_pnl": sign * (outcome - price) * qty if settled else None,
                       "net_notional": sign * price * qty, "game": game,
-                      "family": family, "n_legs": row["n_legs"]})
+                      "family": family, "n_legs": row["n_legs"],
+                      "market_source": row["market_source"]})
     cumulative = exposure = 0.0
     curve = []
     for fill in fills:
@@ -167,7 +175,8 @@ def performance(conn: sqlite3.Connection) -> dict[str, Any]:
             "realized_pnl": cumulative, "net_notional": exposure,
             "max_downswing": downswing, "max_upswing": upswing,
             "curve": curve, "by_family": breakdown("family"),
-            "by_legs": breakdown("n_legs"), "by_game": breakdown("game")}
+            "by_legs": breakdown("n_legs"), "by_game": breakdown("game"),
+            "by_market_source": breakdown("market_source")}
 
 
 def engine_status(conn: sqlite3.Connection, budget_ms: float = 400) -> dict[str, Any]:

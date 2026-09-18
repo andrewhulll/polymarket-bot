@@ -125,8 +125,9 @@ def _pricing(conn) -> None:
 def _performance(conn) -> None:
     st.header("Paper performance")
     p = vm.performance(conn)
-    st.caption("Shadow fills count only our quoted RFQs whose price would have beaten the "
-               "accepted RFQ trade. Realized P&L requires settled legs.")
+    st.caption("Shadow fills count only our quoted RFQs whose price would have beaten the market: "
+               "the accepted RFQ trade when observed, otherwise the leg-implied (naive) price. "
+               "Realized P&L requires settled legs.")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Quotes", p["quoted"])
     c2.metric("Shadow fills", p["shadow_fills"])
