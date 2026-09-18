@@ -437,12 +437,16 @@ Rules (enforced by tests):
 
 ### Dashboard live monitor
 
-Run the headless capture process first, then open Streamlit in another shell:
+Start the dashboard from the repo root:
 
 ```bash
-python3 scripts/capture_live_rfqs.py --data-dir data/live
 streamlit run dashboard/app.py
 ```
+
+When the dashboard starts, it starts the headless capture process if no reader
+is running. A process lock prevents duplicate readers, including when multiple
+dashboard sessions open. To run capture without the dashboard, use
+`python3 scripts/capture_live_rfqs.py --data-dir data/live`.
 
 The capture process owns the quoter-gateway websocket, screening, paper
 pricing and SQLite writes. The **Live monitor RFQ feed** control opens a

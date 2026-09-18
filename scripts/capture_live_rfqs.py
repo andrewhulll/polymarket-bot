@@ -58,6 +58,7 @@ from combo_mm.live_quoter import LiveQuoter
 from combo_mm.nfl.live_pricer import NflLivePricer, LiveRfq
 from combo_mm.nfl.params_provider import ParamsProvider
 from combo_mm.quote_selections import QuoteSelectionStore
+from combo_mm.capture_process import CaptureLock
 
 log = logging.getLogger("capture_live_rfqs")
 
@@ -298,9 +299,18 @@ def main(argv: Optional[list] = None) -> int:
         log.error("%s", exc)
         return 1
 
-    capture = RfqCapture(Path(args.data_dir), price_live=True)
-    capture.start()
-    adapter.start()
+    reader_lock = CaptureLock(Path(args.data_dir) / "rfq_capture.lock")
+    if not reader_lock.acquire():
+        log.info("RFQ capture is already running for %s", args.data_dir)
+        return 0
+
+    try:
+        capture = RfqCapture(Path(args.data_dir), price_live=True)
+        capture.start()
+        adapter.start()
+    except BaseException:
+        reader_lock.release()
+        raise
 
     stop = {"flag": False}
 
@@ -332,6 +342,7 @@ def main(argv: Optional[list] = None) -> int:
     finally:
         adapter.stop()
         capture.stop()
+        reader_lock.release()
         log.info("capture stopped: rfqs=%d nfl=%d trades=%d",
                  capture.rfqs_seen, capture.nfl_rfqs_seen, capture.trades_seen)
     return 0
