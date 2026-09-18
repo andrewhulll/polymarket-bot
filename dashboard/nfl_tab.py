@@ -1033,8 +1033,19 @@ def _params_and_data(meta: Dict) -> None:
         t = st.columns(4)
         t[0].metric("Tuned on", f"{sel['train_seasons'][0]}–{sel['train_seasons'][1]}")
         t[1].metric("Selected model", MODEL_LABELS.get(sel["variance_model"], sel["variance_model"]))
-        t[2].metric("Train Brier", f"{sel['train_brier']:.5f}", help=f"Naive: {sel['train_brier_naive']:.5f}")
+        t[2].metric("Train Brier (deployed combos)", f"{sel['train_brier']:.5f}",
+                   help=f"Naive: {sel['train_brier_naive']:.5f}. Scored on ML x total + spread x total "
+                        "only -- the same-game blocks combo_mm.nfl.live_pricer actually quotes.")
         t[3].metric("Candidates", sel["n_candidates"])
+        corr_scale = sel.get("pricer_corr_scale")
+        if corr_scale is not None and corr_scale != 1.0:
+            st.caption(f"Pricing-time corr_scale: **{corr_scale:g}** -- the fitted margin/total "
+                       "dependence is shrunk to this fraction before pricing (a raw, unshrunk fit is "
+                       "a noisy point estimate; see docs/correlation-model.md §0).")
+        if sel.get("train_brier_all_combos") is not None:
+            st.caption(f"All-combo Brier (for reference, not the selection metric): "
+                       f"{sel['train_brier_all_combos']:.5f} vs naive {sel['train_brier_all_combos_naive']:.5f}. "
+                       "Dominated by ML x spread combos no live RFQ has ever sent.")
         st.caption(f"Frozen estimator: `{json.dumps(sel['estimator'])}` — used by the backtest's test period and the "
                    "weekly refresh. Test-season games are removed from the input before tuning runs.")
     else:
@@ -1043,15 +1054,21 @@ def _params_and_data(meta: Dict) -> None:
         grid = pd.read_csv(grid_path)
         grid["window_seasons"] = grid["window_seasons"].map(lambda w: "all" if pd.isna(w) else f"{int(w)}")
         grid["variance_model"] = grid["variance_model"].map(lambda m: MODEL_LABELS.get(m, m))
-        with st.expander(f"Tuning grid — {len(grid)} candidates ranked by train Brier", expanded=False):
+        with st.expander(f"Tuning grid — {len(grid)} candidates ranked by Brier on deployed combos "
+                         "(ML x total, spread x total)", expanded=False):
             st.dataframe(grid.drop(columns=["grid_index"]), hide_index=True, width="stretch",
-                         column_config={"brier": st.column_config.NumberColumn("Brier", format="%.5f"),
-                                        "brier_naive": st.column_config.NumberColumn("Brier naive", format="%.5f"),
-                                        "brier_skill": st.column_config.NumberColumn("Skill", format="percent"),
+                         column_config={"brier": st.column_config.NumberColumn("Brier (all combos)", format="%.5f"),
+                                        "brier_naive": st.column_config.NumberColumn("Brier naive (all combos)", format="%.5f"),
+                                        "brier_skill": st.column_config.NumberColumn("Skill (all combos)", format="percent"),
                                         "brier_skill_non_nested": st.column_config.NumberColumn("Skill (non-nested)", format="percent"),
+                                        "brier_deployed": st.column_config.NumberColumn("Brier (deployed)", format="%.5f"),
+                                        "brier_naive_deployed": st.column_config.NumberColumn("Brier naive (deployed)", format="%.5f"),
+                                        "brier_skill_deployed": st.column_config.NumberColumn("Skill (deployed)", format="percent"),
+                                        "t_stat_deployed": st.column_config.NumberColumn("t (deployed)", format="%.1f"),
                                         "brier_skill_spread_total": st.column_config.NumberColumn("Skill (spread x total)", format="percent"),
+                                        "brier_skill_ml_total": st.column_config.NumberColumn("Skill (ML x total)", format="percent"),
                                         "log_loss": st.column_config.NumberColumn("Log loss", format="%.5f"),
-                                        "t_stat": st.column_config.NumberColumn("t", format="%.1f")})
+                                        "t_stat": st.column_config.NumberColumn("t (all combos)", format="%.1f")})
 
     files = list_params(PARAMS_DIR)
     st.subheader("Weekly params files")

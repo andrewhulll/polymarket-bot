@@ -1,13 +1,13 @@
 {
   "data_vintage": {
-    "pull_date": "2026-09-16",
-    "sha256": "0ac6de43583d7d321e159dc75b0855896813de2f484df8341da5b43cac32ffd6",
+    "pull_date": "2026-09-17",
+    "sha256": "d15b71205791a1bbd0b0c7152f91eacaf724bfc8f4a41cf649785eea5f0dd543",
     "source_url": "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv"
   },
   "estimator": {
     "factor_max": 1.6,
     "factor_min": 0.6,
-    "half_life_seasons": 1.0,
+    "half_life_seasons": 4.0,
     "min_seasons": 3,
     "offseason_regression": 0.5,
     "ratio_cap": 9.0,
@@ -15,8 +15,8 @@
     "sigma_max": 16.0,
     "sigma_min": 5.0,
     "var_shrink_multiplier": 1.0,
-    "variance_model": "league_constant",
-    "window_seasons": 4
+    "variance_model": "mean_linear",
+    "window_seasons": null
   },
   "gates": [
     {
@@ -26,7 +26,7 @@
     },
     {
       "detail": {
-        "candidate_brier": 0.1872801891627879,
+        "candidate_brier": 0.1874329939704582,
         "n_combos": 1080,
         "naive_brier": 0.18728026342634826,
         "previous_file": null,
@@ -37,7 +37,7 @@
     },
     {
       "detail": {
-        "bytes": 14020
+        "bytes": 14474
       },
       "name": "determinism",
       "passed": true

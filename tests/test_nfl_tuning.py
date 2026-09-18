@@ -9,7 +9,7 @@ pd = pytest.importorskip("pandas")
 
 from combo_mm.nfl import synthetic_backtest as bt  # noqa: E402
 from combo_mm.nfl.estimate import EstimatorConfig  # noqa: E402
-from combo_mm.nfl.tuning import load_selection, tune, write_selection  # noqa: E402
+from combo_mm.nfl.tuning import load_selection, tune, tune_corr_scale, write_selection  # noqa: E402
 from nfl_synthetic import make_games  # noqa: E402
 
 GRID = {"window_seasons": (3, None), "half_life_seasons": (2.0,), "var_shrink_multiplier": (3.0,)}
@@ -60,10 +60,15 @@ def test_tuning_grid_and_selection(tmp_path, games, config):
     result = tune(games, config, grid=GRID, workers=1)
     # 2 windows x 3 variance models (single shrink multiplier)
     assert len(result.grid) == 6
-    assert result.grid["brier"].is_monotonic_increasing
+    # Selection is on the deployed combo universe (ML x total, spread x
+    # total) -- the only same-game blocks the live pricer ever sends -- not
+    # the full COMBOS universe, which is dominated by ML x spread combos no
+    # live RFQ has ever contained.
+    assert result.grid["brier_deployed"].is_monotonic_increasing
     best = result.grid.iloc[0]
     assert result.selected["variance_model"] == best["variance_model"]
-    assert result.selected["train_brier"] == pytest.approx(best["brier"])
+    assert result.selected["train_brier"] == pytest.approx(best["brier_deployed"])
+    assert result.selected["train_brier_all_combos"] == pytest.approx(best["brier"])
 
     path = write_selection(result, tmp_path / "estimator.json", data_vintage={"pull_date": "x"})
     estimator, payload = load_selection(path)
@@ -73,6 +78,19 @@ def test_tuning_grid_and_selection(tmp_path, games, config):
     expected_window = None if pd.isna(best["window_seasons"]) else int(best["window_seasons"])
     assert estimator.window_seasons == expected_window
     assert load_selection(tmp_path / "missing.json") is None
+
+
+def test_tune_corr_scale_scores_deployed_combos_via_market_lift(games, config):
+    """corr_scale=0 must tie naive exactly (zero margin/total dependence);
+    the grid must include 1.0 even if not explicitly requested."""
+    estimator = EstimatorConfig(variance_model="mean_linear", window_seasons=None,
+                                half_life_seasons=2.0)
+    result = tune_corr_scale(games, config, estimator, scales=(0.0, 0.5), workers=1)
+    assert set(result.table["corr_scale"]) == {0.0, 0.5, 1.0}
+    zero_row = result.table[result.table["corr_scale"] == 0.0].iloc[0]
+    assert zero_row["brier_skill_vs_naive"] == pytest.approx(0.0, abs=1e-5)
+    assert result.corr_scale in {0.0, 0.5, 1.0}
+    assert result.brier_naive_deployed > 0
 
 
 def test_shrink_multiplier_only_expands_team_model(games, config):

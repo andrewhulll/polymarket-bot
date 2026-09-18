@@ -106,12 +106,18 @@ def test_fav_ml_with_dog_cover_prices_far_below_naive():
     assert quote.corr_adjustment_bps < -1000
 
 
-def test_spread_times_total_reproduces_the_naive_product():
-    """The tuned league_constant model has no margin/total dependence (docs 4.2)."""
+def test_spread_times_total_has_real_but_small_dependence():
+    """The tuned mean_linear model gives spread x total a small, real lift (docs §0).
+
+    Cov(margin, total) = sigma_home^2 - sigma_away^2 is exactly zero only for
+    league_constant (equal sigmas everywhere); mean_linear's fitted variance
+    asymmetry makes this nonzero but modest -- nowhere near the huge lift a
+    same-dimension combo (ML x spread, see the nested-combo tests below) gets.
+    """
     quote = price(build(), FAV_COVER, OVER)
     assert quote.reason_code == QUOTED_OK
-    assert quote.fair_yes == pytest.approx(quote.naive_yes, abs=2e-4)
-    assert quote.games[0]["lift"] == pytest.approx(1.0, abs=2e-3)
+    assert quote.fair_yes != pytest.approx(quote.naive_yes, abs=2e-4)
+    assert 1.0 < quote.games[0]["lift"] < 1.10
 
 
 def test_market_lift_equals_market_marginals_times_model_dependence():

@@ -11,7 +11,9 @@ from combo_mm.normalize import normalize
 from combo_mm.intl_gateway import GatewayCredentials, InternationalQuoterGatewayAdapter
 from combo_mm.quote_selections import QuoteSelectionStore
 from combo_mm.store import EventStore
-from dashboard.live_view_models import connect_readonly, engine_status, fills, performance, pricing, rfqs
+from dashboard.live_view_models import (
+    connect_readonly, correlation_lift, engine_status, fills, performance, pricing, rfqs,
+)
 
 
 def test_live_tabs_reconcile_to_one_database(tmp_path):
@@ -195,3 +197,57 @@ def test_observed_trade_still_takes_precedence_over_naive(tmp_path):
         assert by_id["rfq-9"]["market_price"] == .43
     quotes.close()
     store.close()
+
+
+def _quoted_rfq(quotes: QuoteSelectionStore, rfq_id: str, corr_bps: float | None) -> None:
+    quotes.record_priced_quote({
+        "rfq_id": rfq_id, "priced_at": "2026-09-17T12:00:00Z", "status": "QUOTED",
+        "reason_code": "QUOTED_OK", "response_action": "SELL", "response_price": .40,
+        "size": 10, "size_unit": "shares", "fair": .40, "naive": .40,
+        "corr_adjustment_bps": corr_bps, "side": "YES"}, "auto")
+
+
+def test_correlation_lift_flags_degenerate_model(tmp_path):
+    """A model whose adjustment is ~0 bps on nearly every quote is flagged."""
+    path = tmp_path / "capture.db"
+    quotes = QuoteSelectionStore(path)
+    for i in range(20):
+        _quoted_rfq(quotes, f"rfq-{i}", corr_bps=0.05)  # noise-level, like league_constant
+    with connect_readonly(path) as conn:
+        stats = correlation_lift(conn)
+        assert stats["n"] == 20
+        assert stats["mean_abs_bps"] == pytest.approx(0.05)
+        assert stats["max_abs_bps"] == pytest.approx(0.05)
+        assert stats["frac_degenerate"] == 1.0
+        assert stats["degenerate"] is True
+    quotes.close()
+
+
+def test_correlation_lift_ignores_declines_and_null_adjustment(tmp_path):
+    path = tmp_path / "capture.db"
+    quotes = QuoteSelectionStore(path)
+    quotes.record_priced_quote({
+        "rfq_id": "rfq-declined", "priced_at": "2026-09-17T12:00:00Z", "status": "DECLINED",
+        "reason_code": "NO_NFL_SAME_GAME"}, "auto")
+    _quoted_rfq(quotes, "rfq-no-corr", corr_bps=None)
+    with connect_readonly(path) as conn:
+        stats = correlation_lift(conn)
+        assert stats["n"] == 0
+        assert stats["degenerate"] is None
+    quotes.close()
+
+
+def test_correlation_lift_not_flagged_when_model_moves_prices(tmp_path):
+    """A model producing real, varied adjustments across most quotes is not flagged."""
+    path = tmp_path / "capture.db"
+    quotes = QuoteSelectionStore(path)
+    for i in range(20):
+        bps = 40.0 + i if i % 20 else 0.1  # one degenerate row, the rest well above threshold
+        _quoted_rfq(quotes, f"rfq-{i}", corr_bps=bps)
+    with connect_readonly(path) as conn:
+        stats = correlation_lift(conn, degenerate_bps=1.0, degenerate_frac=0.95)
+        assert stats["n"] == 20
+        assert stats["frac_degenerate"] == pytest.approx(0.05)
+        assert stats["degenerate"] is False
+        assert stats["mean_abs_bps"] > 40
+    quotes.close()

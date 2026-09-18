@@ -279,6 +279,47 @@ def _kill_switch(conn: sqlite3.Connection) -> dict | None:
     return dict(row) if row else None
 
 
+def correlation_lift(conn: sqlite3.Connection, window: int = 1000,
+                     degenerate_bps: float = 1.0, degenerate_frac: float = 0.95) -> dict[str, Any]:
+    """Distribution of |corr_adjustment_bps| over the most recent auto-quoted RFQs.
+
+    ``corr_adjustment_bps = (fair - naive) * 1e4`` (see
+    ``combo_mm.nfl.live_pricer``): how much the joint correlation model
+    moved the price off the naive independent-leg product. Under
+    ``market_lift`` a same-game combo's only source of dependence is
+    ``Cov(margin, total) = sigma_home^2 - sigma_away^2``
+    (``combo_mm.nfl.params_io.matchup_covariance``), so a params file with
+    equal sigmas for every game -- ``league_constant`` with ``var_slope ==
+    0`` -- makes every quote's fair value equal its naive price exactly.
+    That is a silent failure mode: the RFQ still prices and quotes fine, it
+    just isn't using the model the bot exists to run. ``degenerate`` flags
+    it: True when ``degenerate_frac`` or more of the sampled quotes show
+    less than ``degenerate_bps`` of adjustment.
+    """
+    rows = _rows(conn, """
+        SELECT corr_adjustment_bps FROM priced_quotes
+        WHERE trigger = 'auto' AND status = 'QUOTED' AND corr_adjustment_bps IS NOT NULL
+        ORDER BY rowid DESC LIMIT ?
+    """, (window,))
+    values = sorted(abs(r["corr_adjustment_bps"]) for r in rows)
+    n = len(values)
+    if n == 0:
+        return {"n": 0, "mean_abs_bps": None, "p50_abs_bps": None, "p95_abs_bps": None,
+                "max_abs_bps": None, "frac_degenerate": None, "degenerate": None,
+                "threshold_bps": degenerate_bps}
+    frac_below = sum(1 for v in values if v < degenerate_bps) / n
+    return {
+        "n": n,
+        "mean_abs_bps": sum(values) / n,
+        "p50_abs_bps": values[n // 2],
+        "p95_abs_bps": values[min(n - 1, int(n * 0.95))],
+        "max_abs_bps": values[-1],
+        "frac_degenerate": frac_below,
+        "degenerate": frac_below >= degenerate_frac,
+        "threshold_bps": degenerate_bps,
+    }
+
+
 def engine_status(conn: sqlite3.Connection, budget_ms: float = 400) -> dict[str, Any]:
     health = conn.execute("SELECT * FROM live_engine_health WHERE id=1").fetchone()
     # delivery/queue and fetch/solve are added by a later migration; a stale DB
@@ -308,7 +349,8 @@ def engine_status(conn: sqlite3.Connection, budget_ms: float = 400) -> dict[str,
             "drafts": _rows(conn, "SELECT quote_id, rfq_id, buy_price, sell_price, "
                             "buy_qty_decimal, sell_qty_decimal, created_time FROM quotes "
                             "WHERE status='shadow' ORDER BY rowid DESC LIMIT 500"),
-            "kill_switch": _kill_switch(conn)}
+            "kill_switch": _kill_switch(conn),
+            "correlation_lift": correlation_lift(conn)}
 
 
 def rfq_detail(conn: sqlite3.Connection, rfq_id: str) -> dict | None:

@@ -19,6 +19,59 @@ Numbers quoted here are from the nflverse pull of 2026-09-16 (sha256 `0ac6de4358
 2006–2025 incl. playoffs: 5,426 games, 90,474 combos, 2,959 dropped for pushes. **Train 2006–2021,
 test 2022–2025**, and estimator settings tuned on train only (§2).
 
+## 0. Correction (2026-09-17): the tuning metric didn't match what a live RFQ ever sends
+
+§2's original hyperparameter search, and §4's backtest tables below, score every same-game combo in
+`COMBOS` (17 types up to 3 legs) and pick the config with the lowest Brier over all of them. Two bugs
+followed from that, both fixed in `combo_mm/nfl/tuning.py` and `combo_mm/nfl/synthetic_backtest.py`:
+
+1. **Wrong combo universe.** `combo_mm/nfl/live_pricer.py` only ever prices a same-game block of
+   *exactly two* modeled legs, and — verified against 13,000+ priced blocks in a live capture
+   (`data/live/rfq_capture.db`) — every one of them is `ML x total` or `spread x total`. Not one
+   `ML x spread` combo has ever been sent live, yet that family (§4.2: 13.4% train skill) and
+   `ML x spread x total` (5.4%) dominated the old all-combo Brier, letting a config with **zero**
+   margin/total dependence (`league_constant`) win the search while doing nothing for a real quote.
+   `combo_mm.nfl.synthetic_backtest.DEPLOYED_FAMILIES` now names the two families that actually ship,
+   and `tune()` selects on Brier over exactly that universe.
+2. **Wrong pricing formula.** The backtest scored the model's raw joint probability
+   (`GameModel.joint`), but the live pricer's default fair value is `market_lift` (§5): it keeps each
+   leg's own market price and borrows only the *lift ratio* from the model. The two are mathematically
+   identical for `spread x total` (its legs are calibrated to the market exactly, §2), but diverge for
+   `ML x total`, where the model's own moneyline marginal is a known ~2-point miss (§4.4 #2) that
+   `market_lift` is specifically built to avoid importing. Scoring the raw joint penalized that miss on
+   a family that never actually carries it live. `combo_mm.nfl.synthetic_backtest.lifted()` now scores
+   the market_lift price instead.
+
+**What changes with both fixes**, scored on the deployed universe (train 2006–2021, game-clustered SE):
+
+| variance model | corr_scale | Brier | vs naive (0.182729) | t-stat |
+|---|---|---|---|---|
+| `league_constant` (previous selection) | n/a — dependence is exactly 0 at every scale | 0.182729 | **0.0000%** (exact tie) | ~0 |
+| `mean_linear`, raw fit | 1.0 (the untuned default every live quote used before this fix) | 0.182769 | −0.0220% | 0.7 |
+| `mean_linear_team`, raw fit | 1.0 | 0.183289 | −0.3062% | **3.2** (significantly worse) |
+| **`mean_linear`, shrunk (new selection)** | **≈0.20** | **0.182726** | **+0.0019%** | 1.6 |
+
+`league_constant`'s tie isn't a coincidence: `Cov(margin, total) = sigma_home² − sigma_away²`
+(§1) is exactly zero when every game gets the same sigma, which is what that model does by
+construction — it was never capable of pricing this family differently from naive. `mean_linear`'s
+raw fit is directionally right but statistically noisy (§2: the variance slope's SE is ≈0.6 on a
+4-season window) and overshoots at full strength. Scanning the pricing-time `corr_scale` (which
+scales the fitted dependence without re-estimating it — `combo_mm.nfl.tuning.tune_corr_scale`,
+`NflLivePricerConfig.corr_scale`) finds a non-monotonic curve: skill rises from the `league_constant`
+tie at `corr_scale=0`, peaks (barely significantly, t≈1.6) around `corr_scale=0.2`, then falls back
+through zero and turns significantly negative by `corr_scale=1`. **This is the honest finding: for the
+combo types this feed actually sends, the correlation model's edge is real but small, and only shows
+up at all if you don't trust the raw fit at full strength.** The large, unambiguous edge this model
+architecture is built around (`ML x spread`, 13%+) is real too — it just isn't a family this feed has
+ever sent.
+
+`corr_scale` is not stored in the weekly params file (it scales `matchup_covariance` at *pricing*
+time, not estimation time); it is frozen alongside the estimator selection as `pricer_corr_scale` in
+`params/estimator.json` and read by `scripts/capture_live_rfqs.py` when it builds the live pricer's
+config. §2 and §4 below are the original (pre-fix) analysis and are being superseded incrementally;
+treat their headline "`league_constant` wins, dependence is negligible" conclusion as **the finding
+this correction replaces**, not the current behavior.
+
 ---
 
 ## 1. Canonical form: every leg is a linear inequality on the scores
