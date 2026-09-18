@@ -110,7 +110,8 @@ class StreamConsumer:
     def __init__(self, transport: RfqTransport, store: Any,
                  config: Optional[Any] = None, *,
                  rng: Optional[random.Random] = None,
-                 enable_shadow: bool = False) -> None:
+                 enable_shadow: bool = False,
+                 catalog: Optional[Any] = None) -> None:
         self._transport = transport
         self._store = store
         self._pipeline_config = (
@@ -123,6 +124,9 @@ class StreamConsumer:
         #: When True, run() prices RFQs with the shadow quoting engine
         #: (paper only).
         self._enable_shadow = enable_shadow
+        #: Combo-market catalog for the shadow engine's NFL pricer adapter;
+        #: None keeps the engine's naive default.
+        self._catalog = catalog
         #: One RecoveryReport per (re)connect, in order.
         self.recovery_log: List[Any] = []
         self._stop = threading.Event()
@@ -190,6 +194,7 @@ class StreamConsumer:
         from combo_mm.books import LegBookCache
         from combo_mm.engine import ShadowQuotingEngine
         from combo_mm.fixtures import BASE_TS
+        from combo_mm.nfl.pricer_adapter import build_nfl_adapter
         from combo_mm.reference import ReferenceCache
 
         cfg = self._config
@@ -197,7 +202,11 @@ class StreamConsumer:
         books = LegBookCache(staleness_ms=pipeline.staleness_ms)
         reference = ReferenceCache(self._transport,
                                    ttl_s=pipeline.reference_ttl_s)
+        pricer = (build_nfl_adapter(self._catalog, books, config=pipeline,
+                                    fallback_resolver=self._catalog.lookup)
+                  if self._catalog is not None else None)
         engine = (ShadowQuotingEngine(self._store, books, reference, pipeline,
+                                      pricer=pricer,
                                       params_version=pipeline.params_version)
                   if self._enable_shadow else None)
 

@@ -29,6 +29,7 @@ from combo_mm.engine import ShadowQuotingEngine
 from combo_mm.events import NormalizedEvent
 from combo_mm.live_quoter import LiveQuoter
 from combo_mm.nfl.live_pricer import LiveRfq
+from combo_mm.nfl.pricer_adapter import build_nfl_adapter
 from combo_mm.normalize import NormalizeError, normalize
 from combo_mm.pricer import Pricer, V1NaivePricer
 from combo_mm.quote_selections import QuoteSelectionStore
@@ -87,7 +88,8 @@ class LiveMonitor:
                  pricer: Optional[Pricer] = None, source_label: str = "live",
                  catalog: Optional[ComboMarketCatalog] = None,
                  selections: Optional[QuoteSelectionStore] = None,
-                 quoter: Optional[LiveQuoter] = None) -> None:
+                 quoter: Optional[LiveQuoter] = None,
+                 params_dir: Optional[str] = None) -> None:
         self.config = config or PipelineConfig(paper_mode=True)
         self.source = source
         self.store = store
@@ -95,7 +97,7 @@ class LiveMonitor:
         reference = ReferenceCache(_NoCombos(), ttl_s=self.config.reference_ttl_s)  # type: ignore[arg-type]
         self.engine = ShadowQuotingEngine(
             store, self.books, reference, self.config,
-            pricer=pricer or (V1NaivePricer(resolver=catalog.lookup) if catalog else None))
+            pricer=pricer or self._default_pricer(catalog, params_dir))
         self.source_label = source_label
         self.polls = 0
         self.events_applied = 0
@@ -121,6 +123,30 @@ class LiveMonitor:
         self.accepted_recorded = 0
         self._rescreened_version = -1
         self._last_rescreen = 0.0
+
+    def _default_pricer(
+        self,
+        catalog: Optional[ComboMarketCatalog],
+        params_dir: Optional[str],
+    ) -> Optional[Pricer]:
+        """The shadow engine's pricer when the caller did not pass one.
+
+        With a catalog this is the NFL-model adapter (falling back per-RFQ
+        to the naive pricer, with the catalog-backed same-game guardrail,
+        when the model cannot run); without one the engine keeps its own
+        ``V1NaivePricer`` default. An explicit ``pricer`` kwarg always wins.
+        """
+        if catalog is None:
+            return None
+        try:
+            return build_nfl_adapter(
+                catalog, self.books, params_dir,
+                config=self.config, fallback_resolver=catalog.lookup,
+            )
+        except Exception as exc:  # the monitor must always construct
+            log.warning("NFL pricer adapter unavailable (%s); using naive pricer",
+                        type(exc).__name__)
+            return V1NaivePricer(resolver=catalog.lookup)
 
     @property
     def rfq_beta_enabled(self) -> Optional[bool]:
