@@ -700,17 +700,19 @@ live feed while it happened. The Week 1 RFQs the dashboard's "Run backtest" butt
 arrivals — not actual RFQ negotiations pulled from Polymarket.
 
 **Going forward**, `scripts/capture_live_rfqs.py` listens on the receive-only gateway
-and saves every RFQ and paper pricing decision to disk:
+and saves only RFQs for which the paper model actually produces a quote:
 
 ```bash
 export POLYMARKET_API_KEY=... POLYMARKET_SECRET=... POLYMARKET_PASSPHRASE=... POLYMARKET_ADDRESS=...
 python3 scripts/capture_live_rfqs.py --data-dir data/live   # run continuously; Ctrl+C to stop
 ```
 
-It writes `data/live/rfq_raw.jsonl` for archival export and
-`data/live/rfq_capture.db` for the dashboard. The database includes RFQs,
-screening checks, draft quotes, decline reasons, accepted trade prices,
-engine health and separate wait/compute latency samples.
+It writes raw request and trade frames for quoted RFQs to `data/live/rfq_raw.jsonl`
+and their RFQ, screen, paper quote, trade, and latency records to
+`data/live/rfq_capture.db`. Risk rejections are saved as risk events and shown
+on the Inventory tab; pricing and screening declines are not retained.
+`data/live/combo_markets.json.gz` is the compressed market reference cache;
+the dashboard also needs it to resolve quoted legs.
 
 Once some data has accumulated, pull out just the NFL rows:
 

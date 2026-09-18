@@ -120,7 +120,8 @@ def test_a_no_side_rfq_is_priced_on_the_no_side():
     quoter.drain()
     row = selections.list_priced_quotes()[0]
     assert row["side"] == "NO"
-    assert row["fair"] < 0.5 < row["detail"]["fair_yes"]
+    assert row["fair"] >= row["naive"]
+    assert row["detail"]["fair_yes"] <= 0.5
     # fair and naive are both on the requested side: the table compares like with like
     assert row["naive"] == pytest.approx(1.0 - row["detail"]["naive_yes"], abs=1e-6)
 

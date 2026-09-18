@@ -62,6 +62,23 @@ def test_pending_fill_release_and_rebuild():
     assert row["total_wcl"] == 12.0
 
 
+def test_live_open_status_reserves_only_until_submission_deadline():
+    store = EventStore()
+    with store._conn:
+        store._conn.execute(
+            "INSERT INTO rfq(rfq_id,symbol,status) VALUES ('R','COMBO','RFQ_STATUS_OPEN')")
+    store.upsert_rfq_screen("R", n_legs=1, n_resolved=1, n_nfl_legs=1,
+                            screen="QUOTABLE", rank=0, catalog_version=1,
+                            submission_deadline="1789716300000")
+    store.record_shadow_draft(quote_id="Q", rfq_id="R", symbol="COMBO",
+                              buy_price=.5, sell_price=.5,
+                              buy_qty="100", sell_qty="100",
+                              decided_at="2026-09-18T07:23:00Z")
+    provider = InventoryProvider(store)
+    assert provider("2026-09-18T07:24:00Z").pending == {"COMBO": 50.0}
+    assert provider("2026-09-18T07:25:00Z").pending == {}
+
+
 def test_policy_randomized_post_trade_caps_and_monotone_size():
     cfg = RiskConfig(policy="inventory", max_game_loss=500,
                      max_market_loss=500, max_team_loss=500,

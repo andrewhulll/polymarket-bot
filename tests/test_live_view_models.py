@@ -12,8 +12,52 @@ from combo_mm.intl_gateway import GatewayCredentials, InternationalQuoterGateway
 from combo_mm.quote_selections import QuoteSelectionStore
 from combo_mm.store import EventStore
 from dashboard.live_view_models import (
-    connect_readonly, correlation_lift, engine_status, fills, performance, pricing, rfqs,
+    connect_readonly, correlation_lift, engine_status, fills, inventory_state,
+    performance, pricing, rfqs,
 )
+
+
+def test_paper_notional_stays_within_inventory_equity_and_reduces_buying_power(tmp_path):
+    path = tmp_path / "capture.db"
+    store = EventStore(str(path))
+    quotes = QuoteSelectionStore(path)
+    for index, action in enumerate(("BUY", "BUY", "SELL"), 1):
+        rfq_id = f"R{index}"
+        with store._conn:
+            store._conn.execute(
+                "INSERT INTO rfq(rfq_id,symbol,status) VALUES (?,?,?)",
+                (rfq_id, f"COMBO{index}", "RFQ_STATUS_OPEN"))
+        store.upsert_rfq_screen(rfq_id, n_legs=2, n_resolved=2,
+                                n_nfl_legs=2, screen="QUOTABLE", rank=0,
+                                catalog_version=1)
+        quotes.record_priced_quote({
+            "rfq_id": rfq_id, "priced_at": f"2026-09-18T00:00:0{index}Z",
+            "status": "QUOTED", "reason_code": "QUOTED_OK",
+            "response_action": action, "response_price": .5,
+            "size": 60000 if index < 3 else 20000, "size_unit": "shares",
+            "fair": .5, "naive": .5, "side": "YES",
+            "games": [{"game": "KC@BUF", "away": "KC", "home": "BUF"}],
+            "legs": [{"slug": "kc-buf-moneyline"}, {"slug": "kc-buf-total"}]}, "auto")
+        store.record_shadow_draft(quote_id=f"Q{index}", rfq_id=rfq_id,
+                                  buy_price=.5, sell_price=.5,
+                                  buy_qty="60000", sell_qty="60000")
+    with connect_readonly(path) as conn:
+        perf = performance(conn)
+        inventory = inventory_state(conn)
+        ledger = fills(conn)
+    assert max(abs(point["net_notional"]) for point in perf["curve"]) <= inventory["equity"]
+    assert perf["net_notional"] == inventory["paper_net_notional"] == 40000.0
+    assert inventory["buying_power"] == 10000.0
+    assert inventory["pending"] == {}
+    assert inventory["executed"]["KC@BUF"] == inventory["paper_wcl"] == 60000.0
+    assert inventory["exposures"]["KC@BUF"] == 60000.0
+    assert inventory["markets"]["kc-buf-moneyline"] == 60000.0
+    assert inventory["teams"]["KC"] == inventory["teams"]["BUF"] == 60000.0
+    assert any(event["action"] == "paper quote" for event in inventory["paper_events"])
+    assert any(event["action"] == "capital cap" for event in inventory["paper_events"])
+    assert any(row.get("capacity_limited") for row in ledger)
+    quotes.close()
+    store.close()
 
 
 def test_live_tabs_reconcile_to_one_database(tmp_path):

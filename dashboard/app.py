@@ -163,7 +163,7 @@ def _live_source(config: PipelineConfig):
 @st.cache_resource
 def _combo_catalog() -> ComboMarketCatalog:
     """One process-wide leg catalog: loads the disk cache, then crawls in the background."""
-    return ComboMarketCatalog(LIVE_DATA / "combo_markets.json").start()
+    return ComboMarketCatalog(LIVE_DATA / "combo_markets.json.gz").start()
 
 
 @st.cache_resource

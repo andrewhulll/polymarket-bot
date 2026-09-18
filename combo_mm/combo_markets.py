@@ -25,6 +25,7 @@ the date is the game key shared by all markets on that game.
 from __future__ import annotations
 
 import json
+import gzip
 import logging
 import re
 import threading
@@ -193,7 +194,11 @@ class ComboMarketCatalog:
         if self._cache_path is None or not self._cache_path.is_file():
             return 0
         try:
-            rows = json.loads(self._cache_path.read_text(encoding="utf-8"))["positions"]
+            if self._cache_path.suffix == ".gz":
+                with gzip.open(self._cache_path, "rt", encoding="utf-8") as cache:
+                    rows = json.load(cache)["positions"]
+            else:
+                rows = json.loads(self._cache_path.read_text(encoding="utf-8"))["positions"]
             markets = [LegMarket(**{**row, "tags": tuple(row.get("tags") or ())}) for row in rows]
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self.last_error = f"cache unreadable ({type(exc).__name__})"
@@ -207,7 +212,12 @@ class ComboMarketCatalog:
             rows = [asdict(m) for m in self._index.values()]
         self._cache_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._cache_path.with_suffix(self._cache_path.suffix + ".tmp")
-        tmp.write_text(json.dumps({"saved_at": _now_iso(), "positions": rows}), encoding="utf-8")
+        payload = {"saved_at": _now_iso(), "positions": rows}
+        if self._cache_path.suffix == ".gz":
+            with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as cache:
+                json.dump(payload, cache)
+        else:
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
         tmp.replace(self._cache_path)
 
     # -- crawl ----------------------------------------------------------------

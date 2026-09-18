@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from capture_live_rfqs import RfqCapture  # noqa: E402
 from export_nfl_rfqs import build_rows, load_trade_extras  # noqa: E402
-from combo_mm.quote_selections import QuoteSelectionStore
+from combo_mm.nfl.live_pricer import LiveQuote
 
 NOW = datetime(2026, 9, 18, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -74,7 +74,23 @@ def _build_capture(tmp_path):
     return capture
 
 
-def test_handle_writes_raw_jsonl_only_for_eligible_rfqs(tmp_path, monkeypatch):
+def _attach_quoter(capture, *, status="QUOTED"):
+    class Quoter:
+        def submit(self, rfq):
+            quote = LiveQuote(rfq_id=rfq.rfq_id, priced_at=NOW.isoformat(),
+                              status=status, reason_code="QUOTED_OK" if status == "QUOTED"
+                              else "UNSUPPORTED_LEG", fair=0.5, bid=0.48, ask=0.52,
+                              bid_qty="10", ask_qty="10")
+            capture._record_decision(rfq, quote, NOW, NOW)
+            return True
+
+        def stop(self):
+            pass
+
+    capture.quoter = Quoter()
+
+
+def test_handle_stores_only_quoted_rfqs(tmp_path, monkeypatch):
     from combo_mm.inventory import InventoryProvider
 
     def fail_inventory_rebuild(*args, **kwargs):
@@ -82,6 +98,7 @@ def test_handle_writes_raw_jsonl_only_for_eligible_rfqs(tmp_path, monkeypatch):
 
     monkeypatch.setattr(InventoryProvider, "record", fail_inventory_rebuild)
     capture = _build_capture(tmp_path)
+    _attach_quoter(capture)
     capture.handle({"kind": "event", "raw": _rfq_request("rfq_nfl", ["100", "101"])}, NOW)
     capture.handle({"kind": "event", "raw": _rfq_request("rfq_soccer", ["200", "201"], "0xsoccer")}, NOW)
     capture.handle({"kind": "event", "raw": _rfq_trade("rfq_nfl")}, NOW)
@@ -91,8 +108,7 @@ def test_handle_writes_raw_jsonl_only_for_eligible_rfqs(tmp_path, monkeypatch):
     assert capture.nfl_rfqs_seen == 1
     assert capture.trades_seen == 2
 
-    # Only the screen-eligible RFQ's frames are kept raw: its request and
-    # its trade. The ineligible soccer RFQ leaves no raw trace.
+    # Only the quoted RFQ's request and trade are kept.
     raw_lines = capture.raw_path.read_text().splitlines()
     assert len(raw_lines) == 2
     frames = [json.loads(line) for line in raw_lines]
@@ -101,13 +117,12 @@ def test_handle_writes_raw_jsonl_only_for_eligible_rfqs(tmp_path, monkeypatch):
     assert frames[1]["raw"]["rfq_id"] == "rfq_nfl"
     assert frames[1]["raw"]["event_type"] == "rfq_closed"
 
-    # Slim parsed records still capture everything, including the decline.
-    assert capture.store.get_rfq("rfq_soccer") is not None
+    assert capture.store.get_rfq("rfq_soccer") is None
     assert capture.store.get_rfq("rfq_nfl") is not None
     nfl_screen = capture.store.get_rfq_screen("rfq_nfl")
-    soccer_screen = capture.store.get_rfq_screen("rfq_soccer")
     assert nfl_screen["n_nfl_legs"] == 2
-    assert soccer_screen["n_nfl_legs"] == 0
+    assert capture.store.get_rfq_screen("rfq_soccer") is None
+    assert capture.store.count_raw_events() == 2
     capture.stop()
 
 
@@ -119,18 +134,40 @@ def test_handle_ignores_book_items(tmp_path):
     capture.stop()
 
 
-def test_rescreen_records_decline_when_pricing_unavailable(tmp_path):
-    from combo_mm.combo_markets import parse_catalog_page
+def test_declined_and_unresolved_rfqs_are_not_stored(tmp_path):
+    capture = _build_capture(tmp_path)
+    _attach_quoter(capture, status="DECLINED")
+    capture.handle({"kind": "event", "raw": _rfq_request("declined", ["100", "101"])}, NOW)
+    capture.handle({"kind": "event", "raw": _rfq_request("unknown", ["999", "998"])}, NOW)
+    capture.handle({"kind": "event", "raw": _rfq_trade("declined")}, NOW)
+    assert capture.store.get_rfq("declined") is None
+    assert capture.store.get_rfq("unknown") is None
+    assert capture.store.count_raw_events() == 0
+    assert capture.raw_path.read_text() == ""
+    capture.stop()
 
-    capture = RfqCapture(tmp_path)
-    capture.selections = QuoteSelectionStore(tmp_path / "rfq_capture.db")
-    capture.handle({"kind": "event", "raw": _rfq_request("late", ["100", "101"])}, NOW)
-    assert capture.store.get_rfq_screen("late")["screen"] == "UNRESOLVED"
-    capture.catalog.merge(parse_catalog_page({"markets": [NFL_GAME]}))
-    capture.rescreen_unresolved()
-    assert capture.store.get_rfq_screen("late")["screen"] == "QUOTABLE"
-    quote = capture.selections.list_priced_quotes(rfq_id="late")[0]
-    assert quote["reason_code"] == "PRICING_UNAVAILABLE"
+
+def test_trade_arriving_while_pricing_is_saved_only_after_quote(tmp_path):
+    capture = _build_capture(tmp_path)
+
+    class DeferredQuoter:
+        def submit(self, rfq):
+            self.rfq = rfq
+            return True
+
+        def stop(self):
+            pass
+
+    capture.quoter = DeferredQuoter()
+    capture.handle({"kind": "event", "raw": _rfq_request("early", ["100", "101"])}, NOW)
+    capture.handle({"kind": "event", "raw": _rfq_trade("early")}, NOW)
+    assert capture.store.get_rfq("early") is None
+    quote = LiveQuote(rfq_id="early", priced_at=NOW.isoformat(), status="QUOTED",
+                      reason_code="QUOTED_OK", fair=0.5, bid=0.48, ask=0.52,
+                      bid_qty="10", ask_qty="10")
+    capture._record_decision(capture.quoter.rfq, quote, NOW, NOW)
+    assert capture.store.get_rfq("early")["status"] == "CLOSED"
+    assert len(capture.raw_path.read_text().splitlines()) == 2
     capture.stop()
 
 
@@ -148,6 +185,7 @@ def test_load_trade_extras_reads_last_trade_per_rfq(tmp_path):
 
 def test_build_rows_filters_to_nfl_and_joins_trade(tmp_path):
     capture = _build_capture(tmp_path)
+    _attach_quoter(capture)
     capture.handle({"kind": "event", "raw": _rfq_request("rfq_nfl", ["100", "101"])}, NOW)
     capture.handle({"kind": "event", "raw": _rfq_request("rfq_soccer", ["200", "201"], "0xsoccer")}, NOW)
     capture.handle({"kind": "event", "raw": _rfq_trade("rfq_nfl", price="0.55", size="1500")}, NOW)
@@ -164,6 +202,7 @@ def test_build_rows_filters_to_nfl_and_joins_trade(tmp_path):
 
 def test_build_rows_date_filter_excludes_out_of_range(tmp_path):
     capture = _build_capture(tmp_path)
+    _attach_quoter(capture)
     capture.handle({"kind": "event", "raw": _rfq_request("rfq_nfl", ["100", "101"])}, NOW)
     capture.stop()
 

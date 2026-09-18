@@ -63,7 +63,7 @@
     </table></div>
     <div class="charts">
       <div class="chart"><h3>Cumulative realized P&amp;L</h3><svg id="chart-realized" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
-      <div class="chart"><h3>Net notional exposure</h3><svg id="chart-equity" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
+      <div class="chart"><h3>Assumed paper net notional</h3><svg id="chart-equity" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
     </div>
     <div class="breakdowns" id="perf-breakdowns"></div>
   </section>
@@ -85,7 +85,7 @@
     </table></div>
     <h2>Risk events</h2>
     <div class="table-wrap"><table id="risk-table">
-      <thead><tr><th>Time</th><th>RFQ</th><th>Action</th><th>Reason</th></tr></thead><tbody></tbody>
+      <thead><tr><th>Time</th><th>RFQ</th><th>Game</th><th>Action</th><th>Reason</th></tr></thead><tbody></tbody>
     </table></div>
     <h2>Stored draft quotes</h2>
     <div class="table-wrap"><table id="drafts-table">
@@ -96,12 +96,17 @@
   <section id="tab-inventory" class="tab">
     <div class="kpis" id="inv-kpis"></div>
     <div id="inv-alerts"></div>
+    <div class="kpis" id="inv-activity-kpis"></div>
+    <h2>Recent paper quote decisions</h2>
+    <div class="table-wrap"><table id="inv-quotes">
+      <thead><tr><th>RFQ</th><th>Created</th><th>Status</th><th class="num">Buy</th><th class="num">Sell</th><th class="num">Buy qty</th><th class="num">Sell qty</th></tr></thead><tbody></tbody>
+    </table></div>
     <div class="toolbar">
       <input type="text" id="ks-reason" placeholder="reason (optional)" style="max-width:260px">
       <button id="ks-trip" class="danger">Trip kill switch</button>
       <button id="ks-reset">Reset</button>
       <span class="spacer"></span>
-      <span class="caption">worst-case-loss exposure · paper only</span>
+      <span class="caption">additive worst-case-loss exposure · recorded and estimated paper fills</span>
     </div>
     <h2>Exposure by game</h2>
     <div class="table-wrap"><table id="inv-games">
@@ -115,9 +120,9 @@
     <div class="table-wrap"><table id="inv-teams">
       <thead><tr><th>Team</th><th class="num">WCL</th></tr></thead><tbody></tbody>
     </table></div>
-    <h2>Risk events</h2>
+    <h2>Risk &amp; paper events</h2>
     <div class="table-wrap"><table id="inv-risk">
-      <thead><tr><th>Time</th><th>RFQ</th><th>Action</th><th>Reason</th></tr></thead><tbody></tbody>
+      <thead><tr><th>Time</th><th>RFQ</th><th>Game</th><th>Action</th><th>Reason</th></tr></thead><tbody></tbody>
     </table></div>
   </section>
 

@@ -98,12 +98,12 @@ def test_nested_combo_prices_far_above_naive_and_below_its_cheapest_leg():
     assert quote.corr_adjustment_bps > 1000
 
 
-def test_fav_ml_with_dog_cover_prices_far_below_naive():
-    """"Bills win but don't cover" -- the backtest's worst naive miss (32.8% vs 16.9% realized)."""
+def test_fav_ml_with_dog_cover_keeps_naive_as_the_floor():
+    """A negative model lift is floored at the independent-leg price."""
     quote = price(build(), ML_HOME, DOG_COVER)
     assert quote.reason_code == QUOTED_OK
-    assert quote.fair_yes < quote.naive_yes - 0.10
-    assert quote.corr_adjustment_bps < -1000
+    assert quote.fair_yes == pytest.approx(quote.naive_yes)
+    assert quote.corr_adjustment_bps == pytest.approx(0.0)
 
 
 def test_spread_times_total_has_real_but_small_dependence():
@@ -190,8 +190,9 @@ def test_the_response_side_follows_the_requester_direction():
 def test_a_no_side_rfq_is_priced_at_one_minus_the_yes_fair():
     yes = price(build(), ML_HOME, FAV_COVER, side="YES")
     no = price(build(), ML_HOME, FAV_COVER, side="NO")
-    assert no.fair == pytest.approx(1.0 - yes.fair_yes, abs=1e-6)
-    assert no.fair_yes == pytest.approx(yes.fair_yes, abs=1e-9)
+    assert no.fair == pytest.approx(no.naive, abs=1e-6)
+    assert no.fair >= no.naive
+    assert no.fair_yes == pytest.approx(1.0 - no.fair, abs=1e-9)
     assert no.bid < no.fair < no.ask
 
 

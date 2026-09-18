@@ -7,6 +7,7 @@ fills use their actual side and price. No order is sent from this module.
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from combo_mm.risk import InventoryState
@@ -40,23 +41,42 @@ class InventoryProvider:
         self.capital = capital
         self.game_resolver = game_resolver
 
-    def __call__(self, as_of: str = "") -> InventoryState:
+    def __call__(self, as_of: str = "", *,
+                 exclude_pending_rfqs: Optional[set[str]] = None) -> InventoryState:
         rfqs, quotes, fills, halted = self.store.inventory_rows()
         pending = defaultdict(float)
         executed = defaultdict(float)
         markets = defaultdict(float)
         teams = defaultdict(float)
         net_by_game = defaultdict(float)
+        notional_by_game = defaultdict(float)
         positions = {}
         realized_pnl = 0.0
         rfq_map = {r["rfq_id"]: r for r in rfqs}
         latest = {}
+        snapshot_time = (datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+                         if as_of else datetime.now(timezone.utc))
+        if snapshot_time.tzinfo is None:
+            snapshot_time = snapshot_time.replace(tzinfo=timezone.utc)
         for quote in quotes:
             if quote["origin"] != "shadow":
                 continue
             rfq_id = quote["rfq_id"]
-            if rfq_id not in rfq_map or rfq_map[rfq_id]["status"] not in ("OPEN", "QUOTED"):
+            if exclude_pending_rfqs and rfq_id in exclude_pending_rfqs:
                 continue
+            if rfq_id not in rfq_map or rfq_map[rfq_id]["status"] not in (
+                    "OPEN", "QUOTED", "RFQ_STATUS_OPEN", "RFQ_STATUS_QUOTED"):
+                continue
+            deadline = rfq_map[rfq_id].get("submission_deadline")
+            if deadline:
+                try:
+                    expires = (datetime.fromtimestamp(int(deadline) / 1000, timezone.utc)
+                               if str(deadline).isdigit() else
+                               datetime.fromisoformat(str(deadline).replace("Z", "+00:00")))
+                    if expires <= snapshot_time:
+                        continue
+                except (ValueError, OverflowError):
+                    pass
             if as_of and quote["created_time"] and quote["created_time"] > as_of:
                 continue
             latest[rfq_id] = quote
@@ -90,6 +110,7 @@ class InventoryProvider:
                 continue
             loss = abs(net) * (price if net > 0 else 1 - price)
             executed[game] += loss
+            notional_by_game[game] += abs(net) * price
             net_by_game[game] += net
             for symbol in leg_symbols:
                 markets[symbol] += loss
@@ -106,6 +127,8 @@ class InventoryProvider:
             loss = max(buy_qty * (1 - float(quote["buy_price"] or 0)),
                        sell_qty * float(quote["sell_price"] or 0))
             pending[game] += loss
+            notional_by_game[game] += max(buy_qty * float(quote["buy_price"] or 0),
+                                         sell_qty * float(quote["sell_price"] or 0))
             for leg in rfq.get("legs", []) or [{"symbol": quote["symbol"] or ""}]:
                 markets[leg["symbol"]] += loss
             for team in members:
@@ -115,7 +138,8 @@ class InventoryProvider:
         exposures = {key: pending_map.get(key, 0) + executed_map.get(key, 0)
                      for key in sorted(set(pending_map) | set(executed_map))}
         reserved = sum(exposures.values())
-        return InventoryState(exposures=exposures, capital=self.capital,
+        return InventoryState(exposures=exposures,
+                               notional_by_game=dict(notional_by_game), capital=self.capital,
                               pending=pending_map, executed=executed_map,
                               markets=dict(markets), teams=dict(teams),
                               net_by_game=dict(net_by_game),

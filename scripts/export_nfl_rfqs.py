@@ -1,10 +1,8 @@
 """Export the NFL slice of a live RFQ capture (scripts/capture_live_rfqs.py)
 to a flat CSV/JSON file. Read-only; does not touch the dashboard or pricing.
 
-An RFQ counts as NFL if any of its legs resolved to an NFL market in the
-combo catalog (``rfq_screen.n_nfl_legs > 0``) -- broader than the
-``QUOTABLE`` screen used for live quoting, since this is for "give me the
-data", not "what would we quote".
+Only paper-quoted RFQs are retained by the capture process. This export
+selects the NFL slice of those quotes (``rfq_screen.n_nfl_legs > 0``).
 
 Usage::
 
@@ -42,9 +40,8 @@ def _parse_ts(value: Optional[str]) -> Optional[datetime]:
 def load_trade_extras(raw_path: Path) -> Dict[str, Dict[str, Any]]:
     """rfq_id -> {price, size, executed_at, ...} from the raw JSONL capture.
 
-    Trade extras (accepted price/size) never make it into rfq_capture.db --
-    normalize() drops gateway-native fields it does not recognize (see
-    combo_mm/intl_gateway.py). The raw log is the only place they survive.
+    Accepted price/size also land in ``live_trades``. The raw log keeps the
+    gateway-native extras that normalize() does not recognize.
     Last trade frame per RFQ wins.
     """
     extras: Dict[str, Dict[str, Any]] = {}
@@ -96,7 +93,7 @@ def build_rows(data_dir: Path, *, since: Optional[datetime] = None,
     if not db_path.is_file():
         raise FileNotFoundError(
             f"{db_path} not found -- run scripts/capture_live_rfqs.py first")
-    catalog = ComboMarketCatalog(cache_path=data_dir / "combo_markets.json")
+    catalog = ComboMarketCatalog(cache_path=data_dir / "combo_markets.json.gz")
     catalog.load_cache()
     trade_extras = load_trade_extras(data_dir / "rfq_raw.jsonl")
     store = EventStore(str(db_path))

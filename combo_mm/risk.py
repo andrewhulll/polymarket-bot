@@ -53,6 +53,7 @@ class InventoryState:
     """
 
     exposures: Dict[str, float] = field(default_factory=dict)
+    notional_by_game: Dict[str, float] = field(default_factory=dict)
     capital: float = 50000.0
     pending: Dict[str, float] = field(default_factory=dict)
     executed: Dict[str, float] = field(default_factory=dict)
@@ -67,7 +68,8 @@ class InventoryState:
 
     def to_snapshot(self) -> dict:
         """JSON-serializable snapshot for the draft's input snapshot."""
-        return {"exposures": dict(self.exposures), "capital": self.capital,
+        return {"exposures": dict(self.exposures),
+                "notional_by_game": dict(self.notional_by_game), "capital": self.capital,
                 "pending": dict(self.pending), "executed": dict(self.executed),
                 "markets": dict(self.markets), "teams": dict(self.teams),
                 "net_by_game": dict(self.net_by_game),

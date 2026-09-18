@@ -389,6 +389,12 @@ class NflLivePricer:
             explanations.append(f"{len(independent)} leg(s) from other games priced as independent: "
                                 + " x ".join(f"{leg.q:.3f}" for leg in independent))
 
+        # Apply the same floor on the requested side. This keeps the public
+        # fair/naive pair monotonic for both YES and NO RFQs.
+        naive_side = naive_yes if rfq.side == "YES" else 1.0 - naive_yes
+        fair_side = fair_yes if rfq.side == "YES" else 1.0 - fair_yes
+        fair_side = max(fair_side, naive_side)
+        fair_yes = fair_side if rfq.side == "YES" else 1.0 - fair_side
         corr_bps = (fair_yes - naive_yes) * 10000.0
         if age_days > 7.0:
             confidence_hits.append(("params age", 0.02 * (age_days - 7.0)))
@@ -578,7 +584,11 @@ class NflLivePricer:
         raw = naive * lift if mc.method == "market_lift" else p_all
         lo = max(0.0, sum(qs) - (len(qs) - 1))  # type: ignore[arg-type]
         hi = min(qs)  # type: ignore[type-var]
-        fair = min(max(raw, lo), hi)
+        frechet_fair = min(max(raw, lo), hi)
+        # The independent-leg product is the model floor. Correlation can
+        # improve the price, but it must never make the fair value worse than
+        # the naive quote that we could already show.
+        fair = max(frechet_fair, naive)
 
         kinds = {leg.nfl.kind for leg in unique.values()}  # type: ignore[union-attr]
         explanations = [
@@ -587,7 +597,9 @@ class NflLivePricer:
             f"{away} {cal.mu_away:.1f}; sd {cal.cov.sigma_home:.2f}/{cal.cov.sigma_away:.2f}, "
             f"rho {cal.cov.rho:+.3f}",
             f"{away} @ {home}: model joint {p_all:.4f}, lift over independence {lift:.3f}, "
-            f"naive {naive:.4f} -> fair {fair:.4f}" + (" (Frechet-clamped)" if fair != raw else ""),
+            f"naive {naive:.4f} -> fair {fair:.4f}"
+            + (" (naive floor)" if fair == naive and raw < naive else
+               " (Frechet-clamped)" if frechet_fair != raw else ""),
         ]
         confidence_hits: List[Tuple[str, float]] = []
         if not cal.converged:
@@ -609,7 +621,9 @@ class NflLivePricer:
             "mu_home": cal.mu_home, "mu_away": cal.mu_away, "converged": cal.converged,
             "iterations": cal.iterations, **cal.cov.to_dict(), "corr_scale": mc.corr_scale,
             "model_joint": p_all, "naive": naive, "lift": lift, "fair": fair,
-            "frechet_clamped": fair != raw, "max_marginal_gap": max_gap,
+            "frechet_clamped": frechet_fair != raw,
+            "naive_floored": fair == naive and raw < naive,
+            "max_marginal_gap": max_gap,
             "params_game_row": handle.game(home, away) is not None,
         }
         return {"fair": fair, "model_joint": p_all, "max_gap": max_gap,

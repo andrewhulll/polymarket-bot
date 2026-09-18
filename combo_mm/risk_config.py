@@ -7,7 +7,7 @@ class RiskConfig:
     policy: str = "conservative"
     max_rfq_loss: float = 1000.0
     max_market_loss: float = 4000.0
-    max_game_loss: float = 2500.0
+    max_game_loss: float = 10000.0
     max_team_loss: float = 3000.0
     max_portfolio_loss: float = 25000.0
     min_buying_power: float = 5000.0
