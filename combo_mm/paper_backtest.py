@@ -27,6 +27,11 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
+from combo_mm.backtest.metrics import compute as _shared_compute
+from combo_mm.backtest.metrics import swings as _shared_swings
+from combo_mm.backtest.metrics import (
+    combo_settlement_value as _combo_settlement_value,
+)
 from combo_mm.books import LegBookCache
 from combo_mm.config import PipelineConfig
 from combo_mm.dropcopy import SimulatedDropCopyTransport, drain_drop_copy
@@ -43,21 +48,12 @@ log = logging.getLogger(__name__)
 __all__ = ["BacktestResult", "run_backtest", "compute_metrics", "combo_settlement_value"]
 
 
-def combo_settlement_value(legs: List[Dict[str, Any]]) -> Optional[float]:
-    """Combo settlement from RAW leg settlements: product of q_i.
+combo_settlement_value = _combo_settlement_value
+"""Combo settlement from RAW leg settlements: product of q_i.
 
-    ``settlement_price`` is the leg's own YES/LONG result in [0,1]; the
-    YES/NO inversion happens here (and only here), never at ingest.
-    Returns None when any leg lacks a settlement price (not settled yet).
-    """
-    value = 1.0
-    for leg in legs:
-        sp = leg.get("settlement_price")
-        if sp is None:
-            return None
-        sp = float(sp)
-        value *= sp if leg.get("side") == "YES" else (1.0 - sp)
-    return value
+Single implementation lives in :mod:`combo_mm.backtest.metrics`; this alias
+keeps the historical import path working.
+"""
 
 
 @dataclass
@@ -140,96 +136,37 @@ def run_backtest(session: List[Dict[str, Any]],
 
 
 def compute_metrics(store: EventStore) -> BacktestResult:
-    res = BacktestResult()
-    rfqs = store.list_rfqs()
-    res.rfqs_received = len(rfqs)
+    """Aggregate replay stats.
 
-    # Latest shadow decision per RFQ.
-    latest: Dict[str, Any] = {}
-    for d in store.get_shadow_decisions(limit=10000):
-        latest.setdefault(d["rfq_id"], d)
-    res.rfqs_quoted = sum(1 for d in latest.values()
-                          if d["decision"] == QUOTED_OK)
-    res.rfqs_rejected = sum(1 for d in latest.values()
-                            if d["decision"] != QUOTED_OK)
-    res.rfqs_expired = sum(1 for r in rfqs if r["status"] == "EXPIRED")
-    res.rfqs_executed = sum(
-        1 for r in rfqs
-        if any(q["status"] == "EXECUTED"
-               for q in store.get_quotes_for_rfq(r["rfq_id"])))
-    res.quote_rate = res.rfqs_quoted / res.rfqs_received if res.rfqs_received else 0.0
-    res.execution_rate = res.rfqs_executed / res.rfqs_quoted if res.rfqs_quoted else 0.0
-
-    # Expected P&L: sum of expected edge at quote time. Expected edge per
-    # unit is the half-spread in price units (spread_bps / 10000); the shadow
-    # table stores spread_bps and the RFQ table stores the requested qty.
-    rfq_by_id = {r["rfq_id"]: r for r in rfqs}
-    expected = Decimal(0)
-    for d in latest.values():
-        if d["decision"] == QUOTED_OK:
-            r = rfq_by_id.get(d["rfq_id"]) or {}
-            qty = r.get("qty_decimal")
-            if not qty:
-                # Cash-sized RFQs have no qty_decimal: use the smaller live
-                # quoted side size (conservative; "0" means side unquoted).
-                sides = [Decimal(str(s)) for s in (d.get("buy_qty"), d.get("sell_qty"))
-                         if s and Decimal(str(s)) > 0]
-                qty = min(sides) if sides else 0
-            expected += (Decimal(str(d["spread_bps"] or 0)) / Decimal(10000)
-                         * Decimal(str(qty)))
-    res.expected_pnl = float(expected)
-
-    # Realized P&L: Drop Copy fills vs combo settlement values.
-    settle: Dict[str, Optional[float]] = {}
-    for r in rfqs:
-        legs = (store.get_rfq(r["rfq_id"]) or {}).get("legs") or []
-        settle[r["rfq_id"]] = combo_settlement_value(legs)
-
-    fills = store.get_fills_for_position()
-    res.n_fills = len(fills)
-    cum = 0.0
-    peak = trough = 0.0
-    max_dd = max_up = 0.0
-    equity: List[Tuple[str, float]] = []
-    net: Dict[str, Decimal] = {}
-    last_price: Dict[str, float] = {}
-    exposure: List[Tuple[str, float]] = []
-    for f in fills:
-        s = settle.get(f["rfq_id"] or "")
-        qty = Decimal(str(f["qty"] or 0))
-        price = float(f["price"] or 0)
-        if s is not None:
-            pnl = ((s - price) * float(qty) if f["side"] == "BUY"
-                   else (price - s) * float(qty))
-            cum += pnl
-            peak = max(peak, cum)
-            trough = min(trough, cum)
-            max_dd = max(max_dd, peak - cum)
-            max_up = max(max_up, cum - trough)
-        equity.append((f["executed_time"] or "", cum))
-        dq = qty if f["side"] == "BUY" else -qty
-        sym = f["symbol"] or ""
-        net[sym] = net.get(sym, Decimal(0)) + dq
-        last_price[sym] = price
-        notional = sum(abs(float(net[k])) * last_price[k] for k in net)
-        exposure.append((f["executed_time"] or "", notional))
-
-    res.realized_pnl = cum
-    res.max_downswing = max_dd
-    res.max_upswing = max_up
-    res.equity_curve = equity
-    res.exposure_curve = exposure
-
-    for r in rfqs:
-        d = latest.get(r["rfq_id"])
-        res.per_rfq.append(
-            {
-                "rfq_id": r["rfq_id"],
-                "symbol": r["symbol"],
-                "status": r["status"],
-                "reason_code": d["decision"] if d else None,
-                "fair": d["fair_price"] if d else None,
-                "settlement": settle.get(r["rfq_id"]),
-            }
-        )
-    return res
+    Thin wrapper over the shared :mod:`combo_mm.backtest.metrics`
+    implementation (issue #5 item A): the legacy ``expected_pnl`` is the
+    shared ``quoted_edge_notional`` (quoted half-spread over all quotes,
+    relabeled), and swings run on the legacy fill-time equity curve so
+    dashboard numbers are unchanged.
+    """
+    m = _shared_compute(store)
+    s = _shared_swings(m.equity_curve)
+    return BacktestResult(
+        rfqs_received=m.rfqs_received,
+        rfqs_quoted=m.rfqs_quoted,
+        rfqs_rejected=m.rfqs_rejected,
+        rfqs_expired=m.rfqs_expired,
+        rfqs_executed=m.rfqs_executed,
+        quote_rate=m.quote_rate,
+        execution_rate=m.execution_rate,
+        expected_pnl=m.quoted_edge_notional,
+        realized_pnl=m.realized_pnl,
+        max_downswing=s["max_downswing"],
+        max_upswing=s["max_upswing"],
+        n_fills=m.n_fills,
+        equity_curve=m.equity_curve,
+        exposure_curve=[(r["ts"], r["net_notional"]) for r in m.exposure_curve],
+        per_rfq=[{
+            "rfq_id": row["rfq_id"],
+            "symbol": row["symbol"],
+            "status": row["status"],
+            "reason_code": row["decision"],
+            "fair": row["fair"],
+            "settlement": row["settlement"],
+        } for row in m.per_rfq],
+    )

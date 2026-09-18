@@ -13,3 +13,6 @@ params/history/
 # Python
 __pycache__/
 .pytest_cache/
+
+# Backtest run artifacts (reproducible via scripts/backtest.py; never commit)
+runs/

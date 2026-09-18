@@ -198,6 +198,10 @@ QUOTE_EXPIRED = "EXPIRED"
 QUOTE_TERMINAL_STATUSES = frozenset({QUOTE_DELETED, QUOTE_EXPIRED})
 
 _QUOTE_RANK = {
+    # 'shadow' is not a wire status: it marks engine drafts. It ranks below
+    # DRAFT so simulated lifecycle events (backtest fill model) may advance
+    # a shadow draft through accept -> confirm -> execute.
+    "shadow": -1,
     QUOTE_DRAFT: 0,
     QUOTE_ACTIVE: 1,
     QUOTE_REPLACED: 1,  # same rank: superseded live quote awaiting its replacement
