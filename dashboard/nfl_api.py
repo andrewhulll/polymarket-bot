@@ -85,6 +85,7 @@ VIEWS = ["overview", "combo_pricing", "calibration", "structure", "sensitivity",
 RUN_ALLOWLIST = {
     "refresh_params": ["scripts/refresh_params.py"],
     "run_backtest": ["scripts/nfl_backtest.py"],
+    "run_week_backtest": ["scripts/run_week_backtest.py"],
 }
 
 
@@ -1106,8 +1107,9 @@ def _score_heatmap_chart(gm: GameModel, legs, home: str, away: str, game: Option
 # Research scripts (allowlisted only)
 # ---------------------------------------------------------------------------
 
-def run_script(name: str, options: Optional[Dict] = None) -> Dict:
-    """Run an allowlisted research script; returns ok + the last 40 output lines."""
+def _build_argv(name: str, options: Optional[Dict] = None,
+                data_dir: Optional[str] = None) -> List[str]:
+    """Argv for an allowlisted script; raises ValueError for unknown names."""
     if name not in RUN_ALLOWLIST:
         raise ValueError(f"unknown script {name!r}")
     argv = list(RUN_ALLOWLIST[name])
@@ -1120,6 +1122,15 @@ def run_script(name: str, options: Optional[Dict] = None) -> Dict:
             argv += ["--last-season", str(int(last))]
         if options.get("pull"):
             argv.append("--pull")
+    if name == "run_week_backtest" and data_dir:
+        argv += ["--data-dir", data_dir]
+    return argv
+
+
+def run_script(name: str, options: Optional[Dict] = None,
+               data_dir: Optional[str] = None) -> Dict:
+    """Run an allowlisted research script; returns ok + the last 40 output lines."""
+    argv = _build_argv(name, options, data_dir)
     proc = subprocess.run([sys.executable, *argv], cwd=REPO, capture_output=True,
                           text=True, timeout=7200)
     tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-40:])

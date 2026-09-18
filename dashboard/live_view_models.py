@@ -14,8 +14,11 @@ from typing import Any
 
 
 def connect_readonly(path: str | Path) -> sqlite3.Connection:
+    # Generous busy timeout: the capture process owns all writes, and on
+    # Windows a write transaction blocks readers (rollback-journal mode).
+    # Reads just wait for the writer instead of failing.
     conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True,
-                           timeout=0.2)
+                           timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only=ON")
     return conn

@@ -246,15 +246,21 @@ function renderNflPayloadInto(data, root) {
 
 $("nfl-run-params").addEventListener("click", () => nflRun("refresh_params"));
 $("nfl-run-backtest").addEventListener("click", () => nflRun("run_backtest"));
+$("nfl-run-week1").addEventListener("click", () => nflRun("run_week_backtest", true));
 
-async function nflRun(script) {
+async function nflRun(script, switchToWeek1 = false) {
   const out = $("nfl-run-output");
   out.classList.remove("hidden");
   out.textContent = `running ${script}…`;
   try {
     const res = await post("/api/nfl/run", { script });
-    out.textContent = `$ ${script} → exit ${res.returncode}\n\n${res.stdout || ""}${res.stderr ? "\n--- stderr ---\n" + res.stderr : ""}`;
+    out.textContent = `$ ${script} → exit ${res.returncode}\n\n${res.output || res.stdout || ""}`;
     nflMeta = null;
+    if (switchToWeek1 && res.returncode === 0) {
+      await loadSources();
+      await switchSource("week1_backtest.db");
+      out.textContent += "\n\nswitched the live tabs to the Week 1 backtest database.";
+    }
     if (state.tab === "nfl") await refreshNfl();
   } catch (e) {
     out.textContent = `failed: ${e.message}`;

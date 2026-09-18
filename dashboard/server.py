@@ -54,7 +54,12 @@ class _Waiting(Exception):
 
 
 def _db_path() -> Path:
-    return Path(_CONFIG["data_dir"]) / "rfq_capture.db"
+    return Path(_CONFIG["data_dir"]) / _CONFIG["active_db"]
+
+
+def _source_label(name: str) -> str:
+    return {"rfq_capture.db": "Live capture",
+            "week1_backtest.db": "Week 1 backtest"}.get(name, name)
 
 
 def _connect() -> sqlite3.Connection:
@@ -62,9 +67,21 @@ def _connect() -> sqlite3.Connection:
     if not path.exists():
         raise _Waiting(f"{path} not found yet")
     try:
-        return vm.connect_readonly(path)
+        conn = vm.connect_readonly(path)
     except (OSError, sqlite3.Error) as exc:
         raise _Waiting(f"{path} unreadable ({type(exc).__name__})")
+    # The file can exist but be uninitialized (0 bytes, or the capture hasn't
+    # created tables yet). Report "waiting" instead of 500ing every endpoint.
+    try:
+        has_rfq = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rfq'").fetchone()
+    except sqlite3.Error as exc:
+        conn.close()
+        raise _Waiting(f"{path} unreadable ({type(exc).__name__})")
+    if not has_rfq:
+        conn.close()
+        raise _Waiting(f"{path} has no tables yet")
+    return conn
 
 
 def _pricing_count(conn: sqlite3.Connection) -> int:
@@ -125,6 +142,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(*self._api_risk())
             elif path == "/api/engine":
                 self._respond(*self._api_engine())
+            elif path == "/api/sources":
+                self._respond(*self._api_sources())
             elif path == "/api/nfl/meta":
                 self._respond(*self._api_nfl_meta())
             elif path == "/api/nfl/games":
@@ -151,6 +170,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(*self._api_nfl_explorer_price())
             elif parsed.path == "/api/nfl/run":
                 self._respond(*self._api_nfl_run())
+            elif parsed.path == "/api/sources/active":
+                self._respond(*self._api_sources_active())
             else:
                 self._respond(*_json({"error": "not found"}, 404))
         except ValueError as exc:  # bad request body
@@ -264,6 +285,25 @@ class Handler(BaseHTTPRequestHandler):
         with closing(_connect()) as conn:
             return _json(vm.engine_status(conn, budget))
 
+    # -- data sources ---------------------------------------------------
+    def _api_sources(self) -> tuple[int, str, bytes]:
+        data_dir = Path(_CONFIG["data_dir"])
+        sources = [{"id": p.name, "label": _source_label(p.name)}
+                   for p in sorted(data_dir.glob("*.db")) if p.is_file()]
+        return _json({"sources": sources, "active": _CONFIG["active_db"]})
+
+    def _api_sources_active(self) -> tuple[int, str, bytes]:
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
+        name = body.get("id")
+        if (not isinstance(name, str) or not name.endswith(".db")
+                or "/" in name or "\\" in name
+                or not (Path(_CONFIG["data_dir"]) / name).is_file()):
+            return _json({"error": f"unknown source {name!r}"}, 400)
+        _CONFIG["active_db"] = name
+        return _json({"active": name})
+
     # -- NFL research -----------------------------------------------------
     def _api_nfl_meta(self) -> tuple[int, str, bytes]:
         nfl = _nfl_api()
@@ -339,10 +379,10 @@ class Handler(BaseHTTPRequestHandler):
         options = body.get("options") or {}
         if not isinstance(options, dict):
             raise ValueError("options must be an object")
-        return _json(nfl.run_script(name, options))
+        return _json(nfl.run_script(name, options, data_dir=_CONFIG["data_dir"]))
 
 
-_CONFIG = {"data_dir": str(REPO / "data" / "live")}
+_CONFIG = {"data_dir": str(REPO / "data" / "live"), "active_db": "rfq_capture.db"}
 
 
 def main(argv: list[str] | None = None) -> int:

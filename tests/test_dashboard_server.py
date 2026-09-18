@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import threading
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -387,3 +388,71 @@ def test_missing_database_reports_waiting(repo_path, tmp_path, monkeypatch):
     finally:
         httpd.shutdown()
         thread.join(timeout=5)
+
+
+def post_json(base: str, path: str, body: dict):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(base + path, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as res:
+            return res.status, json.loads(res.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+@pytest.fixture()
+def serve_dir(repo_path, tmp_path, monkeypatch):
+    from dashboard import server as srv
+    monkeypatch.setitem(srv._CONFIG, "data_dir", str(tmp_path))
+    monkeypatch.setitem(srv._CONFIG, "active_db", "rfq_capture.db")
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}"
+    httpd.shutdown()
+    thread.join(timeout=5)
+
+
+def test_uninitialized_db_returns_waiting(serve_dir, tmp_path):
+    (tmp_path / "rfq_capture.db").write_bytes(b"")  # exists but has no tables
+    payload = get_json(serve_dir, "/api/rfqs")
+    assert payload["waiting"] is True
+
+
+def test_sources_list_and_switch(serve_dir, tmp_path):
+    make_db(tmp_path / "rfq_capture.db")
+    make_db(tmp_path / "week1_backtest.db")
+    base = serve_dir
+
+    src = get_json(base, "/api/sources")
+    assert src["active"] == "rfq_capture.db"
+    assert {s["id"] for s in src["sources"]} == {"rfq_capture.db", "week1_backtest.db"}
+    assert all("label" in s for s in src["sources"])
+
+    status, body = post_json(base, "/api/sources/active", {"id": "week1_backtest.db"})
+    assert status == 200
+    assert body["active"] == "week1_backtest.db"
+    assert get_json(base, "/api/sources")["active"] == "week1_backtest.db"
+
+    # unknown files and traversal are rejected
+    for bad in ["nope.db", "../evil.db", "sub/dir.db", ""]:
+        status, body = post_json(base, "/api/sources/active", {"id": bad})
+        assert status == 400, bad
+
+
+def test_nfl_run_rejects_unknown_script(server):
+    status, body = post_json(server, "/api/nfl/run", {"script": "rm -rf"})
+    assert status == 400
+    assert "unknown script" in body["error"]
+
+
+def test_build_argv_week_backtest(repo_path):
+    from dashboard import nfl_api
+    argv = nfl_api._build_argv("run_week_backtest", {}, data_dir="/tmp/x")
+    assert argv == ["scripts/run_week_backtest.py", "--data-dir", "/tmp/x"]
+    argv = nfl_api._build_argv("run_backtest", {"first_season": 2020})
+    assert argv == ["scripts/nfl_backtest.py", "--first-season", "2020"]
+    with pytest.raises(ValueError):
+        nfl_api._build_argv("nope", {})

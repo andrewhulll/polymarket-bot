@@ -105,6 +105,26 @@ function restartPolling() {
   }
 }
 
+/* ---- data sources (live capture vs week-1 backtest) ---- */
+async function loadSources() {
+  try {
+    const data = await get("/api/sources");
+    const sel = $("data-source");
+    sel.innerHTML = data.sources.map((s) =>
+      `<option value="${esc(s.id)}" ${s.id === data.active ? "selected" : ""}>${esc(s.label)}</option>`).join("");
+    sel.onchange = () => switchSource(sel.value);
+  } catch (e) { console.warn(e); }
+}
+
+async function switchSource(id) {
+  try {
+    await post("/api/sources/active", { id });
+    closeDrawer();
+    state.rfqPage = 1; state.pricingPage = 1; state.fillsPage = 1;
+    restartPolling();
+  } catch (e) { console.warn(e); }
+}
+
 async function refresh() {
   if (state.hidden) return;
   try {
@@ -191,3 +211,7 @@ function ensureVega() {
     .then(() => load("/static/vendor/vega-lite.min.js"))
     .then(() => load("/static/vendor/vega-embed.min.js"));
 }
+
+/* ---- init ---- */
+loadSources();
+restartPolling();
