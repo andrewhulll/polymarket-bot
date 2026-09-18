@@ -95,7 +95,8 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
         row["status"] = row["status"] or "PENDING"
         row["reason_code"] = row["reason_code"] or "AWAITING_DECISION"
         row["detail"] = json.loads(row.pop("detail_json") or "{}")
-        sign = 1 if row["response_action"] == "BUY" else -1
+        # A lower ask wins a requester BUY; a higher bid wins a requester SELL.
+        sign = 1 if row["response_action"] == "SELL" else -1
         if row["market_price"] is not None and row["response_price"] is not None:
             row["edge_vs_market"] = sign * (row["market_price"] - row["response_price"])
         else:

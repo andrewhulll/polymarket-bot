@@ -1,11 +1,8 @@
-"""Pricer seam (issue #2): the interface every combo pricer implements.
+"""Pricer seam for the paper shadow engine.
 
-The shadow quoting engine (:mod:`combo_mm.engine`) prices exclusively
-through the :class:`Pricer` protocol below. Issue #2's MVN (multivariate
-normal) pricer will implement this same interface -- filling
-``corr_adjustment_bps`` from the joint leg model instead of the ``0.0``
-used here -- with **zero engine changes**: the engine only ever sees a
-:class:`PricerResult`.
+The headless NFL capture uses :class:`combo_mm.nfl.live_pricer.NflLivePricer`
+because its position IDs require catalog and live book lookups. This V1
+adapter remains useful for offline replay and non-NFL RFQs.
 
 :class:`V1NaivePricer` is the current implementation: it adapts the
 existing independent-leg :func:`combo_mm.pricing.price_combo` (fair =
@@ -14,14 +11,20 @@ product of marginal leg probabilities, ``corr_adjustment_bps = 0.0``).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from combo_mm.config import PipelineConfig
 from combo_mm.pricing import QUOTED_OK, LegMarkInput, QuoteDecision, price_combo
 
-__all__ = ["PricerResult", "Pricer", "V1NaivePricer", "MODEL_VERSION"]
+__all__ = ["PricerResult", "Pricer", "V1NaivePricer", "MODEL_VERSION",
+           "SAME_GAME_NESTED", "SAME_GAME_TOO_LARGE", "SAME_GAME_UNMODELED",
+           "UNRESOLVED_LEG"]
 
 MODEL_VERSION = "v1"
+SAME_GAME_NESTED = "SAME_GAME_NESTED"
+SAME_GAME_TOO_LARGE = "SAME_GAME_TOO_LARGE"
+SAME_GAME_UNMODELED = "SAME_GAME_UNMODELED"
+UNRESOLVED_LEG = "UNRESOLVED_LEG"
 
 
 @dataclass(frozen=True)
@@ -94,9 +97,18 @@ def _v1_confidence(decision: QuoteDecision) -> float:
 
 
 class V1NaivePricer:
-    """Independent-leg pricer: adapts :func:`price_combo` to the seam."""
+    """Independent-leg pricer with a catalog-backed same-game guardrail."""
 
     model_version: str = MODEL_VERSION
+
+    def __init__(self, resolver: Optional[Callable[[str], Any]] = None,
+                 same_game_haircut_bps: float = 150.0,
+                 same_game_max_qty: Optional[float] = None) -> None:
+        if same_game_haircut_bps < 0 or (same_game_max_qty is not None and same_game_max_qty <= 0):
+            raise ValueError("invalid same-game guardrail")
+        self.resolver = resolver
+        self.same_game_haircut_bps = same_game_haircut_bps
+        self.same_game_max_qty = same_game_max_qty
 
     def price(
         self,
@@ -111,6 +123,39 @@ class V1NaivePricer:
         config: Optional[PipelineConfig] = None,
     ) -> PricerResult:
         cfg = config or PipelineConfig()
+        guard_reason = None
+        same_games: Dict[str, List[Any]] = {}
+        if self.resolver is not None:
+            for leg in legs:
+                market = self.resolver(leg.symbol)
+                if market is None:
+                    guard_reason = UNRESOLVED_LEG
+                    break
+                if market.game:
+                    same_games.setdefault(market.game, []).append(market)
+            if guard_reason is None:
+                for members in same_games.values():
+                    if len(members) < 2:
+                        continue
+                    if any(not m.is_nfl for m in members):
+                        guard_reason = SAME_GAME_UNMODELED
+                        break
+                    # ML and spread are nested or nearly contradictory on the
+                    # same score margin. A fixed haircut cannot bound that error.
+                    from combo_mm.nfl.catalog_markets import parse_catalog_leg
+                    parsed_markets = [parse_catalog_leg(m.slug, m.outcome_index) for m in members]
+                    if any(parsed is None for parsed in parsed_markets):
+                        guard_reason = SAME_GAME_UNMODELED
+                        break
+                    kinds = {parsed[0].kind for parsed in parsed_markets}
+                    if "ML" in kinds and "SPR" in kinds:
+                        guard_reason = SAME_GAME_NESTED
+                        break
+                if guard_reason is None and any(len(m) >= 2 for m in same_games.values()):
+                    if self.same_game_max_qty is not None and qty_decimal is not None:
+                        if float(qty_decimal) > self.same_game_max_qty:
+                            guard_reason = SAME_GAME_TOO_LARGE
+        guarded = any(len(m) >= 2 for m in same_games.values())
         decision = price_combo(
             legs,
             rfq_id=rfq_id,
@@ -129,8 +174,10 @@ class V1NaivePricer:
             price_min=cfg.price_min,
             price_max=cfg.price_max,
             min_qty=cfg.min_qty,
+            extra_spread_bps={"same_game_haircut_bps": self.same_game_haircut_bps}
+            if guarded and guard_reason is None else None,
         )
-        quoted = decision.reason_code == QUOTED_OK
+        quoted = decision.reason_code == QUOTED_OK and guard_reason is None
         marginals = {
             m["symbol"]: float(m["q"])
             for m in decision.components.get("leg_marks", [])
@@ -145,7 +192,7 @@ class V1NaivePricer:
             naive_product=decision.fair,   # V1: fair IS the naive product
             corr_adjustment_bps=0.0,       # V1 assumes independent legs
             confidence=_v1_confidence(decision),
-            unquotable_reason=None if quoted else decision.reason_code,
+            unquotable_reason=None if quoted else (guard_reason or decision.reason_code),
             legs_snapshot_hash=decision.legs_snapshot_hash,
             decided_at=decided_at,
             extra={

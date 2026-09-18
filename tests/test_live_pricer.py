@@ -1,12 +1,14 @@
 """Live NFL same-game pricer (#2): fair value, quote terms, and every decline path."""
 import json
 import math
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from combo_mm.combo_markets import ComboMarketCatalog, parse_catalog_page
+from combo_mm.config import PipelineConfig
 from combo_mm.nfl.joint import GameModel, calibrate_means, home_cover, home_ml, over
 from combo_mm.nfl.live_pricer import (
     CONTRADICTORY_LEGS,
@@ -15,6 +17,8 @@ from combo_mm.nfl.live_pricer import (
     MODEL_MARKET_DISAGREE,
     NO_NFL_SAME_GAME,
     OTHER_SAME_GAME,
+    QUOTE_DEADLINE_EXCEEDED,
+    QUOTE_LATENCY_EXCEEDED,
     PARAMS_STALE,
     PARAMS_UNAVAILABLE,
     UNRESOLVED_LEG,
@@ -46,17 +50,42 @@ OTHER_GAME_TOTAL = position(f"{GAME2}-total-46pt5", 0)
 POLITICS = position("will-the-us-invade-iran-before-2027", 0)
 
 
-def build(books=None, *, params_dir=PARAMS_DIR, model_config=None):
+def build(books=None, *, params_dir=PARAMS_DIR, model_config=None, config=None):
     catalog = ComboMarketCatalog()
     catalog.merge(parse_catalog_page(catalog_payload()))
     books = books or StubBooks(now_ms=NOW_MS, kickoffs={"4384970": KICKOFF2, "4384971": KICKOFF2,
                                                         "4384972": KICKOFF2})
-    return NflLivePricer(catalog, books, ParamsProvider(params_dir), model_config=model_config)
+    return NflLivePricer(catalog, books, ParamsProvider(params_dir),
+                         model_config=model_config, config=config)
 
 
 def price(pricer, *positions, side="YES", direction="BUY", qty="25", cash=None, now=NOW):
     return pricer.price(LiveRfq(rfq_id="RFQ-1", leg_position_ids=tuple(positions), side=side,
                                 direction=direction, qty_decimal=qty, cash_order_qty=cash), now=now)
+
+
+def test_quote_declines_when_deadline_is_already_past_or_expires_during_pricing():
+    positions = (ML_HOME, FAV_COVER)
+    expired = build().price(LiveRfq("late", positions, qty_decimal="25",
+                                   submission_deadline_ms=NOW_MS - 1), now=NOW)
+    assert expired.reason_code == QUOTE_DEADLINE_EXCEEDED
+
+    class SlowBooks(StubBooks):
+        def books(self, legs):
+            time.sleep(0.01)
+            return super().books(legs)
+
+    slow = build(SlowBooks(now_ms=NOW_MS))
+    finished_late = slow.price(LiveRfq("slow", positions, qty_decimal="25",
+                                       submission_deadline_ms=NOW_MS + 1), now=NOW)
+    assert finished_late.reason_code == QUOTE_DEADLINE_EXCEEDED
+    assert finished_late.bid is None and finished_late.ask is None
+
+    over_budget = build(SlowBooks(now_ms=NOW_MS),
+                        config=PipelineConfig(quote_latency_budget_ms=1)).price(
+        LiveRfq("cold", positions, qty_decimal="25"), now=NOW)
+    assert over_budget.reason_code == QUOTE_LATENCY_EXCEEDED
+    assert over_budget.bid is None and over_budget.ask is None
 
 
 # -- fair value -------------------------------------------------------------
