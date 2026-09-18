@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from combo_mm.risk_config import RiskConfig
+
 
 @dataclass
 class PipelineConfig:
@@ -49,6 +51,7 @@ class PipelineConfig:
     initial_capital: float = 50000.0        # total exposure bound
     stale_rfq_ms: int = 60000              # RFQ staleness cutoff (exchange time)
     params_version: str = "unversioned"    # pricing params version tag
+    risk: RiskConfig = field(default_factory=RiskConfig)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -57,6 +60,8 @@ class PipelineConfig:
         """Validate every field; raise ValueError/TypeError on bad config."""
         if not isinstance(self.paper_mode, bool):
             raise TypeError("paper_mode must be bool")
+        if not isinstance(self.risk, RiskConfig):
+            raise TypeError("risk must be RiskConfig")
         for name in ("staleness_ms", "backoff_initial_ms", "backoff_max_ms"):
             value = getattr(self, name)
             if not isinstance(value, int) or value <= 0:
@@ -123,6 +128,9 @@ class PipelineConfig:
         unknown = set(data) - known
         if unknown:
             raise TypeError(f"unknown config fields: {sorted(unknown)}")
+        data = dict(data)
+        if isinstance(data.get("risk"), dict):
+            data["risk"] = RiskConfig(**data["risk"])
         return cls(**data)
 
     def startup_banner(self) -> str:
