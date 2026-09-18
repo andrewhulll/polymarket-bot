@@ -1,5 +1,6 @@
 """Live feed -> screen -> pricing model -> logged bid/ask, end to end (paper only)."""
 import inspect
+import json
 import threading
 import time
 
@@ -75,6 +76,14 @@ def test_a_quotable_rfq_is_priced_and_its_bid_ask_logged():
     assert row["params_version"].startswith("nfl_2026_w02.json@")
     assert row["detail"]["games"][0]["game"] == GAME
     assert row["detail"]["explanations"]
+    shadow = monitor.store.get_shadow_quotes()
+    assert len(shadow) == 1
+    assert shadow[0]["model_version"] == row["model_version"]
+    assert shadow[0]["params_version"] == row["params_version"]
+    assert shadow[0]["buy_price"] == row["ask"]
+    decisions = monitor.store.get_shadow_decisions()
+    assert len(decisions) == 1 and decisions[0]["decision"] == "QUOTED_OK"
+    assert json.loads(shadow[0]["input_snapshot_json"])["fair_yes"] == row["detail"]["fair_yes"]
 
 
 def test_rfqs_the_screen_rejects_are_never_priced():

@@ -15,6 +15,7 @@ material) instead of raised.
 from __future__ import annotations
 
 import logging
+import json
 import time
 from collections import OrderedDict
 from dataclasses import replace
@@ -29,7 +30,7 @@ from combo_mm.events import NormalizedEvent
 from combo_mm.live_quoter import LiveQuoter
 from combo_mm.nfl.live_pricer import LiveRfq
 from combo_mm.normalize import NormalizeError, normalize
-from combo_mm.pricer import Pricer
+from combo_mm.pricer import Pricer, V1NaivePricer
 from combo_mm.quote_selections import QuoteSelectionStore
 from combo_mm.reference import ReferenceCache
 from combo_mm.rfq_screen import screen_legs
@@ -92,8 +93,9 @@ class LiveMonitor:
         self.store = store
         self.books = LegBookCache(staleness_ms=self.config.staleness_ms)
         reference = ReferenceCache(_NoCombos(), ttl_s=self.config.reference_ttl_s)  # type: ignore[arg-type]
-        self.engine = ShadowQuotingEngine(store, self.books, reference, self.config,
-                                          pricer=pricer)
+        self.engine = ShadowQuotingEngine(
+            store, self.books, reference, self.config,
+            pricer=pricer or (V1NaivePricer(resolver=catalog.lookup) if catalog else None))
         self.source_label = source_label
         self.polls = 0
         self.events_applied = 0
@@ -106,6 +108,15 @@ class LiveMonitor:
         self.catalog = catalog
         self.selections = selections
         self.quoter = quoter
+        if quoter is not None:
+            previous_decision = quoter.on_decision
+
+            def record_model_decision(rfq, quote, started, decided):
+                self._record_model_decision(rfq, quote, started, decided)
+                if previous_decision is not None:
+                    previous_decision(rfq, quote, started, decided)
+
+            quoter.on_decision = record_model_decision
         self.recent_trades: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.accepted_recorded = 0
         self._rescreened_version = -1
@@ -172,6 +183,32 @@ class LiveMonitor:
         if self.quoter is None or rfq is None or not rfq.leg_position_ids:
             return
         self.quoter.submit(rfq, trigger)
+
+    def _record_model_decision(self, rfq: LiveRfq, quote: Any,
+                               started: datetime, decided: datetime) -> None:
+        """Put the model's result in the same shadow tables the HTML UI reads."""
+        self.store.record_shadow_decision(
+            rfq_id=rfq.rfq_id, decision=quote.reason_code,
+            reason=quote.reason_detail or f"model={quote.model_version}",
+            fair_price=quote.fair, buy_price=quote.ask,
+            sell_price=quote.bid, buy_qty=quote.ask_qty,
+            sell_qty=quote.bid_qty, spread_bps=quote.spread_bps_total,
+            components_json=json.dumps(quote.components, sort_keys=True),
+            ts=decided.isoformat())
+        if quote.quoted:
+            self.store.record_shadow_draft(
+                quote_id=f"paper:{rfq.rfq_id}:model", rfq_id=rfq.rfq_id,
+                fair=quote.fair, buy_price=quote.ask or 0,
+                sell_price=quote.bid or 0, buy_qty=quote.ask_qty or "0",
+                sell_qty=quote.bid_qty or "0", model_version=quote.model_version,
+                params_version=quote.params_version or "unversioned",
+                input_snapshot_json=json.dumps(quote.to_dict(), sort_keys=True),
+                decided_by="nfl-live-model", decided_at=decided.isoformat())
+        if rfq.received_at:
+            self.store.record_live_latency(
+                rfq_id=rfq.rfq_id, posted_at=rfq.received_at,
+                started_at=started.isoformat(), decided_at=decided.isoformat(),
+                quoted=quote.quoted)
 
     # -- screening ------------------------------------------------------------
     def _screen_new_rfq(self, raw: Dict[str, Any], rfq_id: str) -> None:
@@ -270,6 +307,10 @@ class LiveMonitor:
         the dispatch path. A posted time we can't parse skips the sample
         (nothing to measure against).
         """
+        if self.quoter is not None:
+            # The model worker records the shadow outcome when pricing ends.
+            # Running V1 here would log a second, misleading naive decision.
+            return
         draft = self.engine.maybe_quote(event)
         posted_ms = _iso_to_ms(event.event_at)
         if posted_ms <= 0 or not event.rfq_id:

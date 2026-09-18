@@ -142,9 +142,7 @@ class RfqCapture:
                 buy_qty=quote.ask_qty or "0", sell_qty=quote.bid_qty or "0",
                 model_version=quote.model_version,
                 params_version=quote.params_version,
-                input_snapshot_json=json.dumps({"fair_value": quote.fair,
-                                                "naive": quote.naive,
-                                                "components": quote.components}),
+                input_snapshot_json=json.dumps(quote.to_dict(), sort_keys=True),
                 decided_by="headless-paper", decided_at=decided.isoformat())
         if rfq.received_at:
             self.store.record_live_latency(

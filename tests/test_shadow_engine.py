@@ -21,7 +21,8 @@ from combo_mm.eligibility import (
 )
 from combo_mm.engine import PaperModeError
 from combo_mm.events import NormalizedEvent
-from combo_mm.pricer import PricerResult, V1NaivePricer
+from combo_mm.pricer import (PricerResult, V1NaivePricer, SAME_GAME_NESTED,
+                             SAME_GAME_TOO_LARGE, UNRESOLVED_LEG)
 from combo_mm.pricing import (
     CROSSED_BOOK,
     MISSING_LEG,
@@ -45,6 +46,8 @@ from combo_mm.risk import (
 )
 from combo_mm.store import EventStore
 from combo_mm.stream import SimulatedTransport
+from combo_mm.combo_markets import ComboMarketCatalog, parse_catalog_page
+from tests.nfl_live_fixtures import GAME, catalog_payload, position
 
 
 def _run(**kw):
@@ -57,6 +60,27 @@ def _run(**kw):
 def _dump_quotes(store):
     rows = [dict(r) for r in store.list_quotes()]
     return json.dumps(rows, sort_keys=True, default=str)
+
+
+def test_v1_catalog_guardrail_widens_and_declines_nested_legs():
+    catalog = ComboMarketCatalog()
+    catalog.merge(parse_catalog_page(catalog_payload()))
+    ml = position(GAME, 1)
+    spread = position(f"{GAME}-spread-home-4pt5", 0)
+    total = position(f"{GAME}-total-54pt5", 0)
+    def leg(symbol):
+        return LegMarkInput(symbol=symbol, side="YES", bid=0.49, ask=0.51,
+                            bid_size=500, ask_size=500)
+    guarded = V1NaivePricer(resolver=catalog.lookup)
+    widened = guarded.price([leg(ml), leg(total)], rfq_id="R", qty_decimal="10")
+    baseline = V1NaivePricer().price([leg(ml), leg(total)], rfq_id="R", qty_decimal="10")
+    assert widened.quotable
+    assert widened.extra["components"]["same_game_haircut_bps"] == 150
+    assert widened.extra["spread_bps_total"] == baseline.extra["spread_bps_total"] + 150
+    assert guarded.price([leg(ml), leg(spread)], rfq_id="R", qty_decimal="10").unquotable_reason == SAME_GAME_NESTED
+    assert V1NaivePricer(resolver=catalog.lookup, same_game_max_qty=5).price(
+        [leg(ml), leg(total)], rfq_id="R", qty_decimal="10").unquotable_reason == SAME_GAME_TOO_LARGE
+    assert guarded.price([leg(ml), leg("unknown")], rfq_id="R", qty_decimal="10").unquotable_reason == UNRESOLVED_LEG
 
 
 # 1. determinism ------------------------------------------------------------

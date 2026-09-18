@@ -3,8 +3,8 @@
 Paper-trading combo RFQ pipeline for Polymarket, built for Totalis (a prediction-markets startup).
 Listens for combo RFQs, stores raw messages and normalized records, prices NFL same-game combos
 with a joint correlation model (`combo_mm/nfl/`), shadow-quotes without ever submitting, and
-replays sessions deterministically. The minimal V1 independent-leg model remains as the fallback
-pricer and the naive baseline the correlation model is scored against. Live sources are the
+replays sessions deterministically. The minimal V1 independent-leg model remains in offline
+replay and supplies the naive baseline the correlation model is scored against. Live sources are the
 receive-only international quoter gateway and US Retail REST polling; the Exchange gRPC adapter
 is stubbed for later.
 
@@ -77,7 +77,7 @@ One row per brief step, kept current — if a PR changes a step's status, update
 | Brief step | Status | Where (modules) | Tracking |
 |---|---|---|---|
 | 1. RFQ listener and storage | Done | `consumer.py`, `store.py`, `normalize.py`, `recovery.py` | #1 |
-| 2. Pricing and correlation | Done on the live path; not on the shadow-engine path | `nfl/live_pricer.py`, `live_quoter.py`; `ShadowQuotingEngine` still defaults to `V1NaivePricer` (`engine.py`) | #2 |
+| 2. Pricing and correlation | NFL live capture and HTML dashboard use the model; offline shadow replay uses guarded V1 | `nfl/live_pricer.py`, `live_quoter.py`, `live_monitor.py`, `pricer.py` | #2 |
 | 3. Inventory and risk ($50k capital) | Hard caps only | `risk.py` `ConservativeRiskCheck`; inventory never populated | #3 |
 | 4. Shadow quoting | Done | `engine.py`, `eligibility.py` | #4 |
 | 5. Backtest | Partial — historical backtest + correlation sensitivity + settlement scoring done; unified runner over the simulated RFQ dataset missing | `nfl/synthetic_backtest.py`, `scripts/nfl_backtest.py`, `docs/settlement-tracking.md` | #5 |
@@ -117,7 +117,7 @@ One row per brief step, kept current — if a PR changes a step's status, update
 | `auth.py` | Private-Key-JWT → Auth0 structure for the Exchange API (RS256, 3-minute refresh, key rotation, gRPC error mapping). Stubbed — no network, no credentials. |
 | `retail.py` | `RetailPollingSource`: Retail REST polling adapter (RFQ list/detail diffing, leg book/BBO refresh, beta-gate fallback). See “Retail live data”. |
 | `pricing.py` | Minimal V1 independent-leg pricer (pure, no I/O): bounded microprice / midpoint leg marks, `fair = product(q_i)`, spread = base edge + uncertainty + depth + event risk + buffer, tick rounding, side `"0"` suppression, structured reason codes. |
-| `pricer.py` | Pricer seam (issue #2): `Pricer` protocol + `PricerResult`; `V1NaivePricer` adapts `price_combo`. The MVN pricer implements the same interface with zero engine changes. |
+| `pricer.py` | Offline shadow-engine seam: `Pricer` protocol + `PricerResult`; `V1NaivePricer` uses the independent product with a catalog-backed same-game guardrail. Live NFL RFQs use `NflLivePricer`, whose catalog and market-data lookups do not fit this pure seam. |
 | `risk.py` | Risk seam (issue #3): `RiskCheck` protocol + `InventoryState` / `RiskVerdict`; `ConservativeRiskCheck` enforces per-RFQ / per-game / capital hard caps (shrink or reject). The full risk module replaces it behind the same interface. |
 | `eligibility.py` | Pure pre-pricing eligibility filter: event type → RFQ present → status terminal → legs present → exchange-time staleness. Skip reasons `SKIP_NO_RFQ` / `SKIP_RFQ_CLOSED` / `SKIP_NO_LEGS` / `SKIP_STALE_RFQ`. |
 | `engine.py` | Shadow quoting engine (issue #4): eligibility → pricer → risk → two-sided draft quote, stored in `quotes` (`status='shadow'`, `origin='shadow'`) with a full reproducible input snapshot. Paper-only: no call path to any outbound RPC, `PaperModeError` unless `paper_mode=True`. |
@@ -766,12 +766,26 @@ Declines are logged with the same detail as quotes: `UNRESOLVED_LEG`,
 `UNSUPPORTED_LEG`, `OTHER_SAME_GAME`, `NO_NFL_SAME_GAME`, `GAME_STARTED`,
 `MISSING_CALIBRATION_MARKET`, `CONTRADICTORY_LEGS` (e.g. "Lions win *and* Bills
 cover −4.5"), `MODEL_MARKET_DISAGREE`, `LOW_CONFIDENCE`, `PARAMS_STALE`,
-`PARAMS_UNAVAILABLE`, plus the V1 book checks (`MISSING_LEG`, `STALE_LEG`).
+`PARAMS_UNAVAILABLE`, `QUOTE_DEADLINE_EXCEEDED`, `QUOTE_LATENCY_EXCEEDED`,
+plus the V1 book checks (`MISSING_LEG`, `STALE_LEG`).
 
 Pricing runs on its own thread (`combo_mm/live_quoter.py`) with a bounded
-queue, so the ~200 RFQ/s feed is never blocked by a book fetch; warm pricing of
-an already-calibrated game takes ~2 ms, a cold game ~1.5 s (two HTTP round
-trips). **Paper only**: there is no code path from the pricer to a quote
+queue, so the ~200 RFQ/s feed is never blocked by a book fetch. The HTML
+dashboard reads model decisions and model-versioned shadow drafts written by
+the headless capture process. The legacy live monitor uses the same model
+result when a `LiveQuoter` is present; it does not run V1 on that RFQ as well.
+Offline replay still uses `ShadowQuotingEngine` and guarded V1 because it has
+no live catalog or market-data source. Its catalog guardrail widens same-game
+ML/total and spread/total quotes and declines nested ML/spread pairs.
+
+`scripts/bench_pricer.py` measures the network-free ten-leg joint calculation:
+on the development machine, 1,000 samples gave cold-model p99 0.811 ms and
+warm-model p99 0.056 ms. This excludes the Gamma and CLOB requests. A cold
+game can take about 1.5 s; quotes finishing after the RFQ deadline are
+declined as `QUOTE_DEADLINE_EXCEEDED`, and quotes over the configured
+`quote_latency_budget_ms` are declined as `QUOTE_LATENCY_EXCEEDED`.
+End-to-end wait and compute latency is
+recorded in `quote_latency` for live capture. **Paper only**: there is no code path from the pricer to a quote
 submission, and `tests/test_live_quoter.py` asserts that structurally.
 
 The dashboard's **Pricing & quoting** tab lists these quotes (naive vs model
