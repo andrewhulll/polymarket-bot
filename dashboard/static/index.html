@@ -19,7 +19,7 @@
     <button data-tab="engine">Engine</button>
     <button data-tab="nfl">NFL correlation</button>
   </nav>
-  <div class="meta"><span id="killswitch-badge" class="hidden">KILL SWITCH</span><span id="updated">—</span><span id="paused" class="hidden">paused</span></div>
+  <div class="meta"><span id="killswitch-badge" class="hidden">KILL SWITCH</span><label class="caption" style="margin:0">source <select id="data-source" title="data behind the live tabs"></select></label><span id="updated">—</span><span id="paused" class="hidden">paused</span></div>
 </header>
 <main>
   <section id="tab-rfqs" class="tab active">
@@ -98,6 +98,7 @@
       <span class="spacer"></span>
       <button id="nfl-run-params">Refresh params</button>
       <button id="nfl-run-backtest">Run backtest</button>
+      <button id="nfl-run-week1" title="replay the backtest week's combos as RFQs into a separate database">Run Week 1 backtest</button>
     </div>
     <div id="nfl-filters" class="filterbar"></div>
     <div id="nfl-notes"></div>
