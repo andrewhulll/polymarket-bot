@@ -130,14 +130,14 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
 
 
 def _fill_candidates(conn: sqlite3.Connection) -> list[dict]:
-    """Quoted RFQs that could have filled against the market reference.
+    """Quoted RFQs scored as shadow fills.
 
-    The market reference is the observed accepted ``RFQ_TRADE`` price and
-    nothing else: an RFQ with no accepted trade has no market price, so it is
-    not scored as a shadow fill (``_to_fill`` drops it). The leg-implied naive
-    combo price is *our* number, not the market's, so it never stands in here
-    -- the performance page reflects only RFQs that actually traded on the
-    feed. Late (after-deadline) quotes stay in the ledger, flagged on the fill.
+    Every auto-quoted shadow RFQ lands in the ledger. An observed accepted
+    ``RFQ_TRADE`` only *removes* a fill: when the trade price beats our quote
+    (a lower ask when we sell, a higher bid when we buy) we lost the auction.
+    No observed trade means the quote stands as an assumed win -- an
+    optimistic paper assumption, flagged via ``market_source``. Late
+    (after-deadline) quotes stay in the ledger, flagged on the fill.
     """
     return _rows(conn, """
         SELECT p.*,
@@ -175,11 +175,14 @@ def _to_fill(conn: sqlite3.Connection, row: dict) -> dict | None:
         except (ValueError, TypeError):
             pass
     price, market = row["response_price"], row["market_price"]
-    if price is None or market is None:
+    if price is None:
         return None
     action = row["response_action"]
-    if action == "BUY" and price < market or action == "SELL" and price > market:
-        return None
+    if market is not None:
+        # An observed accepted trade beats our quote -> we lost the auction.
+        # No observed trade -> the quote stands as an assumed win.
+        if action == "BUY" and price < market or action == "SELL" and price > market:
+            return None
     qty = float(row["size"] or 0)
     if row["size_unit"] == "notional" and price > 0:
         qty /= price
@@ -203,9 +206,11 @@ def _to_fill(conn: sqlite3.Connection, row: dict) -> dict | None:
             "side": row["side"], "response_action": action,
             "size": row["size"], "size_unit": row["size_unit"],
             "naive": row["naive"], "fair": fair, "our_price": price,
-            "market_price": market, "market_source": row["market_source"],
-            "quote_edge": sign * (market - price),
-            "model_edge": sign * (fair - market) if fair is not None else None,
+            "market_price": market,
+            "market_source": row["market_source"] or "no observed trade",
+            "quote_edge": sign * (market - price) if market is not None else None,
+            "model_edge": (sign * (fair - market)
+                           if fair is not None and market is not None else None),
             "expected_pnl": sign * (float(fair or price) - price) * qty,
             "realized_pnl": sign * (outcome - price) * qty if outcome is not None else None,
             "net_notional": sign * price * qty,
@@ -232,7 +237,8 @@ def fills_count(conn: sqlite3.Connection) -> int:
 
 
 def performance(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Paper fills against observed accepted RFQ trades only."""
+    """Paper fills: every auto-quoted shadow RFQ, minus the ones an observed
+    accepted trade beat."""
     fills = _compute_fills(conn)
     cumulative = exposure = 0.0
     curve = []
