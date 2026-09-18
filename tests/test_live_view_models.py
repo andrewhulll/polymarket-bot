@@ -63,6 +63,7 @@ def test_live_tabs_reconcile_to_one_database(tmp_path):
         assert round(pnl["expected_pnl"], 2) == .50
         assert pnl["realized_pnl"] == 0
         assert pnl["by_game"][0]["game"] == "SEA-ARI"
+        assert pnl["by_market_source"][0]["market_source"] == "accepted trade"
         health = engine_status(conn)
         assert health["health"]["messages_processed"] == 2
         assert health["wait"]["p50"] == 25
@@ -85,3 +86,61 @@ def test_gateway_wakes_headless_consumer_on_frame():
     assert adapter.wait_for_items(0)
     assert len(adapter.poll(datetime.now(timezone.utc))) == 1
     assert not adapter.wait_for_items(0)
+
+
+def test_performance_falls_back_to_naive_market(tmp_path):
+    """No accepted trade observed -> the leg-implied (naive) price is the market.
+
+    Accepted RFQ trades are participant-private on the quoter gateway, so
+    ``live_trades`` stays empty in live operation; fills must still count
+    against the naive price stored at decision time.
+    """
+    path = tmp_path / "capture.db"
+    store = EventStore(str(path))
+    quotes = QuoteSelectionStore(path)
+    posted = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+
+    def add_rfq(rfq_id, response_price, naive):
+        raw = {
+            "event_type": "rfq_created", "rfq_id": rfq_id, "event_id": f"event-{rfq_id}",
+            "symbol": "combo", "createdTime": posted.isoformat(),
+            "updatedTime": posted.isoformat(), "status": "RFQ_STATUS_OPEN",
+            "qtyDecimal": "10", "comboLegs": [
+                {"symbol": "leg-1", "side": "YES"},
+                {"symbol": "leg-2", "side": "YES"}],
+        }
+        assert store.apply(normalize(raw, now=posted))
+        store.upsert_rfq_screen(rfq_id, n_legs=2, n_resolved=2, n_nfl_legs=2,
+                                screen="QUOTABLE", rank=0, catalog_version=1,
+                                checks_json=json.dumps({"known legs": True}))
+        quotes.record_priced_quote({
+            "rfq_id": rfq_id, "priced_at": posted.isoformat(), "status": "QUOTED",
+            "reason_code": "QUOTED_OK", "response_action": "SELL",
+            "response_price": response_price, "size": 10, "size_unit": "shares",
+            "fair": .42, "naive": naive, "side": "YES", "games": [{"game": "SEA-ARI"}],
+            "components": {"base": 5}}, "auto")
+        store.record_shadow_draft(quote_id=f"paper:{rfq_id}:auto", rfq_id=rfq_id,
+                                  buy_price=response_price, sell_price=.45,
+                                  buy_qty="10", sell_qty="10")
+
+    # Our ask .40 beats the naive .45 -> shadow fill, market = naive.
+    add_rfq("rfq-2", .40, .45)
+    # Our ask .50 loses to the naive .45 -> quoted but no fill.
+    add_rfq("rfq-3", .50, .45)
+
+    with connect_readonly(path) as conn:
+        pnl = performance(conn)
+        assert pnl["quoted"] == 2
+        assert pnl["shadow_fills"] == 1
+        assert round(pnl["expected_pnl"], 2) == -.20
+        by_source = pnl["by_market_source"]
+        assert [(b["market_source"], b["shadow_fills"]) for b in by_source] == [
+            ("leg-implied (naive)", 1)]
+        # The detail view agrees on the market price and source.
+        detail = {row["rfq_id"]: row for row in pricing(conn)}
+        assert detail["rfq-2"]["market_price"] == .45
+        assert detail["rfq-2"]["market_source"] == "leg-implied (naive)"
+        assert detail["rfq-2"]["edge_vs_market"] > 0
+        assert detail["rfq-3"]["market_price"] == .45
+    quotes.close()
+    store.close()
