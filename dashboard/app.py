@@ -337,7 +337,7 @@ def _live_status() -> None:
 if run is not None and run["mode"] == "live" and run.get("monitor") is not None:
     _live_status()
 
-view = (st.tabs(["RFQs", "Pricing & quoting", "Performance", "Engine status", "NFL correlation"])
+view = (st.tabs(["RFQs", "Pricing & quoting", "Performance", "Engine status", "NFL correlation", "Risk"])
         if run is None or run["mode"] != "live" else None)
 
 # The NFL correlation view reads offline backtest files and does not need a run.
@@ -1091,6 +1091,48 @@ def _engine_view(r: Dict[str, Any]) -> None:
 
 # The run-dependent views render once a control above has produced a DB (and
 # stay inert in bare mode, ``python -c "import dashboard.app"``).
+def _risk_view(r: Dict[str, Any]) -> None:
+    conn = _connect(r["db_path"])
+    try:
+        st.header("Paper risk")
+        latest = conn.execute(
+            "SELECT * FROM exposure_snapshots WHERE level='portfolio' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+        state = conn.execute(
+            "SELECT state, trigger, ts FROM kill_switch_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if state and state["state"] == "tripped":
+            st.warning(f"Kill switch tripped: {state['trigger']}")
+        else:
+            st.success("Kill switch clear")
+        if latest:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Equity", f"${latest['equity']:,.0f}")
+            c2.metric("Buying power", f"${latest['buying_power']:,.0f}")
+            c3.metric("Pending loss", f"${latest['pending_wcl']:,.0f}")
+            c4.metric("Executed loss", f"${latest['executed_wcl']:,.0f}")
+        games = conn.execute(
+            "SELECT key, pending_wcl, executed_wcl, total_wcl FROM exposure_snapshots "
+            "WHERE level='game' AND id IN "
+            "(SELECT MAX(id) FROM exposure_snapshots WHERE level='game' GROUP BY key) "
+            "ORDER BY total_wcl DESC LIMIT 10").fetchall()
+        st.subheader("Top games by reserved loss")
+        st.dataframe([dict(row) for row in games], hide_index=True, width="stretch")
+        curve = conn.execute(
+            "SELECT ts, pending_wcl, executed_wcl, total_wcl FROM exposure_snapshots "
+            "WHERE level='portfolio' ORDER BY id").fetchall()
+        st.subheader("Exposure over time")
+        if curve:
+            st.line_chart(pd.DataFrame([dict(row) for row in curve]).set_index("ts"))
+        adjustments = conn.execute(
+            "SELECT ts, rfq_id, game_id, action, reason FROM risk_events "
+            "ORDER BY id DESC LIMIT 100").fetchall()
+        st.subheader("Risk decisions")
+        st.dataframe([dict(row) for row in adjustments], hide_index=True, width="stretch")
+    finally:
+        conn.close()
+
+
 if run is not None and run["mode"] == "live" and run.get("db_path"):
     @st.fragment(run_every=0.75 if live_polling else None)
     def _live_readonly_view() -> None:
@@ -1099,7 +1141,7 @@ if run is not None and run["mode"] == "live" and run.get("db_path"):
 elif run is not None and run["mode"] == "live":
     st.info("The headless capture runner will create the live database when it starts.")
 elif run is None or not run.get("db_path"):
-    for tab in view[:4]:
+    for tab in view[:4] + view[5:]:
         with tab:
             st.info(f'Press "Run backtest -- {BACKTEST_LABEL}" for the historical RFQs '
                     'or "Live monitor RFQ feed" to watch the live feed.')
@@ -1112,3 +1154,5 @@ else:
         _performance_view(run)
     with view[3]:
         _engine_view(run)
+    with view[5]:
+        _risk_view(run)

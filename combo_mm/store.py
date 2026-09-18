@@ -198,6 +198,33 @@ class EventStore:
                     event_id TEXT
                 );
 
+                CREATE VIEW IF NOT EXISTS positions AS
+                    SELECT rfq_id, symbol, side, SUM(qty) AS qty,
+                           SUM(qty * price) / NULLIF(SUM(qty), 0) AS avg_price,
+                           MAX(executed_time) AS last_fill
+                    FROM fills GROUP BY rfq_id, symbol, side;
+                CREATE TABLE IF NOT EXISTS risk_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL, rfq_id TEXT, quote_id TEXT, game_id TEXT,
+                    action TEXT NOT NULL, reason TEXT NOT NULL,
+                    detail_json TEXT NOT NULL, policy_version TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS exposure_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id TEXT NOT NULL, ts TEXT NOT NULL,
+                    level TEXT NOT NULL, key TEXT NOT NULL,
+                    pending_wcl REAL NOT NULL, executed_wcl REAL NOT NULL,
+                    total_wcl REAL NOT NULL, equity REAL NOT NULL,
+                    buying_power REAL NOT NULL,
+                    UNIQUE(source_id, level, key)
+                );
+                CREATE TABLE IF NOT EXISTS kill_switch_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL, state TEXT NOT NULL
+                        CHECK (state IN ('tripped', 'reset')),
+                    trigger TEXT NOT NULL, detail_json TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS dropcopy_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     resume_token TEXT
@@ -350,7 +377,11 @@ class EventStore:
                 log.debug("duplicate event ignored: %s", event.event_key)
                 return False
             self._project(cur, event)
-            return True
+        if event.event_type in ("rfq_closed", "rfq_cancelled", "rfq_expired",
+                                "quote_deleted"):
+            from combo_mm.inventory import InventoryProvider
+            InventoryProvider(self).record(event.event_at, f"event:{event.event_key}")
+        return True
 
     def _project(self, cur: sqlite3.Cursor, event: NormalizedEvent) -> None:
         p = event.payload
@@ -790,7 +821,11 @@ class EventStore:
                 (fill_id, rfq_id, quote_id, symbol, side, price, qty,
                  executed_time, source, drop_copy_seq, event_id),
             )
-            return cur.rowcount > 0
+            inserted = cur.rowcount > 0
+        if inserted:
+            from combo_mm.inventory import InventoryProvider
+            InventoryProvider(self).record(executed_time or "", f"fill:{fill_id}")
+        return inserted
 
     # -- Drop Copy resume token ----------------------------------------------------------
     def get_drop_copy_token(self) -> Optional[str]:
@@ -1368,6 +1403,69 @@ class EventStore:
                 (limit,)).fetchall()
             return [dict(r) for r in rows]
 
+    def inventory_rows(self) -> tuple[list[dict], list[dict], list[dict], bool]:
+        """Consistent inputs for a rebuildable inventory snapshot."""
+        with self._lock:
+            rfqs = [dict(r) for r in self._conn.execute(
+                "SELECT rfq_id, symbol, status, updated_time FROM rfq ORDER BY rfq_id")]
+            for rfq in rfqs:
+                rfq["legs"] = [dict(r) for r in self._conn.execute(
+                    "SELECT symbol, side, settlement_price FROM rfq_legs "
+                    "WHERE rfq_id=? ORDER BY rowid",
+                    (rfq["rfq_id"],))]
+            quotes = [dict(r) for r in self._conn.execute(
+                "SELECT quote_id, rfq_id, symbol, status, origin, buy_price, "
+                "sell_price, buy_qty_decimal, sell_qty_decimal, created_time "
+                "FROM quotes ORDER BY rowid")]
+            fills = [dict(r) for r in self._conn.execute(
+                "SELECT fill_id, rfq_id, quote_id, symbol, side, price, qty, "
+                "executed_time FROM fills ORDER BY fill_id")]
+            last = self._conn.execute(
+                "SELECT state FROM kill_switch_events ORDER BY id DESC LIMIT 1").fetchone()
+            return rfqs, quotes, fills, bool(last and last["state"] == "tripped")
+
+    def record_risk_event(self, *, ts: str, rfq_id: str, quote_id: str,
+                          game_id: str, verdict) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO risk_events (ts, rfq_id, quote_id, game_id, action, "
+                "reason, detail_json, policy_version) VALUES (?,?,?,?,?,?,?,?)",
+                (ts, rfq_id, quote_id, game_id, verdict.action, verdict.reason,
+                 json.dumps({"detail": verdict.detail,
+                             "flags": verdict.flags,
+                             "widen_bps": verdict.widen_bps,
+                             "skew_bps": verdict.skew_bps,
+                             "exposure_before": verdict.exposure_before,
+                             "exposure_after": verdict.exposure_after}, sort_keys=True),
+                 "inventory-v1"))
+
+    def record_exposure_snapshot(self, ts: str, source_id: str, snapshot) -> None:
+        rows = []
+        for game in sorted(snapshot.exposures):
+            rows.append((source_id, ts, "game", game,
+                         snapshot.pending.get(game, 0),
+                         snapshot.executed.get(game, 0),
+                         snapshot.exposures[game], snapshot.equity,
+                         snapshot.buying_power))
+        rows.append((source_id, ts, "portfolio", "ALL",
+                     sum(snapshot.pending.values()), sum(snapshot.executed.values()),
+                     sum(snapshot.exposures.values()), snapshot.equity,
+                     snapshot.buying_power))
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO exposure_snapshots "
+                "(source_id,ts,level,key,pending_wcl,executed_wcl,total_wcl,equity,buying_power) "
+                "VALUES (?,?,?,?,?,?,?,?,?)", rows)
+
+    def set_kill_switch(self, halted: bool, *, ts: str, reason: str) -> None:
+        if not reason.strip():
+            raise ValueError("a reason is required")
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO kill_switch_events (ts,state,trigger,detail_json) "
+                "VALUES (?,?,?,?)", (ts, "tripped" if halted else "reset",
+                                     reason, "{}"))
+
     def get_fill_stats(self) -> Dict[str, Any]:
         with self._lock:
             rows = self._conn.execute(
@@ -1454,6 +1552,17 @@ class EventStore:
                     "sell_qty, components_json, ts "
                     "FROM shadow_decisions ORDER BY rfq_id, ts, id"),
                 "drop_copy_token": self.get_drop_copy_token(),
+                "risk_events": rows(
+                    "SELECT ts, rfq_id, quote_id, game_id, action, reason, "
+                    "detail_json, policy_version FROM risk_events "
+                    "ORDER BY ts, rfq_id, id"),
+                "exposure_snapshots": rows(
+                    "SELECT source_id, ts, level, key, pending_wcl, executed_wcl, "
+                    "total_wcl, equity, buying_power FROM exposure_snapshots "
+                    "ORDER BY source_id, level, key"),
+                "kill_switch_events": rows(
+                    "SELECT ts, state, trigger, detail_json FROM kill_switch_events "
+                    "ORDER BY ts, id"),
             }
         canonical = json.dumps(snapshot, sort_keys=True,
                                separators=(",", ":"), default=str)

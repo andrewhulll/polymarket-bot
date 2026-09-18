@@ -1,4 +1,4 @@
-"""Risk seam (issue #3): conservative placeholder behind the interface.
+"""Pure risk decisions for paper quotes.
 
 The shadow quoting engine (:mod:`combo_mm.engine`) risk-checks exclusively
 through the :class:`RiskCheck` protocol below. The full risk module
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Protocol
+from typing import Dict, Protocol, Optional, Tuple
 
 from combo_mm.pricer import PricerResult
 
@@ -27,29 +27,53 @@ __all__ = [
     "RISK_SIZE_REDUCED",
     "RISK_GAME_EXPOSURE",
     "RISK_CAPITAL",
+    "RISK_WIDEN", "RISK_SKEW", "RISK_LIMIT_MARKET",
+    "RISK_LIMIT_TEAM", "RISK_LIMIT_PORTFOLIO", "RISK_KILL_SWITCH",
 ]
 
 RISK_OK = "RISK_OK"
 RISK_SIZE_REDUCED = "RISK_SIZE_REDUCED"
 RISK_GAME_EXPOSURE = "RISK_GAME_EXPOSURE"
 RISK_CAPITAL = "RISK_CAPITAL"
+RISK_WIDEN = "RISK_WIDEN"
+RISK_SKEW = "RISK_SKEW"
+RISK_LIMIT_MARKET = "RISK_LIMIT_MARKET"
+RISK_LIMIT_TEAM = "RISK_LIMIT_TEAM"
+RISK_LIMIT_PORTFOLIO = "RISK_LIMIT_PORTFOLIO"
+RISK_KILL_SWITCH = "RISK_KILL_SWITCH"
 
 
 @dataclass(frozen=True)
 class InventoryState:
     """Point-in-time inventory for the risk check (read-only here).
 
-    ``exposures`` maps a game key (combo symbol) to its current notional
-    exposure. Issue #3 owns updating this; the conservative check only
-    reads it.
+    ``exposures`` maps NFL game ids (or a fallback combo symbol) to
+    conservative worst-case loss. Pending and executed are separate so
+    callers can display and audit each source of capital use.
     """
 
     exposures: Dict[str, float] = field(default_factory=dict)
     capital: float = 50000.0
+    pending: Dict[str, float] = field(default_factory=dict)
+    executed: Dict[str, float] = field(default_factory=dict)
+    markets: Dict[str, float] = field(default_factory=dict)
+    teams: Dict[str, float] = field(default_factory=dict)
+    net_by_game: Dict[str, float] = field(default_factory=dict)
+    equity: float = 50000.0
+    buying_power: float = 50000.0
+    realized_pnl: float = 0.0
+    kill_switch: bool = False
+    as_of: str = ""
 
     def to_snapshot(self) -> dict:
         """JSON-serializable snapshot for the draft's input snapshot."""
-        return {"exposures": dict(self.exposures), "capital": self.capital}
+        return {"exposures": dict(self.exposures), "capital": self.capital,
+                "pending": dict(self.pending), "executed": dict(self.executed),
+                "markets": dict(self.markets), "teams": dict(self.teams),
+                "net_by_game": dict(self.net_by_game),
+                "equity": self.equity, "buying_power": self.buying_power,
+                "realized_pnl": self.realized_pnl,
+                "kill_switch": self.kill_switch, "as_of": self.as_of}
 
 
 @dataclass(frozen=True)
@@ -61,6 +85,14 @@ class RiskVerdict:
     adjusted_sell_qty: str
     reason: str                        # RISK_OK / RISK_SIZE_REDUCED / ...
     detail: dict = field(default_factory=dict)
+    action: str = "quote"
+    adjusted_buy_price: Optional[float] = None
+    adjusted_sell_price: Optional[float] = None
+    widen_bps: float = 0.0
+    skew_bps: float = 0.0
+    flags: Tuple[str, ...] = ()
+    exposure_before: dict = field(default_factory=dict)
+    exposure_after: dict = field(default_factory=dict)
 
 
 class RiskCheck(Protocol):
@@ -140,13 +172,14 @@ class ConservativeRiskCheck(RiskCheck):
         detail["game_exposure_after"] = game_exposure
         if game_exposure > self._max_per_game_notional:
             return RiskVerdict(False, buy_qty, sell_qty,
-                               RISK_GAME_EXPOSURE, detail)
+                               RISK_GAME_EXPOSURE, detail, action="reject")
 
         total_exposure = (sum(inventory.exposures.values())
                           + effective_notional)
         detail["total_exposure_after"] = total_exposure
         if total_exposure > self._initial_capital:
             return RiskVerdict(False, buy_qty, sell_qty,
-                               RISK_CAPITAL, detail)
+                               RISK_CAPITAL, detail, action="reject")
 
-        return RiskVerdict(True, buy_qty, sell_qty, reason, detail)
+        return RiskVerdict(True, buy_qty, sell_qty, reason, detail,
+                           action="reduce" if reason == RISK_SIZE_REDUCED else "quote")

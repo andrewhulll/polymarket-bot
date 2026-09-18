@@ -29,7 +29,7 @@ import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from combo_mm.books import LegBookCache
 from combo_mm.config import PipelineConfig
@@ -42,7 +42,11 @@ from combo_mm.risk import (
     ConservativeRiskCheck,
     InventoryState,
     RiskCheck,
+    RiskVerdict,
+    RISK_KILL_SWITCH,
 )
+from combo_mm.inventory import InventoryProvider
+from combo_mm.risk_policy import InventoryRiskCheck
 from combo_mm.store import EventStore
 
 log = logging.getLogger(__name__)
@@ -55,7 +59,7 @@ __all__ = [
     "DECIDED_BY",
 ]
 
-ENGINE_VERSION = "engine-v1"
+ENGINE_VERSION = "engine-v2"
 DECIDED_BY = "shadow-engine"
 
 
@@ -121,6 +125,8 @@ class ShadowQuotingEngine:
         risk: Optional[RiskCheck] = None,
         params_version: Optional[str] = None,
         inventory: Optional[InventoryState] = None,
+        inventory_provider: Optional[Callable[..., InventoryState]] = None,
+        game_resolver: Optional[Callable[[str], Optional[str]]] = None,
     ) -> None:
         if config.paper_mode is not True:
             raise PaperModeError(
@@ -138,19 +144,22 @@ class ShadowQuotingEngine:
         self._risk = (
             risk
             if risk is not None
-            else ConservativeRiskCheck(
+            else (InventoryRiskCheck(config.risk) if config.risk.policy == "inventory"
+                  else ConservativeRiskCheck(
                 max_per_rfq_notional=config.max_per_rfq_notional,
                 max_per_game_notional=config.max_per_game_notional,
                 initial_capital=config.initial_capital,
-            )
+            ))
         )
         self._params_version = (
             params_version if params_version is not None
             else config.params_version
         )
-        self._inventory = (
-            inventory if inventory is not None else InventoryState()
-        )
+        self._inventory = inventory
+        self._inventory_provider = (inventory_provider if inventory_provider is not None
+                                    else InventoryProvider(store, capital=config.initial_capital,
+                                                           game_resolver=game_resolver))
+        self._game_resolver = game_resolver
 
     # -- main entry ------------------------------------------------------
     def maybe_quote(self, event: NormalizedEvent) -> Optional[DraftQuote]:
@@ -218,8 +227,23 @@ class ShadowQuotingEngine:
 
         # (4) risk -------------------------------------------------------
         notional = self._notional(result)
-        verdict = self._risk.check(
-            result, notional, self._inventory, rfq.get("symbol") or "")
+        inventory = (self._inventory if self._inventory is not None else
+                     self._inventory_provider(event.event_at))
+        game_key, game_source = self._game_key(rfq, result)
+        result.extra.setdefault("symbol", rfq.get("symbol") or game_key)
+        result.extra.setdefault("markets", tuple(str(leg["symbol"])
+                                                  for leg in rfq.get("legs", [])))
+        nfl_legs = [str(leg.get("symbol", "")) for leg in rfq.get("legs", [])
+                    if str(leg.get("symbol", "")).startswith("NFL-")]
+        if nfl_legs:
+            result.extra.setdefault("teams", tuple(nfl_legs[0].split("-")[3:5]))
+        verdict = (RiskVerdict(False, "0", "0", RISK_KILL_SWITCH,
+                               {"game_key": game_key}, action="reject")
+                   if inventory.kill_switch or self._config.risk.risk_halt
+                   else self._risk.check(result, notional, inventory, game_key))
+        verdict.detail.setdefault("game_key_source", game_source)
+        self._store.record_risk_event(ts=event.event_at, rfq_id=result.rfq_id,
+                                      quote_id="", game_id=game_key, verdict=verdict)
         if not verdict.ok:
             self._record_decision(
                 event, rfq_id=result.rfq_id, decision=verdict.reason,
@@ -233,7 +257,7 @@ class ShadowQuotingEngine:
 
         # (5) draft quote ------------------------------------------------
         draft = self._build_draft(event, rfq, result, verdict, inputs,
-                                  notional)
+                                  notional, inventory)
 
         # (6) persist ----------------------------------------------------
         self._store.record_shadow_draft(
@@ -252,6 +276,8 @@ class ShadowQuotingEngine:
             decided_by=draft.decided_by,
             decided_at=draft.decided_at,
         )
+        if hasattr(self._inventory_provider, "record") and self._inventory is None:
+            self._inventory_provider.record(event.event_at, f"draft:{draft.quote_id}")
         extra = result.extra
         self._record_decision(
             event, rfq_id=draft.rfq_id, decision=QUOTED_OK,
@@ -276,6 +302,26 @@ class ShadowQuotingEngine:
         return draft
 
     # -- helpers ----------------------------------------------------------
+    def _game_key(self, rfq: Dict[str, Any], result: PricerResult) -> tuple[str, str]:
+        explicit = result.extra.get("game_id")
+        if explicit:
+            return str(explicit), "pricer"
+        per_game = result.extra.get("per_game")
+        if isinstance(per_game, dict) and len(per_game) == 1:
+            return str(next(iter(per_game))), "pricer"
+        if self._game_resolver:
+            games = {self._game_resolver(str(leg["symbol"]))
+                     for leg in rfq.get("legs", [])}
+            games.discard(None)
+            if len(games) == 1:
+                return str(next(iter(games))), "registry"
+        heads = {"-".join(str(leg["symbol"]).split("-")[:5])
+                 for leg in rfq.get("legs", [])
+                 if str(leg.get("symbol", "")).startswith("NFL-")}
+        if len(heads) == 1:
+            return next(iter(heads)), "leg_symbols"
+        return str(rfq.get("symbol") or ""), "combo_symbol_fallback"
+
     def _leg_inputs(self, rfq: Dict[str, Any],
                     now_ms: int) -> List[LegMarkInput]:
         """Build pricer inputs from the RFQ's legs and book snapshots."""
@@ -320,7 +366,7 @@ class ShadowQuotingEngine:
     def _build_draft(self, event: NormalizedEvent, rfq: Dict[str, Any],
                      result: PricerResult, verdict: Any,
                      inputs: List[LegMarkInput],
-                     notional: float) -> DraftQuote:
+                     notional: float, inventory: InventoryState) -> DraftQuote:
         extra = result.extra
         # Deterministic quote id: per-RFQ draft sequence. Identical across
         # replays because the count only depends on this run's own drafts.
@@ -338,8 +384,10 @@ class ShadowQuotingEngine:
             "naive_product": result.naive_product,
             "corr_adjustment_bps": result.corr_adjustment_bps,
             "confidence": result.confidence,
-            "buy_price": extra.get("buy_price"),
-            "sell_price": extra.get("sell_price"),
+            "buy_price": (verdict.adjusted_buy_price if verdict.adjusted_buy_price is not None
+                          else extra.get("buy_price")),
+            "sell_price": (verdict.adjusted_sell_price if verdict.adjusted_sell_price is not None
+                           else extra.get("sell_price")),
             "requested_buy_qty": extra.get("buy_qty"),
             "requested_sell_qty": extra.get("sell_qty"),
             "buy_qty": verdict.adjusted_buy_qty,
@@ -347,9 +395,13 @@ class ShadowQuotingEngine:
             "risk_reason": verdict.reason,
             "requested_notional": notional,
             "risk_verdict_detail": verdict.detail,
+            "risk_action": verdict.action,
+            "risk_flags": verdict.flags,
+            "exposure_before": verdict.exposure_before,
+            "exposure_after": verdict.exposure_after,
             "model_version": result.model_version,
             "params_version": result.params_version,
-            "inventory": self._inventory.to_snapshot(),
+            "inventory": inventory.to_snapshot(),
             "spread_knobs": {
                 "base_edge_bps": cfg.base_edge_bps,
                 "uncertainty_per_leg_bps": cfg.uncertainty_per_leg_bps,
@@ -379,8 +431,10 @@ class ShadowQuotingEngine:
             status="shadow",
             origin="shadow",
             fair=result.fair_value,
-            buy_price=float(extra.get("buy_price") or 0.0),
-            sell_price=float(extra.get("sell_price") or 0.0),
+            buy_price=float(verdict.adjusted_buy_price if verdict.adjusted_buy_price is not None
+                            else extra.get("buy_price") or 0.0),
+            sell_price=float(verdict.adjusted_sell_price if verdict.adjusted_sell_price is not None
+                             else extra.get("sell_price") or 0.0),
             buy_qty=verdict.adjusted_buy_qty,
             sell_qty=verdict.adjusted_sell_qty,
             expected_edge_bps=float(extra.get("expected_edge_bps") or 0.0),
