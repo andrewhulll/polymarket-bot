@@ -101,10 +101,11 @@ def main(argv=None) -> int:
         print(bt.score_table(combos[~combos["nested"].astype(bool)], bt.prob_columns(config)).round(5).to_string(index=False))
         print(f"By family ({config.primary_model}):")
         print(bt.group_table(combos, "family", primary).round(4).to_string(index=False))
-        print(f"Sensitivity to correlation ({config.scaled_model}; spread x total + ML x total):")
-        cross = combos[combos["family"].isin(["spread x total", "ML x total"])]
+        print(f"Sensitivity to correlation ({config.scaled_model}; market_lift price; deployed combos -- "
+              f"{', '.join(bt.DEPLOYED_FAMILIES)}):")
+        cross = combos[bt.deployed_mask(combos)]
         print(bt.sensitivity_table(cross, config.corr_scales, config.scaled_model,
-                                   config.edge_threshold).round(4).to_string(index=False))
+                                   config.edge_threshold, use_lift=True).round(4).to_string(index=False))
         games_split = out.games[out.games["split"] == split]
         print("Corr(favorite margin, total) by spread bucket:")
         print(bt.spread_bucket_structure(games_split).round(3).to_string(index=False))

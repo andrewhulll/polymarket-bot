@@ -58,8 +58,9 @@ from combo_mm.store import EventStore
 from combo_mm.config import PipelineConfig
 from combo_mm.leg_books import LiveLegBooks
 from combo_mm.live_quoter import LiveQuoter
-from combo_mm.nfl.live_pricer import NflLivePricer, LiveRfq
+from combo_mm.nfl.live_pricer import NflLivePricer, NflLivePricerConfig, LiveRfq
 from combo_mm.nfl.params_provider import ParamsProvider
+from combo_mm.nfl.tuning import SELECTION_PATH, load_selection
 from combo_mm.quote_selections import QuoteSelectionStore
 from combo_mm.capture_process import CaptureLock
 
@@ -68,6 +69,20 @@ log = logging.getLogger("capture_live_rfqs")
 # Keep catalog backfill small so old unresolved RFQs cannot stall the live
 # websocket drain and health heartbeat on a large capture database.
 RESCREEN_BATCH = 25
+
+
+def _live_pricer_config(repo: Path) -> NflLivePricerConfig:
+    """``corr_scale`` from the frozen train-only tuning selection, default 1.0.
+
+    ``corr_scale`` shrinks the fitted margin/total dependence at PRICING
+    time (see ``combo_mm.nfl.tuning.tune_corr_scale``); it is not part of
+    the weekly params file, so it is read here rather than from
+    ``ParamsProvider``. Falls back to the untuned default (1.0, the raw fit,
+    unshrunk) when no tuning selection exists yet.
+    """
+    selection = load_selection(repo / SELECTION_PATH)
+    corr_scale = selection[1].get("pricer_corr_scale", 1.0) if selection is not None else 1.0
+    return NflLivePricerConfig(corr_scale=corr_scale)
 
 
 def _combo_side(raw: Dict[str, Any]) -> Optional[str]:
@@ -93,7 +108,8 @@ class RfqCapture:
         self.errors = 0
         self.quoter = None
         if price_live:
-            params = ParamsProvider(Path(__file__).resolve().parents[1] / "params")
+            repo = Path(__file__).resolve().parents[1]
+            params = ParamsProvider(repo / "params")
             try:
                 handle = params.current()
             except Exception as exc:
@@ -103,7 +119,8 @@ class RfqCapture:
                 log.warning("weekly parameters unavailable; quotable RFQs will be marked PRICING_UNAVAILABLE")
             else:
                 pricer = NflLivePricer(self.catalog, LiveLegBooks(), params,
-                                       config=PipelineConfig(paper_mode=True))
+                                       config=PipelineConfig(paper_mode=True),
+                                       model_config=_live_pricer_config(repo))
                 self.quoter = LiveQuoter(pricer, self.selections, workers=quoter_workers,
                                          on_decision=self._record_decision)
         self.rfqs_seen = 0

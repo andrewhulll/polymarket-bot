@@ -186,5 +186,24 @@ def _engine(conn) -> None:
         st.caption("No live timing samples yet.")
     st.subheader("Decline and skip reasons")
     st.dataframe(pd.DataFrame(status["reasons"]), hide_index=True, width="stretch")
+    st.subheader("Correlation model lift")
+    st.caption("How much the joint model is moving prices off the naive independent-leg product "
+               "on the most recent auto-quoted RFQs. Near-zero here on every quote means the "
+               "correlation model isn't doing anything -- see docs/correlation-model.md.")
+    corr = status["correlation_lift"]
+    if corr["n"]:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Quotes sampled", corr["n"])
+        c2.metric("Mean |corr adj|", f"{corr['mean_abs_bps']:.2f} bps")
+        c3.metric("p95 |corr adj|", f"{corr['p95_abs_bps']:.2f} bps")
+        c4.metric("Max |corr adj|", f"{corr['max_abs_bps']:.2f} bps")
+        if corr["degenerate"]:
+            st.error(
+                f"{corr['frac_degenerate']:.0%} of the last {corr['n']} auto-quotes show less than "
+                f"{corr['threshold_bps']:g} bps of correlation adjustment (fair ≈ naive on nearly "
+                "every quote). The correlation model is not affecting live prices -- check the "
+                "active params file's variance_model and var_slope.")
+    else:
+        st.caption("No QUOTED rows with a correlation adjustment yet.")
     st.subheader("Stored draft quotes")
     st.dataframe(pd.DataFrame(status["drafts"]), hide_index=True, width="stretch")

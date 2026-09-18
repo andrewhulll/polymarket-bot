@@ -67,6 +67,8 @@ from combo_mm.nfl.params_io import VARIANCE_MODELS, matchup_covariance
 __all__ = [
     "MARKETS",
     "COMBOS",
+    "DEPLOYED_FAMILIES",
+    "deployed_mask",
     "OUTCOMES",
     "SPREAD_BUCKETS",
     "BacktestConfig",
@@ -76,6 +78,7 @@ __all__ = [
     "load_outputs",
     "model_col",
     "scale_col",
+    "lifted",
     "prob_columns",
     "score_table",
     "group_table",
@@ -122,6 +125,25 @@ def _build_combos() -> Dict[str, Tuple[Tuple[str, ...], str, bool]]:
 
 # name -> (leg keys, family, nested). Leg keys resolve per game against the favorite.
 COMBOS: Dict[str, Tuple[Tuple[str, ...], str, bool]] = _build_combos()
+
+# combo_mm.nfl.live_pricer only ever prices a same-game block of exactly two
+# modeled legs (one NFL game contributing >=2 legs; every leg in the block is
+# a full-game ML/spread/total). Verified against the live capture database
+# (data/live/rfq_capture.db, 13k+ priced multi-leg blocks): every one of them
+# is moneyline+total or spread+total -- never moneyline+spread (which needs
+# no correlation model: covering implies the moneyline) and never a 3-leg
+# combo. Estimator hyperparameters chosen by scoring the full COMBOS universe
+# are dominated by "ML x spread" and "ML x spread x total" (nested/near-nested
+# combos with double-digit Brier skill from the shared margin dimension
+# alone), which never reach a live RFQ -- that lets a config with ~zero
+# margin/total dependence win the grid search while doing nothing for the
+# combos actually quoted. Score selection on this slice instead.
+DEPLOYED_FAMILIES: Tuple[str, ...] = ("ML x total", "spread x total")
+
+
+def deployed_mask(combos):
+    """Row mask for the exact combo universe the live pricer ever quotes."""
+    return combos["family"].isin(DEPLOYED_FAMILIES)
 
 # Binary outcomes for the correlation-structure view (team totals use a
 # half-point line at the closing-line implied team points).
@@ -219,6 +241,11 @@ def model_col(model: str) -> str:
 
 def scale_col(scale: float) -> str:
     return f"p_scale_{scale:g}"
+
+
+def lifted(col: str) -> str:
+    """Column name for ``col``'s market_lift price (see ``_price_game``)."""
+    return f"{col}_lift"
 
 
 def prob_columns(config: BacktestConfig) -> List[str]:
@@ -320,12 +347,27 @@ def _price_game(game: Game, params_by_model: Dict[str, Dict[str, Any]],
         if any(p is None for p in market_ps):
             continue  # no moneyline price (pre-2006): combo not constructible
         realized = _combo_realized(leg_objs, game)
+        naive = float(math.prod(market_ps))  # type: ignore[arg-type]
         row = dict(base, combo=name, family=family, n_legs=len(keys), nested=nested,
-                   pushed=realized is None, realized=realized,
-                   naive=float(math.prod(market_ps)))  # type: ignore[arg-type]
+                   pushed=realized is None, realized=realized, naive=naive)
         if realized is not None:
+            # market_lift (combo_mm.nfl.pricing's default, and the live
+            # pricer's): keep each leg's own market price and borrow only the
+            # *dependence* from the model, via lift = P_model(all) /
+            # prod(P_model(leg_i)), clamped to the Frechet bounds. This is
+            # not the same number as the model's own joint (below) whenever a
+            # leg's model marginal misses the market -- moneyline legs are
+            # over-identified (docs/correlation-model.md #4.4.2) and diverge
+            # here; spread/total legs are calibrated to the market exactly
+            # (calibrate_means), so lift and joint coincide for them.
+            lo = max(0.0, sum(market_ps) - (len(market_ps) - 1))  # type: ignore[arg-type]
+            hi = min(market_ps)  # type: ignore[type-var]
             for col, gm in models.items():
-                row[col] = gm.joint(leg_objs)
+                p_joint = gm.joint(leg_objs)
+                row[col] = p_joint
+                p_margs = [gm.leg(leg) for leg in leg_objs]
+                lift = p_joint / max(math.prod(p_margs), 1e-12)
+                row[lifted(col)] = min(max(naive * lift, lo), hi)
         combo_rows.append(row)
     if not config.structure:
         return combo_rows, None
@@ -643,12 +685,19 @@ def pnl_stats(trades) -> Dict[str, float]:
 
 
 def sensitivity_table(combos, corr_scales: Sequence[float], primary_model: str,
-                      threshold: float = 0.01):
-    """Scores and edge P&L as the correlation assumption is scaled."""
+                      threshold: float = 0.01, use_lift: bool = False):
+    """Scores and edge P&L as the correlation assumption is scaled.
+
+    ``use_lift=True`` scores the market_lift price (:func:`lifted`) instead
+    of the model's raw joint -- what a live quote actually shows, not just
+    the model's own view of the combo (see :mod:`combo_mm.nfl.tuning`).
+    """
     pd = _pd()
     rows = []
     for c in sorted(corr_scales):
         col = model_col(primary_model) if c == 1.0 else scale_col(c)
+        if use_lift:
+            col = lifted(col)
         if col not in combos.columns:
             continue
         sc = score_table(combos, [col]).iloc[-1]
