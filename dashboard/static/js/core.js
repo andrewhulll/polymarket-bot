@@ -89,6 +89,20 @@ function showTab(name) {
 document.querySelectorAll("#tabs button").forEach((b) =>
   b.addEventListener("click", () => showTab(b.dataset.tab)));
 
+/* keyboard: 1–6 switch tabs, "/" focuses the RFQ search */
+document.addEventListener("keydown", (e) => {
+  const typing = /^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement?.tagName || "");
+  if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === "/") {
+    const s = $("rfq-search");
+    if (s) { e.preventDefault(); showTab("rfqs"); s.focus(); }
+    return;
+  }
+  const btns = [...document.querySelectorAll("#tabs button")];
+  const n = parseInt(e.key, 10);
+  if (n >= 1 && n <= btns.length) btns[n - 1].click();
+});
+
 document.addEventListener("visibilitychange", () => {
   state.hidden = document.hidden;
   $("paused").classList.toggle("hidden", !state.hidden);

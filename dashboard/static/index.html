@@ -13,12 +13,12 @@
     <h1>Combo RFQ bot <span class="sub">live · paper only</span></h1>
   </div>
   <nav id="tabs">
-    <button data-tab="rfqs" class="active">RFQs</button>
-    <button data-tab="pricing">Pricing</button>
-    <button data-tab="performance">Performance</button>
-    <button data-tab="engine">Engine</button>
-    <button data-tab="inventory">Inventory</button>
-    <button data-tab="nfl">NFL correlation</button>
+    <button data-tab="rfqs" class="active" title="RFQs (press 1)">RFQs</button>
+    <button data-tab="pricing" title="Pricing (press 2)">Pricing</button>
+    <button data-tab="performance" title="Performance (press 3)">Performance</button>
+    <button data-tab="engine" title="Engine (press 4)">Engine</button>
+    <button data-tab="inventory" title="Inventory (press 5)">Inventory</button>
+    <button data-tab="nfl" title="NFL correlation (press 6)">NFL correlation</button>
   </nav>
   <div class="meta"><span id="killswitch-badge" class="hidden">KILL SWITCH</span><label class="caption" style="margin:0">source <select id="data-source" title="data behind the live tabs"></select></label><span id="updated">—</span><span id="paused" class="hidden">paused</span></div>
 </header>
@@ -27,7 +27,7 @@
     <div class="toolbar">
       <label class="toggle"><input type="checkbox" id="only-quotable"> quotable only</label>
       <select id="screen-filter"><option value="">all screens</option></select>
-      <input type="search" id="rfq-search" placeholder="search id / symbol…">
+      <input type="search" id="rfq-search" placeholder="search id / symbol…  ( / )">
       <span class="spacer"></span>
       <button id="rfq-prev">‹</button><span id="rfq-page-label" class="page-label"></span><button id="rfq-next">›</button>
     </div>
