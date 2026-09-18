@@ -1,0 +1,34 @@
+# Always-on supervision for the headless RFQ capture process (Linux).
+#
+# Install (replace __REPO_DIR__ with your checkout path first, e.g. via
+# sed -i "s|__REPO_DIR__|$HOME/polymarket-bot|g" this file):
+#   mkdir -p ~/.config/systemd/user
+#   cp polymarket-bot-capture.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now polymarket-bot-capture.service
+# Uninstall:
+#   systemctl --user disable --now polymarket-bot-capture.service
+#   rm ~/.config/systemd/user/polymarket-bot-capture.service
+#
+# Restart=always brings the capture back after a crash or kill, even with
+# the dashboard closed (the case the dashboard's auto-start does not
+# cover). The process takes the rfq_capture.lock on start, so the
+# dashboard's auto-start (ensure_capture_running) never launches a
+# duplicate. Credentials come from the environment or the gitignored
+# repo-root .env -- never put secrets in this file. See docs/always-on.md.
+[Unit]
+Description=Polymarket combo RFQ capture (paper trading, receive-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_DIR__
+# If dependencies live under a venv, point ExecStart at its python instead.
+ExecStart=/usr/bin/env python3 __REPO_DIR__/scripts/capture_live_rfqs.py --data-dir __REPO_DIR__/data/live
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
