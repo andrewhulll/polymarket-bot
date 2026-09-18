@@ -17,6 +17,7 @@
     <button data-tab="pricing">Pricing</button>
     <button data-tab="performance">Performance</button>
     <button data-tab="engine">Engine</button>
+    <button data-tab="inventory">Inventory</button>
     <button data-tab="nfl">NFL correlation</button>
   </nav>
   <div class="meta"><span id="killswitch-badge" class="hidden">KILL SWITCH</span><label class="caption" style="margin:0">source <select id="data-source" title="data behind the live tabs"></select></label><span id="updated">—</span><span id="paused" class="hidden">paused</span></div>
@@ -92,6 +93,34 @@
     </table></div>
   </section>
 
+  <section id="tab-inventory" class="tab">
+    <div class="kpis" id="inv-kpis"></div>
+    <div id="inv-alerts"></div>
+    <div class="toolbar">
+      <input type="text" id="ks-reason" placeholder="reason (optional)" style="max-width:260px">
+      <button id="ks-trip" class="danger">Trip kill switch</button>
+      <button id="ks-reset">Reset</button>
+      <span class="spacer"></span>
+      <span class="caption">worst-case-loss exposure · paper only</span>
+    </div>
+    <h2>Exposure by game</h2>
+    <div class="table-wrap"><table id="inv-games">
+      <thead><tr><th>Game</th><th class="num">Pending</th><th class="num">Executed</th><th class="num">Total WCL</th><th class="num">Net pos</th></tr></thead><tbody></tbody>
+    </table></div>
+    <h2>Exposure by market</h2>
+    <div class="table-wrap"><table id="inv-markets">
+      <thead><tr><th>Market</th><th class="num">WCL</th></tr></thead><tbody></tbody>
+    </table></div>
+    <h2>Exposure by team</h2>
+    <div class="table-wrap"><table id="inv-teams">
+      <thead><tr><th>Team</th><th class="num">WCL</th></tr></thead><tbody></tbody>
+    </table></div>
+    <h2>Risk events</h2>
+    <div class="table-wrap"><table id="inv-risk">
+      <thead><tr><th>Time</th><th>RFQ</th><th>Action</th><th>Reason</th></tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+
   <section id="tab-nfl" class="tab">
     <div class="toolbar">
       <div id="nfl-subtabs" class="subtabs"></div>
@@ -121,6 +150,7 @@
 <script src="/static/js/pricing.js"></script>
 <script src="/static/js/performance.js"></script>
 <script src="/static/js/engine.js"></script>
+<script src="/static/js/inventory.js"></script>
 <script src="/static/js/nfl.js"></script>
 </body>
 </html>

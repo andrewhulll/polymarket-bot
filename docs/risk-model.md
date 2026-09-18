@@ -20,7 +20,7 @@ For an open short, it is `quantity * (1 - average_price)`. Game, team, leg
 market, and portfolio exposure are conservative sums of these losses and
 pending reservations. Equity starts at $50,000 plus realized closing P&L;
 buying power is equity less reserved loss. `exposure_snapshots` and
-`risk_events` preserve the history shown in the dashboard Risk tab.
+`risk_events` preserve the history shown in the dashboard Inventory tab.
 
 NFL game IDs come from a supplied resolver or the pricer when available.
 Otherwise canonical NFL leg symbols group by their season, week, away, and
@@ -42,4 +42,16 @@ The additive loss model is intentionally conservative for overlapping NFL
 legs. It does not calculate score scenario WCL, CVaR, VaR, settlement P&L,
 or automatic drawdown triggers. Those measures require a calibrated joint
 game model and settlement lifecycle; dashboard exposure here is additive
-reserved loss. The Risk tab labels it accordingly.
+reserved loss. The Inventory tab labels it accordingly.
+
+## Dashboard
+
+The live dashboard's **Inventory** tab (`GET /api/inventory`) shows the
+current paper inventory rebuilt from the event store: equity, buying power,
+and realized P&L; worst-case-loss exposure by game (pending vs executed
+split), by leg market, and by team; and the recent risk-event feed. The tab
+also carries the manual kill-switch control (`POST /api/risk/kill-switch`
+with `{"action": "trip"|"reset"}`), which appends one row to
+`kill_switch_events` -- the same table the engine reads on every RFQ, so a
+trip halts paper quoting immediately. The switch latches until an explicit
+reset, exactly like `python -m scripts.risk_halt`.

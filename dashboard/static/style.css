@@ -36,6 +36,8 @@ h3 { font-size: 13px; margin: 0 0 8px; font-weight: 600; }
   border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
 .toolbar button:disabled { opacity: .35; cursor: default; }
 .toolbar button:hover:not(:disabled), .subtabs button:hover { border-color: var(--accent); }
+.toolbar button.danger { border-color: var(--bad); color: var(--bad); }
+.toolbar button.danger:hover:not(:disabled) { border-color: var(--bad); background: rgba(255,107,107,.12); }
 .subtabs button.active { background: #1f3a5f; border-color: #2c4f7d; color: #fff; }
 .page-label { color: var(--dim); font-size: 12px; min-width: 90px; text-align: center; }
 .toggle { display: flex; align-items: center; gap: 7px; cursor: pointer; color: var(--dim); font-size: 12px; }
