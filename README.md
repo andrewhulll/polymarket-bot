@@ -117,7 +117,7 @@ One row per brief step, kept current — if a PR changes a step's status, update
 | `auth.py` | Private-Key-JWT → Auth0 structure for the Exchange API (RS256, 3-minute refresh, key rotation, gRPC error mapping). Stubbed — no network, no credentials. |
 | `retail.py` | `RetailPollingSource`: Retail REST polling adapter (RFQ list/detail diffing, leg book/BBO refresh, beta-gate fallback). See “Retail live data”. |
 | `pricing.py` | Minimal V1 independent-leg pricer (pure, no I/O): bounded microprice / midpoint leg marks, `fair = product(q_i)`, spread = base edge + uncertainty + depth + event risk + buffer, tick rounding, side `"0"` suppression, structured reason codes. |
-| `pricer.py` | Offline shadow-engine seam: `Pricer` protocol + `PricerResult`; `V1NaivePricer` uses the independent product with a catalog-backed same-game guardrail. Live NFL RFQs use `NflLivePricer`, whose catalog and market-data lookups do not fit this pure seam. |
+| `pricer.py` | Shadow-engine pricing seam: `Pricer` protocol + `PricerResult`; `V1NaivePricer` uses the independent product with a catalog-backed same-game guardrail. On live paths the engine prices with the NFL correlation model via `combo_mm/nfl/pricer_adapter.py` (`NflPricerAdapter`, pure in-memory: engine book cache + local catalog + local params, no I/O), falling back per-RFQ to `V1NaivePricer` (explicitly tagged `pricer_fallback`) when the model cannot run. |
 | `risk.py` | Risk seam (issue #3): `RiskCheck` protocol + `InventoryState` / `RiskVerdict`; `ConservativeRiskCheck` enforces per-RFQ / per-game / capital hard caps (shrink or reject). The full risk module replaces it behind the same interface. |
 | `eligibility.py` | Pure pre-pricing eligibility filter: event type → RFQ present → status terminal → legs present → exchange-time staleness. Skip reasons `SKIP_NO_RFQ` / `SKIP_RFQ_CLOSED` / `SKIP_NO_LEGS` / `SKIP_STALE_RFQ`. |
 | `engine.py` | Shadow quoting engine (issue #4): eligibility → pricer → risk → two-sided draft quote, stored in `quotes` (`status='shadow'`, `origin='shadow'`) with a full reproducible input snapshot. Paper-only: no call path to any outbound RPC, `PaperModeError` unless `paper_mode=True`. |
@@ -199,9 +199,11 @@ event the engine runs four stages:
    `SKIP_NO_LEGS`, `SKIP_STALE_RFQ`); anything else is ignored silently.
 2. **Pricing** (`pricer.py`, the #2 seam) — any `Pricer` implementation prices the
    legs into a `PricerResult` (fair value, marginals, correlation adjustment,
-   confidence, decline reason). `V1NaivePricer` adapts the existing independent-leg
-   `price_combo`; the MVN pricer will implement the same interface with zero
-   engine changes.
+   confidence, decline reason). Live paths inject the NFL correlation model
+   through `NflPricerAdapter` (see `combo_mm/nfl/pricer_adapter.py`); replay,
+   backtests, and the engine constructor keep the `V1NaivePricer` default,
+   which is also the adapter's explicit per-RFQ fallback when the model
+   cannot run.
 3. **Risk** (`risk.py`, the #3 seam) — any `RiskCheck` implementation verdicts the
    draft against the quoted notional and the `InventoryState`. `ConservativeRiskCheck`
    shrinks both sides proportionally past the per-RFQ cap (`RISK_SIZE_REDUCED`),
