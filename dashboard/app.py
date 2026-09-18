@@ -833,11 +833,14 @@ def _pricing_view(r: Dict[str, Any]) -> None:
             st.metric("RFQ status", d["rfq_status"])
             st.write(f"Model: `{d['reason']}`")
             st.write(f"Size: buy `{d['buy_qty'] or '-'}` / sell `{d['sell_qty'] or '-'}`")
-        st.markdown("**Pricing adjustments** (spread components, bps)")
+        st.markdown("**Pricing adjustments** (leg-width markup, bps)")
         st.table([{"adjustment": name, "bps": _f(components.get(key), ".2f")} for name, key in (
-            ("base edge", "base_edge_bps"), ("model uncertainty", "model_uncertainty_bps"),
-            ("depth impact", "depth_impact_bps"), ("event risk", "event_risk_bps"),
-            ("operational buffer", "operational_buffer_bps"))])
+            ("avg leg half-spread", "avg_leg_half_spread_bps"),
+            ("multiplier x avg (uncapped)", "half_spread_bps_uncapped"),
+            ("half-spread (capped)", "half_spread_bps"))])
+        if components.get("spread_capped"):
+            st.write(f"_Spread capped at `{_f(components.get('max_half_spread_bps'), '.0f')}` bps "
+                     "half-spread (total spread never exceeds 100 bps)._")
         st.write(f"Total spread: `{_f(components.get('spread_bps_total'), '.2f')}` bps "
                  f"=> half-spread `{_f(components.get('half_spread'))}` "
                  f"around center `{_f(components.get('center'))}` (center = model fair; "

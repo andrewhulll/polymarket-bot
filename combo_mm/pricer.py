@@ -102,12 +102,10 @@ class V1NaivePricer:
     model_version: str = MODEL_VERSION
 
     def __init__(self, resolver: Optional[Callable[[str], Any]] = None,
-                 same_game_haircut_bps: float = 150.0,
                  same_game_max_qty: Optional[float] = None) -> None:
-        if same_game_haircut_bps < 0 or (same_game_max_qty is not None and same_game_max_qty <= 0):
+        if same_game_max_qty is not None and same_game_max_qty <= 0:
             raise ValueError("invalid same-game guardrail")
         self.resolver = resolver
-        self.same_game_haircut_bps = same_game_haircut_bps
         self.same_game_max_qty = same_game_max_qty
 
     def price(
@@ -155,7 +153,6 @@ class V1NaivePricer:
                     if self.same_game_max_qty is not None and qty_decimal is not None:
                         if float(qty_decimal) > self.same_game_max_qty:
                             guard_reason = SAME_GAME_TOO_LARGE
-        guarded = any(len(m) >= 2 for m in same_games.values())
         decision = price_combo(
             legs,
             rfq_id=rfq_id,
@@ -164,18 +161,13 @@ class V1NaivePricer:
             cash_order_qty=cash_order_qty,
             model_version=self.model_version,
             decided_at=decided_at,
-            base_edge_bps=cfg.base_edge_bps,
-            uncertainty_per_leg_bps=cfg.uncertainty_per_leg_bps,
-            width_weight=cfg.width_weight,
-            depth_slope_bps=cfg.depth_slope_bps,
-            event_risk_bps=cfg.event_risk_bps,
-            operational_buffer_bps=cfg.operational_buffer_bps,
+            leg_width_multiplier=cfg.leg_width_multiplier,
+            max_half_spread_bps=cfg.max_half_spread_bps,
+            max_leg_spread_bps=cfg.max_leg_spread_bps,
             tick_size=cfg.tick_size,
             price_min=cfg.price_min,
             price_max=cfg.price_max,
             min_qty=cfg.min_qty,
-            extra_spread_bps={"same_game_haircut_bps": self.same_game_haircut_bps}
-            if guarded and guard_reason is None else None,
         )
         quoted = decision.reason_code == QUOTED_OK and guard_reason is None
         marginals = {

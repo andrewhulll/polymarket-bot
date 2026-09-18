@@ -14,12 +14,13 @@ Pricing model
 - ``q_i = p_i`` for YES legs, ``1 - p_i`` for NO legs. A resolved winning leg
   contributes 1; a resolved losing leg forces the combo to 0 (decline).
 - ``fair = product(q_i)``, clamped to ``[0, 1]``.
-- ``half_spread = total_bps / 10000`` in ABSOLUTE price units (not scaled by
-  ``fair``): wider uncertainty can never tighten the quoted spread, no matter
-  how small the fair value gets. Components: ``base_edge +
-  model_uncertainty + depth_impact(size) + event_risk + operational_buffer``
-  (all in bps, all configurable on :class:`PipelineConfig`). Uncertainty
-  grows with wide/shallow books, leg count, and stale data.
+- ``half_spread = min(max_half_spread_bps, leg_width_multiplier *
+  avg_leg_half_spread) / 10000`` in ABSOLUTE price units (not scaled by
+  ``fair``): the spread is copied from the legs' own books, which have
+  already priced in uncertainty and disagreement; the combo inherits it
+  plus combination risk via the multiplier. The cap keeps the total spread
+  at or under 100 bps. One knob (the multiplier), one gate: decline when
+  any leg book is stale or wider than ``max_leg_spread_bps``.
 - ``center = fair`` (no inventory skew -- the risk engine is parked).
 - ``buyPrice`` (our offer / creator's buy) = round UP to tick of
   ``center + half_spread``; ``sellPrice`` (our bid / creator's sell) = round
@@ -49,6 +50,7 @@ __all__ = [
     # reason codes
     "QUOTED_OK",
     "STALE_LEG",
+    "WIDE_LEG_BOOK",
     "MISSING_LEG",
     "CROSSED_BOOK",
     "RESOLVED_LOSER",
@@ -59,6 +61,7 @@ __all__ = [
 
 QUOTED_OK = "QUOTED_OK"
 STALE_LEG = "STALE_LEG"
+WIDE_LEG_BOOK = "WIDE_LEG_BOOK"
 MISSING_LEG = "MISSING_LEG"
 CROSSED_BOOK = "CROSSED_BOOK"
 RESOLVED_LOSER = "RESOLVED_LOSER"
@@ -142,35 +145,28 @@ def price_combo(
     cash_order_qty: Optional[str] = None,
     model_version: str = "v1",
     decided_at: str = "",
-    # Spread knobs (bps unless noted); defaults mirror PipelineConfig.
-    base_edge_bps: float = 15.0,
-    uncertainty_per_leg_bps: float = 5.0,
-    width_weight: float = 0.5,
-    stale_penalty_bps: float = 50.0,   # reserved: stale legs currently decline
-    depth_slope_bps: float = 20.0,
-    event_risk_bps: float = 5.0,
-    operational_buffer_bps: float = 5.0,
+    # Markup knobs: the spread is copied from the legs' own books.
+    # half_spread = min(max_half_spread_bps,
+    #                   leg_width_multiplier * avg leg half-spread).
+    leg_width_multiplier: float = 2.0,
+    max_half_spread_bps: float = 50.0,   # total spread never exceeds 100 bps
+    max_leg_spread_bps: float = 1000.0,  # decline when a leg book is wider
     tick_size: float = 0.001,
     price_min: float = 0.001,
     price_max: float = 0.999,
     min_qty: float = 1.0,
     fair_override: Optional[float] = None,
-    extra_spread_bps: Optional[Dict[str, float]] = None,
 ) -> QuoteDecision:
     """Price one combo RFQ. Pure function -- no I/O.
 
     Returns a :class:`QuoteDecision` with ``reason_code=QUOTED_OK`` on success,
-    or a decline reason otherwise. Every spread component is recorded in
+    or a decline reason otherwise. The markup inputs are recorded in
     ``components`` for dashboard explanation.
 
     ``fair_override`` lets a dependence-aware pricer (e.g. the NFL joint
     model) supply the combo fair while reusing this function's leg checks,
-    spread, tick rounding and sizing. The independent-leg product is still
+    markup, tick rounding and sizing. The independent-leg product is still
     computed and recorded as ``components["naive_fair"]``.
-
-    ``extra_spread_bps`` adds named spread components on top of the V1 stack
-    (e.g. the NFL pricer's model-risk haircuts); each is recorded in
-    ``components`` under its own name.
     """
     leg_inputs = [
         {
@@ -223,8 +219,6 @@ def price_combo(
     # --- leg marks -------------------------------------------------------
     q_list: List[float] = []
     leg_marks: List[Dict[str, Any]] = []
-    total_spread_bps = 0.0
-    total_top_size = 0.0
     for leg in legs:
         if leg.side not in ("YES", "NO"):
             return decline(MISSING_LEG, bad_side=leg.side, symbol=leg.symbol)
@@ -255,8 +249,7 @@ def price_combo(
         # mid rather than collapsing it to _EPS (which made spread_bps ~1e11).
         mid = (leg.bid + leg.ask) / 2.0
         spread_bps = ((leg.ask - leg.bid) / max(mid, _EPS)) * 10000.0
-        total_spread_bps += spread_bps
-        total_top_size += (leg.bid_size or 0.0) + (leg.ask_size or 0.0)
+        leg_width_bps = (leg.ask - leg.bid) * 10000.0  # absolute, for the markup
         leg_marks.append(
             {
                 "symbol": leg.symbol,
@@ -266,6 +259,7 @@ def price_combo(
                 "mark": mark,
                 "q": q,
                 "spread_bps": spread_bps,
+                "leg_width_bps": leg_width_bps,
             }
         )
 
@@ -277,30 +271,34 @@ def price_combo(
     if fair_override is not None:
         fair = min(max(float(fair_override), 0.0), 1.0)
 
-    # --- spread ----------------------------------------------------------
-    # Uncertainty grows with wide/shallow books and leg count. The spread is
-    # in ABSOLUTE price units (total_bps / 10000, not scaled by fair):
-    # wider uncertainty can never tighten it, even when fair shrinks (e.g.
-    # an extra leg multiplies fair down but adds uncertainty).
-    model_uncertainty_bps = (
-        uncertainty_per_leg_bps * len(legs) + width_weight * total_spread_bps
+    # --- markup: copy the spread from the legs' own books ------------------
+    # half_spread = multiplier x average leg half-spread, in ABSOLUTE price
+    # units (not scaled by fair), capped so the total spread never exceeds
+    # 100 bps. The legs' books have already priced in uncertainty,
+    # disagreement and event risk; the combo inherits all of it plus
+    # combination risk via the multiplier. Resolved legs have no book, so
+    # they contribute no width.
+    live_half_widths_bps: List[float] = []
+    for m in leg_marks:
+        if m.get("resolved"):
+            continue
+        width_bps = float(m["leg_width_bps"])
+        if width_bps > max_leg_spread_bps:
+            return decline(
+                WIDE_LEG_BOOK,
+                symbol=m["symbol"],
+                leg_width_bps=width_bps,
+                max_leg_spread_bps=max_leg_spread_bps,
+            )
+        live_half_widths_bps.append(width_bps / 2.0)
+    avg_leg_half_spread_bps = (
+        sum(live_half_widths_bps) / len(live_half_widths_bps)
+        if live_half_widths_bps else 0.0
     )
-    # Depth impact scales with requested size vs top-of-book size.
-    ref_qty = Decimal(qty_decimal) if qty_decimal else (
-        Decimal(cash_order_qty) if cash_order_qty else Decimal(0)
-    )
-    depth_impact_bps = depth_slope_bps * float(ref_qty) / max(total_top_size, _EPS)
-    depth_impact_bps = min(depth_impact_bps, 500.0)  # cap: never quote absurd wide
-    extras = {k: float(v) for k, v in (extra_spread_bps or {}).items()}
-    total_bps = (
-        base_edge_bps
-        + model_uncertainty_bps
-        + depth_impact_bps
-        + event_risk_bps
-        + operational_buffer_bps
-        + sum(extras.values())
-    )
-    half_spread = total_bps / 10000.0  # absolute price units
+    uncapped_half_spread_bps = leg_width_multiplier * avg_leg_half_spread_bps
+    half_spread_bps = min(max_half_spread_bps, uncapped_half_spread_bps)
+    half_spread = half_spread_bps / 10000.0  # absolute price units
+    total_bps = 2.0 * half_spread_bps  # full spread; kept as spread_bps_total
 
     # --- prices ----------------------------------------------------------
     # center = fair (no inventory skew: the risk engine is parked).
@@ -359,11 +357,12 @@ def price_combo(
         "fair": fair,
         "naive_fair": naive_fair,
         "spread_bps_total": total_bps,
-        "base_edge_bps": base_edge_bps,
-        "model_uncertainty_bps": model_uncertainty_bps,
-        "depth_impact_bps": depth_impact_bps,
-        "event_risk_bps": event_risk_bps,
-        "operational_buffer_bps": operational_buffer_bps,
+        "half_spread_bps": half_spread_bps,
+        "half_spread_bps_uncapped": uncapped_half_spread_bps,
+        "avg_leg_half_spread_bps": avg_leg_half_spread_bps,
+        "leg_width_multiplier": leg_width_multiplier,
+        "max_half_spread_bps": max_half_spread_bps,
+        "spread_capped": half_spread_bps < uncapped_half_spread_bps,
         "half_spread": half_spread,
         "center": fair,
         "tick_size": tick_size,
@@ -371,9 +370,6 @@ def price_combo(
         "valid_sell": valid_sell,
         "size_mode": "qty" if qty_decimal is not None else "cash",
     }
-    if extras:
-        components.update(extras)
-        components["extra_spread_bps"] = sorted(extras)
     return QuoteDecision(
         rfq_id=rfq_id,
         model_version=model_version,

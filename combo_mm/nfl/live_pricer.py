@@ -9,7 +9,8 @@ Pipeline for one live RFQ (gateway legs are combo-catalog position ids)::
     GameModel --> model joint P_m(all), model marginals P_m(leg_i)
     fair = prod(q_i) * P_m(all) / prod P_m(leg_i)   ("market_lift", default)
          clamped to the Frechet bounds, times any independent legs
-    spread = V1 stack (pricing.price_combo) + model-risk add-ons --> bid / ask
+    spread = leg-width markup (pricing.price_combo): half-spread = 2 x avg leg
+         half-spread, capped at 50 bps --> bid / ask
 
 **Why market_lift.** It keeps each leg's own market price exactly and borrows
 only the *dependence* from the model. The model's moneyline marginal misses
@@ -110,19 +111,19 @@ class LegBookSource(Protocol):
 
 @dataclass(frozen=True)
 class NflLivePricerConfig:
-    """Model knobs on top of :class:`PipelineConfig`'s V1 spread stack (bps unless noted)."""
+    """Model knobs for the NFL live pricer.
+
+    The quote markup is the shared leg-width rule (see
+    :func:`combo_mm.pricing.price_combo`): the spread is copied from the
+    legs' own books, so there are no model-risk spread add-ons here. The
+    knobs below govern the joint model, calibration, and decline gates.
+    """
 
     method: str = "market_lift"
     corr_scale: float = 1.0
     max_book_age_s: float = 30.0          # leg book older than this -> stale leg
     max_params_age_days: float = 9.0      # older weekly params -> PARAMS_STALE
     max_marginal_gap: float = 0.04        # |P_model(leg) - q_market| above this -> decline
-    gap_weight: float = 0.5               # marginal_gap_bps = weight * gap * 1e4
-    corr_model_risk_kappa: float = 0.10   # corr_model_risk_bps = kappa * |fair - naive| * 1e4
-    key_number_bps: float = 40.0
-    big_favorite_bps: float = 30.0
-    tail_bps_per_leg: float = 25.0        # per same-game leg beyond two
-    params_age_bps_per_day: float = 5.0   # per day beyond 7
     min_confidence: float = 0.4
     calibration_candidates: int = 2       # main spread / total markets tried per game
 
@@ -130,8 +131,7 @@ class NflLivePricerConfig:
         if self.method not in METHODS:
             raise ValueError(f"method must be one of {METHODS}")
         for name in ("corr_scale", "max_book_age_s", "max_params_age_days", "max_marginal_gap",
-                     "gap_weight", "corr_model_risk_kappa", "key_number_bps", "big_favorite_bps",
-                     "tail_bps_per_leg", "params_age_bps_per_day", "min_confidence"):
+                     "min_confidence"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or value < 0:
                 raise ValueError(f"{name} must be a non-negative number")
@@ -365,7 +365,6 @@ class NflLivePricer:
 
         # (4) per-game joint model ------------------------------------------------
         fair_yes, model_joint_yes = 1.0, 1.0
-        addons: Dict[str, float] = {}
         explanations: List[str] = []
         confidence_hits: List[Tuple[str, float]] = []
         max_gap = 0.0
@@ -375,8 +374,6 @@ class NflLivePricer:
             model_joint_yes *= info["model_joint"]
             max_gap = max(max_gap, info["max_gap"])
             quote.games.append(info["report"])
-            for k, v in info["addons"].items():
-                addons[k] = addons.get(k, 0.0) + v
             explanations += info["explanations"]
             confidence_hits += info["confidence_hits"]
         for leg in independent:
@@ -388,15 +385,12 @@ class NflLivePricer:
                                 + " x ".join(f"{leg.q:.3f}" for leg in independent))
 
         corr_bps = (fair_yes - naive_yes) * 10000.0
-        addons["corr_model_risk_bps"] = mc.corr_model_risk_kappa * abs(corr_bps)
-        addons["marginal_gap_bps"] = mc.gap_weight * max_gap * 10000.0
         if age_days > 7.0:
-            addons["params_age_bps"] = mc.params_age_bps_per_day * (age_days - 7.0)
             confidence_hits.append(("params age", 0.02 * (age_days - 7.0)))
-        addons = {k: round(v, 4) for k, v in addons.items() if v > 0}
         explanations.insert(0, f"Correlation: fair YES {fair_yes:.4f} vs naive {naive_yes:.4f} "
-                               f"({corr_bps:+,.0f} bps); model-risk haircut "
-                               f"{addons.get('corr_model_risk_bps', 0.0):,.0f} bps")
+                               f"({corr_bps:+,.0f} bps). Markup: half-spread = "
+                               f"{self.config.leg_width_multiplier:g} x avg leg half-spread, "
+                               f"capped at {self.config.max_half_spread_bps:g} bps")
 
         quote.fair_yes, quote.naive_yes = fair_yes, naive_yes
         quote.model_joint_yes, quote.corr_adjustment_bps = model_joint_yes, corr_bps
@@ -409,19 +403,18 @@ class NflLivePricer:
             "q_market": leg.q, "p_model": leg.p_model,
         } for leg in legs]
 
-        # (5) quote terms: V1 spread stack + model add-ons ---------------------
+        # (5) quote terms: leg-width markup on the joint-model fair ------------
         fair_side = fair_yes if rfq.side == "YES" else 1.0 - fair_yes
         quote.naive = round(naive_yes if rfq.side == "YES" else 1.0 - naive_yes, 6)
         cfg = self.config
         decision = price_combo(
             mark_inputs, rfq_id=rfq.rfq_id, qty_decimal=rfq.qty_decimal,
             cash_order_qty=rfq.cash_order_qty, model_version=MODEL_VERSION,
-            decided_at=quote.priced_at, base_edge_bps=cfg.base_edge_bps,
-            uncertainty_per_leg_bps=cfg.uncertainty_per_leg_bps, width_weight=cfg.width_weight,
-            depth_slope_bps=cfg.depth_slope_bps, event_risk_bps=cfg.event_risk_bps,
-            operational_buffer_bps=cfg.operational_buffer_bps, tick_size=cfg.tick_size,
+            decided_at=quote.priced_at, leg_width_multiplier=cfg.leg_width_multiplier,
+            max_half_spread_bps=cfg.max_half_spread_bps,
+            max_leg_spread_bps=cfg.max_leg_spread_bps, tick_size=cfg.tick_size,
             price_min=cfg.price_min, price_max=cfg.price_max, min_qty=cfg.min_qty,
-            fair_override=fair_side, extra_spread_bps=addons)
+            fair_override=fair_side)
         components = dict(decision.components)
         components.pop("naive_fair", None)  # YES-leg product; logged as naive_yes instead
         quote.components = components
@@ -579,7 +572,6 @@ class NflLivePricer:
         fair = min(max(raw, lo), hi)
 
         kinds = {leg.nfl.kind for leg in unique.values()}  # type: ignore[union-attr]
-        addons: Dict[str, float] = {}
         explanations = [
             f"{away} @ {home}: calibrated to {describe_leg(s_mkt, s_side)} ({s_mark:.3f}) and "
             f"{describe_leg(t_mkt, t_side)} ({t_mark:.3f}) -> mean score {home} {cal.mu_home:.1f}, "
@@ -594,14 +586,11 @@ class NflLivePricer:
         spread_lines = [abs(leg.nfl.line) for leg in unique.values()   # type: ignore[union-attr]
                         if leg.nfl.kind == SPR]
         if ML in kinds and SPR in kinds and any(_near_key_number(x) for x in spread_lines):  # type: ignore[arg-type]
-            addons["key_number_bps"] = mc.key_number_bps
             explanations.append("Key number: ML x spread near 3/7, where the normal margin misprices")
         if abs(spread_line) >= 10.0 and kinds & {ML, SPR} and kinds & {TOT, TT}:  # type: ignore[arg-type]
-            addons["big_favorite_bps"] = mc.big_favorite_bps
             confidence_hits.append(("big favourite", 0.1))
             explanations.append("Big favourite: margin/total dependence for 10+ pt favourites is unmodeled")
         if len(unique) > 2:
-            addons["tail_bps"] = mc.tail_bps_per_leg * (len(unique) - 2)
             explanations.append(f"Tails: {len(unique)} same-game legs, Gaussian tails are thin")
 
         report = {
@@ -614,5 +603,5 @@ class NflLivePricer:
             "frechet_clamped": fair != raw, "max_marginal_gap": max_gap,
             "params_game_row": handle.game(home, away) is not None,
         }
-        return {"fair": fair, "model_joint": p_all, "max_gap": max_gap, "addons": addons,
+        return {"fair": fair, "model_joint": p_all, "max_gap": max_gap,
                 "explanations": explanations, "confidence_hits": confidence_hits, "report": report}

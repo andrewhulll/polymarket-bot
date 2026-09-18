@@ -281,11 +281,9 @@ def run_week_backtest(games: Sequence[Game], *, season: int = BACKTEST_SEASON,
                          for sn in (snaps[r["symbol"]] for r in leg_rows)]
             comp = price_combo(
                 comp_legs, rfq_id=rfq_id, qty_decimal=qty, model_version=COMPETITOR,
-                base_edge_bps=config.base_edge_bps,
-                uncertainty_per_leg_bps=config.uncertainty_per_leg_bps,
-                width_weight=config.width_weight, depth_slope_bps=config.depth_slope_bps,
-                event_risk_bps=config.event_risk_bps,
-                operational_buffer_bps=config.operational_buffer_bps,
+                leg_width_multiplier=config.leg_width_multiplier,
+                max_half_spread_bps=config.max_half_spread_bps,
+                max_leg_spread_bps=config.max_leg_spread_bps,
                 tick_size=config.tick_size, price_min=config.price_min,
                 price_max=config.price_max, min_qty=config.min_qty)
 
