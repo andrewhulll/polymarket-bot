@@ -19,7 +19,7 @@ async function refreshPricing() {
   $("pricing-prev").disabled = data.page <= 1;
   $("pricing-next").disabled = data.page >= pages;
   $("pricing-count").textContent =
-    `${data.total.toLocaleString()} priced RFQs · Q edge = our price vs market · M edge = model fair vs market`;
+    `${data.total.toLocaleString()} priced RFQs · Trade and edges appear only when an accepted Combo trade is observed`;
 
   const quoted = data.rows.filter((r) => r.status === "QUOTED");
   const edges = quoted.map((r) => r.edge_vs_market).filter((v) => v != null);
@@ -34,7 +34,7 @@ async function refreshPricing() {
     `<tr class="clickable" data-rfq="${esc(r.rfq_id)}">` +
     `<td>${shortId(r.rfq_id)}</td>` +
     `<td class="dim">${esc((r.priced_at || "").slice(11, 19))}</td>` +
-    `<td>${decisionBadge(r.status)}</td>` +
+    `<td>${decisionBadge(r.status)}${r.after_deadline ? ' <span class="badge warn" title="Paper quote priced after exchange deadline">LATE</span>' : ""}</td>` +
     `<td class="dim">${esc(r.reason_code || "")}</td>` +
     `<td class="num"><b>${fmtPrice(r.response_price)}</b></td>` +
     `<td class="num">${fmtPrice(r.fair)}</td>` +
@@ -60,16 +60,18 @@ async function openPricingDrawer(rfqId) {
     .reduce((a, b) => a + b, 0);
   const explanations = (detail.explanations || []).map((e) => `<li>${esc(e)}</li>`).join("");
   const legs = (detail.legs || []).map((l) =>
-    `<tr><td class="mono">${esc(l.symbol || l.label || "")}</td><td>${esc(l.side || "")}</td>` +
-    `<td class="num">${fmtPrice(l.q ?? l.mark)}</td></tr>`).join("");
+    `<tr><td class="mono">${esc(l.label || l.symbol || "")}</td><td>${esc(l.book_source || "—")}</td>` +
+    `<td class="num">${fmtPrice(l.bid)}</td><td class="num">${fmtPrice(l.ask)}</td>` +
+    `<td class="num">${fmtPrice(l.q_market ?? l.q ?? l.mark)}</td></tr>`).join("");
 
   openDrawer(shortId(rfqId), `
-    <p>${decisionBadge(r.status)} <span class="dim">${esc(r.reason_code || "")} ${esc(r.reason_detail || "")}</span></p>
+    <p>${decisionBadge(r.status)}${r.after_deadline ? ' <span class="badge warn">LATE</span>' : ""} <span class="dim">${esc(r.reason_code || "")} ${esc(r.reason_detail || "")}</span></p>
+    ${r.after_deadline ? '<p class="caption">Paper price computed after the exchange submission deadline; it could not have been submitted for this RFQ.</p>' : ""}
     <div class="kpis">
       ${kpi("Our price", fmtPrice(r.response_price))}
       ${kpi("Model fair", fmtPrice(r.fair))}
       ${kpi("Naive", fmtPrice(r.naive))}
-      ${kpi("Market", fmtPrice(r.market_price))}
+      ${kpi("Observed trade", fmtPrice(r.market_price))}
     </div>
     <dl class="kv">
       <dt>Quote edge</dt><dd>${fmtEdge(r.edge_vs_market)} <span class="dim">(our price vs ${esc(r.market_source || "market")})</span></dd>
@@ -85,7 +87,7 @@ async function openPricingDrawer(rfqId) {
     ${compRows ? `<h3>Spread components (bps)</h3>
       <div class="table-wrap"><table><thead><tr><th>Component</th><th class="num">bps</th></tr></thead><tbody>${compRows}</tbody></table></div>` : ""}
     ${legs ? `<h3>Legs</h3>
-      <div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Side</th><th class="num">q</th></tr></thead><tbody>${legs}</tbody></table></div>` : ""}
+      <div class="table-wrap"><table><thead><tr><th>Leg</th><th>Book</th><th class="num">Bid</th><th class="num">Ask</th><th class="num">Mark</th></tr></thead><tbody>${legs}</tbody></table></div>` : ""}
     <details><summary>Full decision JSON</summary><pre class="json">${esc(JSON.stringify(detail, null, 2))}</pre></details>
   `);
 }

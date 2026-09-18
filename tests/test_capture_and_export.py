@@ -74,7 +74,13 @@ def _build_capture(tmp_path):
     return capture
 
 
-def test_handle_writes_raw_jsonl_only_for_eligible_rfqs(tmp_path):
+def test_handle_writes_raw_jsonl_only_for_eligible_rfqs(tmp_path, monkeypatch):
+    from combo_mm.inventory import InventoryProvider
+
+    def fail_inventory_rebuild(*args, **kwargs):
+        raise AssertionError("live capture must not rebuild inventory on RFQ close")
+
+    monkeypatch.setattr(InventoryProvider, "record", fail_inventory_rebuild)
     capture = _build_capture(tmp_path)
     capture.handle({"kind": "event", "raw": _rfq_request("rfq_nfl", ["100", "101"])}, NOW)
     capture.handle({"kind": "event", "raw": _rfq_request("rfq_soccer", ["200", "201"], "0xsoccer")}, NOW)

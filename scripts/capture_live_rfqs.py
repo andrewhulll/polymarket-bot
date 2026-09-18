@@ -65,7 +65,9 @@ from combo_mm.capture_process import CaptureLock
 
 log = logging.getLogger("capture_live_rfqs")
 
-RESCREEN_BATCH = 5000
+# Keep catalog backfill small so old unresolved RFQs cannot stall the live
+# websocket drain and health heartbeat on a large capture database.
+RESCREEN_BATCH = 25
 
 
 def _combo_side(raw: Dict[str, Any]) -> Optional[str]:
@@ -176,7 +178,9 @@ class RfqCapture:
             self.errors += 1
             log.warning("dropping malformed frame", exc_info=True)
             return
-        applied = self.store.apply(event, source="live_capture")
+        # This receive-only feed has no fills or live inventory. Rebuilding
+        # inventory on each close scans every stored RFQ and stalls capture.
+        applied = self.store.apply(event, source="live_capture", record_inventory=False)
         if not applied:
             return
         if event.event_type == "rfq_created" and event.rfq_id:
@@ -302,6 +306,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="stop after N seconds (default: run until interrupted)")
     parser.add_argument("--quoter-workers", type=int, default=4,
                         help="pricing worker threads draining the RFQ queue (default: 4)")
+    parser.add_argument("--no-rescreen", action="store_true",
+                        help="skip historical unresolved-RFQ backfill for a fresh live run")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO,
@@ -348,13 +354,20 @@ def main(argv: Optional[list] = None) -> int:
             now = datetime.now(timezone.utc)
             for item in adapter.poll(now):
                 capture.handle(item, now)
-            capture.rescreen_unresolved()
+            if not args.no_rescreen:
+                capture.rescreen_unresolved()
             capture.heartbeat(adapter)
             if time.monotonic() - last_log >= args.log_every:
+                quoter_stats = capture.quoter.stats() if capture.quoter else {}
                 log.info(
-                    "rfqs=%d nfl=%d trades=%d catalog=%d gateway_connected=%s",
+                    "rfqs=%d nfl=%d trades=%d catalog=%d gateway_connected=%s "
+                    "quoter_submitted=%d quoter_priced=%d quoter_queued=%d "
+                    "quoter_dropped=%d gateway_buffer_drops=%d",
                     capture.rfqs_seen, capture.nfl_rfqs_seen,
-                    capture.trades_seen, len(capture.catalog), adapter.connected)
+                    capture.trades_seen, len(capture.catalog), adapter.connected,
+                    quoter_stats.get("submitted", 0), quoter_stats.get("priced", 0),
+                    quoter_stats.get("queued", 0), quoter_stats.get("dropped", 0),
+                    adapter.stats()["buffer_drops"])
                 last_log = time.monotonic()
             if args.duration is not None and time.monotonic() - start_time >= args.duration:
                 break

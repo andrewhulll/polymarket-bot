@@ -33,8 +33,10 @@ def rfqs(conn: sqlite3.Connection, *, only_quotable: bool = False,
          limit: int = 500, offset: int = 0) -> list[dict]:
     rows = _rows(conn, """
         SELECT r.*, s.screen, s.n_legs, s.n_resolved, s.n_nfl_legs, s.checks_json,
-               s.direction, s.side, s.submission_deadline
+               s.direction, s.side, s.submission_deadline,
+               t.price AS trade_price, t.executed_at AS trade_executed_at
         FROM rfq r LEFT JOIN rfq_screen s USING (rfq_id)
+        LEFT JOIN live_trades t USING (rfq_id)
         WHERE (? = 0 OR s.screen = 'QUOTABLE')
           AND (? IS NULL OR s.screen = ?)
           AND (? IS NULL OR r.rfq_id LIKE ? ESCAPE '\\' OR r.symbol LIKE ? ESCAPE '\\')
@@ -59,6 +61,24 @@ def _like_prefix(value: str | None) -> str | None:
 
 def rfqs_count(conn: sqlite3.Connection, *, only_quotable: bool = False,
                screen: str | None = None, search: str | None = None) -> int:
+    # The unfiltered feed is the common polling path. Counting through the
+    # screen join scans millions of rows on a live capture and can take longer
+    # than the browser's refresh interval, leaving the RFQ table blank.
+    if search is None:
+        if screen is None and not only_quotable:
+            return conn.execute("SELECT COUNT(*) FROM rfq").fetchone()[0]
+        if screen is not None and only_quotable and screen != "QUOTABLE":
+            return 0
+        if only_quotable or screen == "QUOTABLE":
+            # rank 0 is exactly QUOTABLE and has an existing index in the
+            # capture schema. Small legacy/test databases may lack rank.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(rfq_screen)")}
+            if "rank" in columns:
+                return conn.execute("SELECT COUNT(*) FROM rfq_screen WHERE rank = 0").fetchone()[0]
+            return conn.execute("SELECT COUNT(*) FROM rfq_screen WHERE screen = 'QUOTABLE'").fetchone()[0]
+        selected = screen or "QUOTABLE"
+        return conn.execute("SELECT COUNT(*) FROM rfq_screen WHERE screen = ?",
+                            (selected,)).fetchone()[0]
     return conn.execute("""
         SELECT COUNT(*) FROM rfq r LEFT JOIN rfq_screen s USING (rfq_id)
         WHERE (? = 0 OR s.screen = 'QUOTABLE')
@@ -74,11 +94,10 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
         SELECT r.rfq_id, r.created_time, r.status AS rfq_status, s.n_legs,
                p.status, p.reason_code, p.reason_detail, p.response_price,
                p.response_action, p.size, p.size_unit, p.fair, p.naive,
-               p.detail_json, p.priced_at, p.side,
+               p.detail_json, p.priced_at, p.side, p.after_deadline,
                q.model_version, q.params_version, q.decided_by,
-               COALESCE(t.price, p.naive) AS market_price,
-               CASE WHEN t.price IS NOT NULL THEN 'accepted trade'
-                    ELSE 'leg-implied (naive)' END AS market_source,
+               t.price AS market_price,
+               CASE WHEN t.price IS NOT NULL THEN 'accepted trade' END AS market_source,
                t.size AS market_size,
                l.wait_ms, l.compute_ms
         FROM rfq_screen s JOIN rfq r USING (rfq_id)
@@ -96,7 +115,7 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
         row["reason_code"] = row["reason_code"] or "AWAITING_DECISION"
         row["detail"] = json.loads(row.pop("detail_json") or "{}")
         # A lower ask wins a requester BUY; a higher bid wins a requester SELL.
-        sign = 1 if row["response_action"] == "SELL" else -1
+        sign = -1 if row["response_action"] == "SELL" else 1
         if row["market_price"] is not None and row["response_price"] is not None:
             row["edge_vs_market"] = sign * (row["market_price"] - row["response_price"])
         else:
@@ -112,13 +131,13 @@ def _fill_candidates(conn: sqlite3.Connection) -> list[dict]:
     """Quoted RFQs that could have filled against the observed market."""
     return _rows(conn, """
         SELECT p.*,
-               COALESCE(t.price, p.naive) AS market_price,
-               CASE WHEN t.price IS NOT NULL THEN 'accepted trade'
-                    ELSE 'leg-implied (naive)' END AS market_source,
+               t.price AS market_price,
+               'accepted trade' AS market_source,
                t.executed_at, r.created_time, s.n_legs
-        FROM priced_quotes p LEFT JOIN live_trades t ON t.rfq_id = p.rfq_id
+        FROM priced_quotes p JOIN live_trades t ON t.rfq_id = p.rfq_id
         JOIN rfq r ON r.rfq_id = p.rfq_id JOIN rfq_screen s ON s.rfq_id = p.rfq_id
         WHERE p.trigger = 'auto' AND p.status = 'QUOTED'
+          AND COALESCE(p.after_deadline, 0) = 0
           AND EXISTS (SELECT 1 FROM quotes q WHERE q.rfq_id = p.rfq_id
                       AND q.status = 'shadow')
         ORDER BY p.priced_at
@@ -203,13 +222,7 @@ def fills_count(conn: sqlite3.Connection) -> int:
 
 
 def performance(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Paper fills: our quote would have beaten the observed market price.
-
-    The market is the accepted RFQ trade when one is observed; otherwise the
-    leg-implied (naive) price stored at decision time. Accepted trades are
-    participant-private on the quoter gateway, so the naive fallback is the
-    common case in live operation.
-    """
+    """Paper fills against observed accepted RFQ trades only."""
     fills = _compute_fills(conn)
     cumulative = exposure = 0.0
     curve = []
@@ -314,8 +327,11 @@ def rfq_detail(conn: sqlite3.Connection, rfq_id: str) -> dict | None:
     pricing_row = dict(pricing) if pricing else None
     if pricing_row is not None:
         pricing_row["detail"] = json.loads(pricing_row.pop("detail_json") or "{}")
+    trade = conn.execute("SELECT price, size, executed_at FROM live_trades WHERE rfq_id = ?",
+                         (rfq_id,)).fetchone()
     return {"rfq": dict(rfq), "screen": screen_row, "legs": legs,
-            "events": events, "pricing": pricing_row}
+            "events": events, "pricing": pricing_row,
+            "trade": dict(trade) if trade else None}
 
 
 def latency_histogram(conn: sqlite3.Connection, n_buckets: int = 40) -> dict:
