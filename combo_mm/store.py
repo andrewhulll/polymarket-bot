@@ -311,7 +311,8 @@ class EventStore:
             )
             latency_columns = {r[1] for r in cur.execute(
                 "PRAGMA table_info(quote_latency)").fetchall()}
-            for column in ("started_at", "wait_ms", "compute_ms"):
+            for column in ("started_at", "wait_ms", "compute_ms", "fetch_ms",
+                           "solve_ms", "delivery_ms", "queue_ms"):
                 if column not in latency_columns:
                     cur.execute(f"ALTER TABLE quote_latency ADD COLUMN {column} "
                                 + ("TEXT" if column == "started_at" else "REAL"))
@@ -1160,7 +1161,10 @@ class EventStore:
 
     def record_live_latency(self, *, rfq_id: str, posted_at: str,
                             started_at: str, decided_at: str, quoted: bool,
-                            budget_ms: float = 400.0) -> None:
+                            budget_ms: float = 400.0,
+                            fetch_ms: Optional[float] = None,
+                            solve_ms: Optional[float] = None,
+                            local_received_at: Optional[str] = None) -> None:
         def millis(value: str) -> float:
             return _parse_ts(value).timestamp() * 1000
         try:
@@ -1168,14 +1172,31 @@ class EventStore:
             compute_ms = max(0.0, millis(decided_at) - millis(started_at))
         except (ValueError, TypeError, AttributeError):
             return
+        # Split "wait" when we know when this process first saw the frame:
+        #   delivery_ms = local receipt - upstream post  (network + clock skew)
+        #   queue_ms    = worker start   - local receipt (our own backlog)
+        # A fat delivery with a tiny queue means the clock/network, not us.
+        delivery_ms = queue_ms = None
+        if local_received_at:
+            try:
+                local = millis(local_received_at)
+                delivery_ms = max(0.0, local - millis(posted_at))
+                queue_ms = max(0.0, millis(started_at) - local)
+            except (ValueError, TypeError, AttributeError):
+                delivery_ms = queue_ms = None
+        # fetch_ms (book network reads) and solve_ms (joint model) are the two
+        # halves of compute; the pricer measures them, so the dashboard can
+        # blame a slow network vs a slow solve instead of guessing.
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO quote_latency "
                 "(rfq_id, event_type, posted_at, started_at, decided_at, "
-                "wait_ms, compute_ms, latency_ms, quoted, over_budget, source) "
-                "VALUES (?, 'rfq_created', ?, ?, ?, ?, ?, ?, ?, ?, 'live_capture')",
+                "wait_ms, compute_ms, fetch_ms, solve_ms, delivery_ms, queue_ms, "
+                "latency_ms, quoted, over_budget, source) "
+                "VALUES (?, 'rfq_created', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live_capture')",
                 (rfq_id, posted_at, started_at, decided_at, wait_ms, compute_ms,
-                 wait_ms + compute_ms, int(quoted), int(wait_ms + compute_ms > budget_ms)))
+                 fetch_ms, solve_ms, delivery_ms, queue_ms, wait_ms + compute_ms,
+                 int(quoted), int(wait_ms + compute_ms > budget_ms)))
 
     def record_quote_latency(self, *, rfq_id: str, event_type: str,
                              posted_at: str, decided_at: str,

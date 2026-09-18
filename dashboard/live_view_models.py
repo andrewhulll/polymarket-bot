@@ -98,8 +98,9 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
                p.response_action, p.size, p.size_unit, p.fair, p.naive,
                p.detail_json, p.priced_at, p.side, p.after_deadline,
                q.model_version, q.params_version, q.decided_by,
-               t.price AS market_price,
-               CASE WHEN t.price IS NOT NULL THEN 'accepted trade' END AS market_source,
+               COALESCE(t.price, p.naive) AS market_price,
+               CASE WHEN t.price IS NOT NULL THEN 'accepted trade'
+                    WHEN p.naive IS NOT NULL THEN 'leg-implied naive' END AS market_source,
                t.size AS market_size,
                l.wait_ms, l.compute_ms
         FROM rfq_screen s JOIN rfq r USING (rfq_id)
@@ -130,16 +131,22 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
 
 
 def _fill_candidates(conn: sqlite3.Connection) -> list[dict]:
-    """Quoted RFQs that could have filled against the observed market."""
+    """Quoted RFQs that could have filled against the market reference.
+
+    An observed accepted trade is the reference when we have one; otherwise the
+    leg-implied naive combo price stands in, so every quoted RFQ is scored on
+    the performance page, not just the rare ones with a matching Combo trade.
+    Late (after-deadline) quotes stay in the ledger, flagged on the fill.
+    """
     return _rows(conn, """
         SELECT p.*,
-               t.price AS market_price,
-               'accepted trade' AS market_source,
+               COALESCE(t.price, p.naive) AS market_price,
+               CASE WHEN t.price IS NOT NULL THEN 'accepted trade'
+                    ELSE 'leg-implied naive' END AS market_source,
                t.executed_at, r.created_time, s.n_legs
-        FROM priced_quotes p JOIN live_trades t ON t.rfq_id = p.rfq_id
+        FROM priced_quotes p LEFT JOIN live_trades t ON t.rfq_id = p.rfq_id
         JOIN rfq r ON r.rfq_id = p.rfq_id JOIN rfq_screen s ON s.rfq_id = p.rfq_id
         WHERE p.trigger = 'auto' AND p.status = 'QUOTED'
-          AND COALESCE(p.after_deadline, 0) = 0
           AND EXISTS (SELECT 1 FROM quotes q WHERE q.rfq_id = p.rfq_id
                       AND q.status = 'shadow')
         ORDER BY p.priced_at
@@ -191,6 +198,7 @@ def _to_fill(conn: sqlite3.Connection, row: dict) -> dict | None:
         if outcome_yes is not None else None
     fair = row["fair"]
     return {"rfq_id": row["rfq_id"], "time": row["priced_at"],
+            "after_deadline": bool(row["after_deadline"]),
             "game": game, "family": family, "n_legs": row["n_legs"],
             "side": row["side"], "response_action": action,
             "size": row["size"], "size_unit": row["size_unit"],
@@ -273,9 +281,16 @@ def _kill_switch(conn: sqlite3.Connection) -> dict | None:
 
 def engine_status(conn: sqlite3.Connection, budget_ms: float = 400) -> dict[str, Any]:
     health = conn.execute("SELECT * FROM live_engine_health WHERE id=1").fetchone()
-    samples = _rows(conn, "SELECT wait_ms, compute_ms FROM quote_latency "
-                    "WHERE source='live_capture' ORDER BY id DESC LIMIT 5000")
+    # delivery/queue and fetch/solve are added by a later migration; a stale DB
+    # opened read-only may not have them, so only select the columns present.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(quote_latency)")}
+    cols = [c for c in ("wait_ms", "compute_ms", "delivery_ms", "queue_ms",
+                        "fetch_ms", "solve_ms") if c in have]
+    samples = _rows(conn, f"SELECT {', '.join(cols)} FROM quote_latency "
+                    "WHERE source='live_capture' ORDER BY id DESC LIMIT 5000") if cols else []
     def distribution(key: str) -> dict:
+        if key not in have:
+            return {"p50": None, "p95": None, "max": None}
         values = sorted(x[key] for x in samples if x[key] is not None)
         if not values:
             return {"p50": None, "p95": None, "max": None}
@@ -284,6 +299,8 @@ def engine_status(conn: sqlite3.Connection, budget_ms: float = 400) -> dict[str,
                 "max": values[-1]}
     return {"health": dict(health) if health else None,
             "wait": distribution("wait_ms"), "compute": distribution("compute_ms"),
+            "delivery": distribution("delivery_ms"), "queue": distribution("queue_ms"),
+            "fetch": distribution("fetch_ms"), "solve": distribution("solve_ms"),
             "budget_ms": budget_ms, "samples": len(samples),
             "reasons": _rows(conn, "SELECT reason_code, COUNT(*) AS n FROM priced_quotes "
                              "WHERE trigger='auto' AND status != 'QUOTED' "
