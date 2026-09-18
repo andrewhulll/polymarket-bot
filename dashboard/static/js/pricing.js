@@ -19,7 +19,7 @@ async function refreshPricing() {
   $("pricing-prev").disabled = data.page <= 1;
   $("pricing-next").disabled = data.page >= pages;
   $("pricing-count").textContent =
-    `${data.total.toLocaleString()} priced RFQs · Trade and edges appear only when an accepted Combo trade is observed`;
+    `${data.total.toLocaleString()} priced RFQs · Market ref is the accepted Combo trade when observed (◉), else the leg-implied naive price (○)`;
 
   const quoted = data.rows.filter((r) => r.status === "QUOTED");
   const edges = quoted.map((r) => r.edge_vs_market).filter((v) => v != null);
@@ -71,7 +71,7 @@ async function openPricingDrawer(rfqId) {
       ${kpi("Our price", fmtPrice(r.response_price))}
       ${kpi("Model fair", fmtPrice(r.fair))}
       ${kpi("Naive", fmtPrice(r.naive))}
-      ${kpi("Observed trade", fmtPrice(r.market_price))}
+      ${kpi("Market ref", fmtPrice(r.market_price))}
     </div>
     <dl class="kv">
       <dt>Quote edge</dt><dd>${fmtEdge(r.edge_vs_market)} <span class="dim">(our price vs ${esc(r.market_source || "market")})</span></dd>
