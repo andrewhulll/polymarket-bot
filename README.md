@@ -436,23 +436,28 @@ Rules (enforced by tests):
 
 ### Dashboard live monitor
 
-Start the dashboard from the repo root:
+Watch the live feed from the repo root:
 
 ```bash
-streamlit run dashboard/app.py
+python -m dashboard.server
 ```
 
-When the dashboard starts, it starts the headless capture process if no reader
-is running. A process lock prevents duplicate readers, including when multiple
-dashboard sessions open. To run capture without the dashboard, use
-`python3 scripts/capture_live_rfqs.py --data-dir data/live`.
+then open http://127.0.0.1:8000. The page polls small read-only JSON
+endpoints and patches itself in place -- it never full-refreshes, so scroll
+position and row selection survive feed updates. (The Streamlit app
+`dashboard/app.py` still hosts the NFL backtest-research tab.)
 
-The capture process owns the quoter-gateway websocket, screening, paper
-pricing and SQLite writes. The **Live monitor RFQ feed** control opens a
-read-only viewer of `data/live/rfq_capture.db`; closing or slowing the page
-does not delay pricing. The dashboard refreshes every 0.75 seconds. Gateway
-credentials come from the environment or the gitignored `.env` file. The
-runner never submits a quote.
+Run the headless capture separately -- the dashboard never starts it:
+
+```bash
+python3 scripts/capture_live_rfqs.py --data-dir data/live
+```
+
+A process lock prevents duplicate readers. The capture process owns the
+quoter-gateway websocket, screening, paper pricing and SQLite writes; the
+dashboard is a read-only viewer of `data/live/rfq_capture.db`, so closing or
+slowing the page does not delay pricing. Gateway credentials come from the
+environment or the gitignored `.env` file. The runner never submits a quote.
 
 ### How live polling works
 
@@ -519,7 +524,7 @@ pick up the RFQ beta on the next successful poll.
 export POLYMARKET_US_KEY_ID="..."
 export POLYMARKET_US_SECRET_KEY="..."
 pip install polymarket-us
-# dashboard: streamlit run dashboard/app.py, then press "Live monitor RFQ feed"
+# dashboard: python -m dashboard.server, then open http://127.0.0.1:8000
 # (without the gateway keys set); or drive the source directly:
 python3 -c "
 from combo_mm import EventStore, PollingConsumer, RetailPollingSource
@@ -605,10 +610,10 @@ Rules (enforced by tests):
 
 ### Dashboard
 
-Start `scripts/capture_live_rfqs.py` and press **Live monitor RFQ feed** in the
-dashboard. The RFQs, Pricing & quoting, Performance and Engine status views
-read its SQLite database. **Stop live monitor** stops this page's refresh; the
-headless engine continues until stopped in its own shell.
+Start `scripts/capture_live_rfqs.py`, then `python -m dashboard.server` and open
+http://127.0.0.1:8000. The RFQs, Pricing & quoting, Performance and Engine
+status views read its SQLite database. Closing the page stops the browser
+polling; the headless engine continues until stopped in its own shell.
 
 ### Leg markets (combo catalog)
 

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Combo RFQ bot — live dashboard</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="dot" id="health-dot" title="capture database"></span>
+    <h1>Combo RFQ bot <span class="sub">live · paper only</span></h1>
+  </div>
+  <nav id="tabs">
+    <button data-tab="rfqs" class="active">RFQs</button>
+    <button data-tab="pricing">Pricing &amp; quoting</button>
+    <button data-tab="performance">Performance</button>
+    <button data-tab="engine">Engine status</button>
+  </nav>
+  <div class="meta"><span id="updated">—</span><span id="paused" class="hidden">paused (tab hidden)</span></div>
+</header>
+<main>
+  <section id="tab-rfqs" class="tab active">
+    <div class="toolbar">
+      <label class="toggle"><input type="checkbox" id="only-quotable"> Show only RFQs we want to quote</label>
+      <span class="spacer"></span>
+      <button id="rfq-prev">‹ Prev</button>
+      <span id="rfq-page-label"></span>
+      <button id="rfq-next">Next ›</button>
+    </div>
+    <p class="caption" id="rfq-count"></p>
+    <p class="caption">Newest first. The checks come from the live screening rules and configured share minimum. Cash-notional sizing is checked during pricing. Click a row to inspect its pricing.</p>
+    <div class="table-wrap"><table id="rfq-table">
+      <thead><tr><th>RFQ</th><th>Want to quote</th><th>Screen</th><th>Known legs</th><th>NFL same game</th><th>No unsupported same game</th><th>Size minimum</th><th>Legs</th><th>Size</th><th>Posted</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <section id="tab-pricing" class="tab">
+    <div class="toolbar">
+      <span class="spacer"></span>
+      <button id="pricing-prev">‹ Prev</button>
+      <span id="pricing-page-label"></span>
+      <button id="pricing-next">Next ›</button>
+    </div>
+    <p class="caption" id="pricing-count"></p>
+    <div class="table-wrap"><table id="pricing-table">
+      <thead><tr><th>RFQ</th><th>Decision</th><th>Reason</th><th>Our price</th><th>Size</th><th>Market price</th><th>Wait (ms)</th><th>Compute (ms)</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div id="pricing-detail" class="detail hidden"></div>
+  </section>
+
+  <section id="tab-performance" class="tab">
+    <p class="caption">Shadow fills count only our quoted RFQs whose price would have beaten the market: the accepted RFQ trade when observed, otherwise the leg-implied (naive) price. Realized P&amp;L requires settled legs.</p>
+    <div class="cards" id="perf-cards"></div>
+    <div class="charts">
+      <div class="chart"><h3>Net notional</h3><svg id="chart-notional" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
+      <div class="chart"><h3>Realized P&amp;L</h3><svg id="chart-realized" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
+    </div>
+    <div class="breakdowns">
+      <div><h3>Combo family</h3><div class="table-wrap"><table id="perf-family"><thead><tr><th>family</th><th>shadow_fills</th><th>expected_pnl</th><th>realized_pnl</th></tr></thead><tbody></tbody></table></div></div>
+      <div><h3>Leg count</h3><div class="table-wrap"><table id="perf-legs"><thead><tr><th>n_legs</th><th>shadow_fills</th><th>expected_pnl</th><th>realized_pnl</th></tr></thead><tbody></tbody></table></div></div>
+      <div><h3>Game</h3><div class="table-wrap"><table id="perf-game"><thead><tr><th>game</th><th>shadow_fills</th><th>expected_pnl</th><th>realized_pnl</th></tr></thead><tbody></tbody></table></div></div>
+    </div>
+  </section>
+
+  <section id="tab-engine" class="tab">
+    <div id="engine-health"></div>
+    <h2>Quote latency · <span id="latency-budget"></span> ms budget</h2>
+    <p class="caption">Wait starts at the exchange posting timestamp when the gateway supplies it; otherwise the gateway receive timestamp is the observable lower bound.</p>
+    <div id="latency-alert"></div>
+    <div class="table-wrap"><table id="latency-table">
+      <thead><tr><th>Stage</th><th>p50 (ms)</th><th>p95 (ms)</th><th>max (ms)</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <h2>Decline and skip reasons</h2>
+    <div class="table-wrap"><table id="reasons-table">
+      <thead><tr><th>reason_code</th><th>n</th></tr></thead><tbody></tbody>
+    </table></div>
+    <h2>Stored draft quotes</h2>
+    <div class="table-wrap"><table id="drafts-table">
+      <thead><tr><th>quote_id</th><th>rfq_id</th><th>buy_price</th><th>sell_price</th><th>buy_qty</th><th>sell_qty</th><th>created</th></tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+
+  <div id="waiting" class="waiting hidden">Waiting for the headless capture database…</div>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
