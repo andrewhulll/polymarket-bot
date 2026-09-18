@@ -262,19 +262,27 @@ def test_pricing_model_edge(server):
 
 def test_performance_endpoint(server):
     p = get_json(server, "/api/performance")
-    # Only R1 has an accepted trade to score against; R3 never traded, so it
-    # is not scored -- the page reflects only RFQs that actually traded.
-    assert p["quoted"] == 2 and p["shadow_fills"] == 1
-    assert p["win_rate"] == 0.5
+    # R3 never traded: its quote stands as an assumed win. R1's trade did not
+    # beat its quote, so both fill.
+    assert p["quoted"] == 2 and p["shadow_fills"] == 2
+    assert p["win_rate"] == 1.0
     assert p["by_family"][0]["family"] == "Moneyline + Spread"
-    assert len(p["curve"]) == 1
+    assert len(p["curve"]) == 2
 
 
 def test_fills_endpoint(server):
     fills = get_json(server, "/api/fills")
-    # R3 never traded, so it is not scored; only R1 fills, against its trade.
-    assert fills["total"] == 1 and len(fills["rows"]) == 1
-    only = fills["rows"][0]
+    # Newest first: R3 (no trade -> assumed win), then R1 (trade did not beat it).
+    assert fills["total"] == 2 and len(fills["rows"]) == 2
+    untraded, traded = fills["rows"]
+    assert untraded["rfq_id"] == "R3"
+    # R3: BUY 0.40, fair 0.42, settled YES at 1.0, no market reference.
+    assert untraded["market_price"] is None
+    assert untraded["market_source"] == "no observed trade"
+    assert untraded["quote_edge"] is None and untraded["model_edge"] is None
+    assert abs(untraded["expected_pnl"] - 0.2) < 1e-9    # +1 * (0.42 - 0.40) * 10
+    assert abs(untraded["realized_pnl"] - 6.0) < 1e-9    # +1 * (1 - 0.40) * 10
+    only = traded
     assert only["rfq_id"] == "R1"
     # R1: SELL 0.60 vs accepted trade 0.62, fair 0.58, settled YES at 1.0
     assert only["market_source"] == "accepted trade"
@@ -284,7 +292,7 @@ def test_fills_endpoint(server):
     assert abs(only["realized_pnl"] - (-10.0)) < 1e-9  # -1 * (1 - 0.60) * 25: sold a winner
     assert only["settled_legs"] == 2 and only["total_legs"] == 2
     page2 = get_json(server, "/api/fills?page=2")
-    assert page2["total"] == 1 and page2["rows"] == []
+    assert page2["total"] == 2 and page2["rows"] == []
 
 
 def test_exposure_endpoint(server):

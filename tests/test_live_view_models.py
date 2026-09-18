@@ -99,13 +99,12 @@ def test_gateway_wakes_headless_consumer_on_frame():
     assert not adapter.wait_for_items(0)
 
 
-def test_no_observed_trade_has_no_market_reference(tmp_path):
-    """Without an observed accepted trade there is no market price at all.
+def test_no_observed_trade_is_an_assumed_win(tmp_path):
+    """Without an observed accepted trade the quote stands as an assumed win.
 
     The leg-implied naive combo price is our own number, not the market's, so
-    it never stands in as the reference. An RFQ that never traded on the feed
-    carries no market price, no market edge, and is not scored as a shadow
-    fill -- it stays visible on the pricing tab but off the performance page.
+    it never stands in as the reference: the fill carries no market price and
+    no market edge. Only a trade that beats our quote removes the fill.
     """
     path = tmp_path / "capture.db"
     store = EventStore(str(path))
@@ -153,9 +152,21 @@ def test_no_observed_trade_has_no_market_reference(tmp_path):
 
         pnl = performance(conn)
         assert pnl["quoted"] == 3
-        assert pnl["shadow_fills"] == 0  # no accepted trades -> nothing to score
-        assert pnl["by_market_source"] == []
-        assert fills(conn) == []
+        # No accepted trades -> every quote stands as an assumed win.
+        assert pnl["shadow_fills"] == 3
+        # SELL: expected = -(fair - price) * 10 -> -.2, -.2, +.8
+        assert pnl["by_market_source"] == [
+            {"market_source": "no observed trade", "shadow_fills": 3,
+             "expected_pnl": pytest.approx(0.4), "realized_pnl": 0}]
+        by_id = {f["rfq_id"]: f for f in fills(conn)}
+        assert set(by_id) == {"rfq-2", "rfq-3", "rfq-4"}
+        for f in by_id.values():
+            assert f["market_price"] is None
+            assert f["market_source"] == "no observed trade"
+            assert f["quote_edge"] is None
+            assert f["model_edge"] is None
+        assert by_id["rfq-4"]["after_deadline"] is True
+        assert by_id["rfq-2"]["after_deadline"] is False
 
 
 def test_observed_trade_still_takes_precedence_over_naive(tmp_path):
@@ -195,6 +206,46 @@ def test_observed_trade_still_takes_precedence_over_naive(tmp_path):
         by_id = {f["rfq_id"]: f for f in fills(conn)}
         assert by_id["rfq-9"]["market_source"] == "accepted trade"
         assert by_id["rfq-9"]["market_price"] == .43
+    quotes.close()
+    store.close()
+
+
+def test_beating_trade_removes_fill(tmp_path):
+    """An accepted trade better than our quote means we lost the auction."""
+    path = tmp_path / "capture.db"
+    store = EventStore(str(path))
+    quotes = QuoteSelectionStore(path)
+    posted = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+    raw = {
+        "event_type": "rfq_created", "rfq_id": "rfq-b", "event_id": "event-rfq-b",
+        "symbol": "combo", "createdTime": posted.isoformat(),
+        "updatedTime": posted.isoformat(), "status": "RFQ_STATUS_OPEN",
+        "qtyDecimal": "10", "comboLegs": [
+            {"symbol": "leg-1", "side": "YES"},
+            {"symbol": "leg-2", "side": "YES"}],
+    }
+    assert store.apply(normalize(raw, now=posted))
+    store.upsert_rfq_screen("rfq-b", n_legs=2, n_resolved=2, n_nfl_legs=2,
+                            screen="QUOTABLE", rank=0, catalog_version=1,
+                            checks_json=json.dumps({"known legs": True}))
+    quotes.record_priced_quote({
+        "rfq_id": "rfq-b", "priced_at": posted.isoformat(), "status": "QUOTED",
+        "reason_code": "QUOTED_OK", "response_action": "SELL",
+        "response_price": .40, "size": 10, "size_unit": "shares",
+        "fair": .42, "naive": .45, "side": "YES", "games": [{"game": "SEA-ARI"}],
+        "components": {"base": 5}}, "auto")
+    store.record_shadow_draft(quote_id="paper:rfq-b:auto", rfq_id="rfq-b",
+                              buy_price=.40, sell_price=.45,
+                              buy_qty="10", sell_qty="10")
+    # Someone else sold at .38, undercutting our .40 ask: we lost.
+    store.record_live_trade("rfq-b", .38, 10, posted.isoformat())
+
+    with connect_readonly(path) as conn:
+        assert performance(conn)["shadow_fills"] == 0
+        assert fills(conn) == []
+        row = pricing(conn, rfq_id="rfq-b")[0]
+        assert row["market_price"] == .38
+        assert row["edge_vs_market"] == pytest.approx(0.02)  # SELL: -1*(.38-.40)
     quotes.close()
     store.close()
 
