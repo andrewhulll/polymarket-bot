@@ -1,5 +1,7 @@
 """Live feed -> screen -> pricing model -> logged bid/ask, end to end (paper only)."""
 import inspect
+import threading
+import time
 
 import pytest
 from datetime import datetime, timezone
@@ -176,3 +178,68 @@ def test_the_quoting_path_cannot_submit_a_quote():
                    combo_mm.nfl.params_provider, combo_mm.leg_books):
         source = inspect.getsource(module).lower()
         assert not any(name in source for name in banned), module.__name__
+
+
+def _pool_quoter(workers):
+    """A quoter with real worker threads over the deterministic stub books."""
+    catalog = ComboMarketCatalog()
+    catalog.merge(parse_catalog_page(catalog_payload()))
+    books = StubBooks(now_ms=NOW_MS, kickoffs={"4384970": KICKOFF2, "4384971": KICKOFF2,
+                                               "4384972": KICKOFF2})
+    selections = QuoteSelectionStore()
+    pricer = NflLivePricer(catalog, books, ParamsProvider(PARAMS_DIR))
+    return (LiveQuoter(pricer, selections, workers=workers, start_worker=True,
+                       clock=lambda: NOW), selections)
+
+
+def test_worker_pool_makes_the_same_decisions_as_a_single_worker():
+    legs = (ML_HOME, FAV_COVER)
+    n = 20
+    results = {}
+    for workers in (1, 4):
+        quoter, selections = _pool_quoter(workers)
+        try:
+            for i in range(n):
+                assert quoter.submit(LiveRfq(rfq_id=f"P{i}", leg_position_ids=legs))
+            deadline = time.monotonic() + 60
+            while quoter.priced < n and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert quoter.priced == n, f"workers={workers} priced {quoter.priced}/{n}"
+            rows = {r["rfq_id"]: (r["status"], r["bid"], r["ask"], r["fair"], r["reason_code"])
+                    for r in selections.list_priced_quotes()}
+            assert len(rows) == n
+            results[workers] = rows
+        finally:
+            quoter.stop()
+    assert results[1] == results[4]
+
+
+def test_worker_pool_counts_every_submission_exactly_once():
+    quoter, selections = _pool_quoter(4)
+    try:
+        n = 50
+        for i in range(n):
+            quoter.submit(LiveRfq(rfq_id=f"C{i}", leg_position_ids=(ML_HOME, FAV_COVER)))
+        quoter._queue.join()
+        stats = quoter.stats()
+        assert stats["submitted"] == n
+        assert stats["priced"] == n
+        assert stats["quoted"] + stats["declined"] == n
+        assert len(selections.list_priced_quotes()) == n
+    finally:
+        quoter.stop()
+
+
+def test_stop_joins_every_worker_thread():
+    quoter, _ = _pool_quoter(3)
+    try:
+        assert len(quoter._threads) == 3
+        assert all(t.is_alive() for t in quoter._threads)
+    finally:
+        quoter.stop()
+    assert quoter._threads == []
+
+
+def test_workers_must_be_positive():
+    with pytest.raises(ValueError):
+        LiveQuoter(None, None, workers=0)
