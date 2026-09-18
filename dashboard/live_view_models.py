@@ -98,9 +98,8 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
                p.response_action, p.size, p.size_unit, p.fair, p.naive,
                p.detail_json, p.priced_at, p.side, p.after_deadline,
                q.model_version, q.params_version, q.decided_by,
-               COALESCE(t.price, p.naive) AS market_price,
-               CASE WHEN t.price IS NOT NULL THEN 'accepted trade'
-                    WHEN p.naive IS NOT NULL THEN 'leg-implied naive' END AS market_source,
+               t.price AS market_price,
+               CASE WHEN t.price IS NOT NULL THEN 'accepted trade' END AS market_source,
                t.size AS market_size,
                l.wait_ms, l.compute_ms
         FROM rfq_screen s JOIN rfq r USING (rfq_id)
@@ -133,16 +132,17 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
 def _fill_candidates(conn: sqlite3.Connection) -> list[dict]:
     """Quoted RFQs that could have filled against the market reference.
 
-    An observed accepted trade is the reference when we have one; otherwise the
-    leg-implied naive combo price stands in, so every quoted RFQ is scored on
-    the performance page, not just the rare ones with a matching Combo trade.
-    Late (after-deadline) quotes stay in the ledger, flagged on the fill.
+    The market reference is the observed accepted ``RFQ_TRADE`` price and
+    nothing else: an RFQ with no accepted trade has no market price, so it is
+    not scored as a shadow fill (``_to_fill`` drops it). The leg-implied naive
+    combo price is *our* number, not the market's, so it never stands in here
+    -- the performance page reflects only RFQs that actually traded on the
+    feed. Late (after-deadline) quotes stay in the ledger, flagged on the fill.
     """
     return _rows(conn, """
         SELECT p.*,
-               COALESCE(t.price, p.naive) AS market_price,
-               CASE WHEN t.price IS NOT NULL THEN 'accepted trade'
-                    ELSE 'leg-implied naive' END AS market_source,
+               t.price AS market_price,
+               CASE WHEN t.price IS NOT NULL THEN 'accepted trade' END AS market_source,
                t.executed_at, r.created_time, s.n_legs
         FROM priced_quotes p LEFT JOIN live_trades t ON t.rfq_id = p.rfq_id
         JOIN rfq r ON r.rfq_id = p.rfq_id JOIN rfq_screen s ON s.rfq_id = p.rfq_id

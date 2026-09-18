@@ -19,7 +19,7 @@ async function refreshPricing() {
   $("pricing-prev").disabled = data.page <= 1;
   $("pricing-next").disabled = data.page >= pages;
   $("pricing-count").textContent =
-    `${data.total.toLocaleString()} priced RFQs · Market ref is the accepted Combo trade when observed (◉), else the leg-implied naive price (○)`;
+    `${data.total.toLocaleString()} priced RFQs · Market ref is the accepted Combo trade (◉) when observed; RFQs that never traded have no market ref`;
 
   const quoted = data.rows.filter((r) => r.status === "QUOTED");
   const edges = quoted.map((r) => r.edge_vs_market).filter((v) => v != null);
@@ -39,7 +39,7 @@ async function refreshPricing() {
     `<td class="num"><b>${fmtPrice(r.response_price)}</b></td>` +
     `<td class="num">${fmtPrice(r.fair)}</td>` +
     `<td class="num">${fmtPrice(r.naive)}</td>` +
-    `<td class="num">${fmtPrice(r.market_price)}${r.market_source ? ` <span class="dim" title="${esc(r.market_source)}">${r.market_source === "accepted trade" ? "◉" : "○"}</span>` : ""}</td>` +
+    `<td class="num">${fmtPrice(r.market_price)}${r.market_source ? ` <span class="dim" title="${esc(r.market_source)}">◉</span>` : ""}</td>` +
     `<td class="num">${fmtEdge(r.edge_vs_market)}</td>` +
     `<td class="num">${fmtEdge(r.model_edge)}</td>` +
     `<td class="num">${fmtMs(r.wait_ms)}</td>` +

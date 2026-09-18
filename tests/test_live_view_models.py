@@ -97,8 +97,14 @@ def test_gateway_wakes_headless_consumer_on_frame():
     assert not adapter.wait_for_items(0)
 
 
-def test_no_observed_trade_falls_back_to_leg_implied_naive(tmp_path):
-    """Without an observed trade, the naive price is the market reference."""
+def test_no_observed_trade_has_no_market_reference(tmp_path):
+    """Without an observed accepted trade there is no market price at all.
+
+    The leg-implied naive combo price is our own number, not the market's, so
+    it never stands in as the reference. An RFQ that never traded on the feed
+    carries no market price, no market edge, and is not scored as a shadow
+    fill -- it stays visible on the pricing tab but off the performance page.
+    """
     path = tmp_path / "capture.db"
     store = EventStore(str(path))
     quotes = QuoteSelectionStore(path)
@@ -128,9 +134,7 @@ def test_no_observed_trade_falls_back_to_leg_implied_naive(tmp_path):
                                   buy_price=response_price, sell_price=.45,
                                   buy_qty="10", sell_qty="10")
 
-    # Neither RFQ has an observed Combo trade. rfq-2 beats the naive price
-    # (SELL @ .40 vs .45); rfq-3 is worse than naive (SELL @ .50 vs .45).
-    # rfq-4 is quoted after the deadline but must still be logged, flagged.
+    # None of these RFQs traded on the feed, so none has a market reference.
     add_rfq("rfq-2", .40, .45)
     add_rfq("rfq-3", .50, .45)
     add_rfq("rfq-4", .40, .45, after_deadline=True)
@@ -138,24 +142,18 @@ def test_no_observed_trade_falls_back_to_leg_implied_naive(tmp_path):
     with connect_readonly(path) as conn:
         detail = {row["rfq_id"]: row for row in pricing(conn)}
         for row in detail.values():
+            # naive stays available as our own number, but it is not the market.
             assert row["naive"] == .45
-            assert row["market_price"] == .45
-            assert row["market_source"] == "leg-implied naive"
-        assert detail["rfq-2"]["edge_vs_market"] == pytest.approx(-0.05)
+            assert row["market_price"] is None
+            assert row["market_source"] is None
+            assert row["edge_vs_market"] is None
         assert detail["rfq-4"]["after_deadline"] == 1
 
         pnl = performance(conn)
         assert pnl["quoted"] == 3
-        assert pnl["shadow_fills"] == 2  # rfq-3 was worse than the market ref
-        assert pnl["by_market_source"] == [
-            {"market_source": "leg-implied naive", "shadow_fills": 2,
-             "expected_pnl": pnl["expected_pnl"],
-             "realized_pnl": pnl["realized_pnl"]}]
-        by_id = {f["rfq_id"]: f for f in fills(conn)}
-        assert by_id["rfq-2"]["market_source"] == "leg-implied naive"
-        assert by_id["rfq-2"]["after_deadline"] is False
-        assert by_id["rfq-4"]["after_deadline"] is True
-        assert "rfq-3" not in by_id
+        assert pnl["shadow_fills"] == 0  # no accepted trades -> nothing to score
+        assert pnl["by_market_source"] == []
+        assert fills(conn) == []
 
 
 def test_observed_trade_still_takes_precedence_over_naive(tmp_path):

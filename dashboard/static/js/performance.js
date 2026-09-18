@@ -79,7 +79,7 @@ function refreshFillsTable(fills) {
     `<td class="num">${fmtPrice(r.naive)}</td>` +
     `<td class="num">${fmtPrice(r.fair)}</td>` +
     `<td class="num"><b>${fmtPrice(r.our_price)}</b></td>` +
-    `<td class="num">${fmtPrice(r.market_price)}${r.market_source ? ` <span class="dim" title="${esc(r.market_source)}">${r.market_source === "accepted trade" ? "◉" : "○"}</span>` : ""}</td>` +
+    `<td class="num">${fmtPrice(r.market_price)}${r.market_source ? ` <span class="dim" title="${esc(r.market_source)}">◉</span>` : ""}</td>` +
     `<td class="num">${fmtEdge(r.quote_edge)}</td>` +
     `<td class="num"><span class="${(r.expected_pnl ?? 0) >= 0 ? "pos" : "neg"}">${fmtMoney(r.expected_pnl)}</span></td>` +
     `<td class="num"><span class="${(r.realized_pnl ?? 0) >= 0 ? "pos" : "neg"}">${fmtMoney(r.realized_pnl)}</span></td>` +
