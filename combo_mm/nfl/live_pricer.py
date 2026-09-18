@@ -150,7 +150,8 @@ class LiveRfq:
     qty_decimal: Optional[str] = None     # shares
     cash_order_qty: Optional[str] = None  # notional
     submission_deadline_ms: Optional[int] = None
-    received_at: Optional[str] = None
+    received_at: Optional[str] = None       # upstream post time (from the gateway)
+    local_received_at: Optional[str] = None  # when this process first saw the frame
 
     @property
     def size(self) -> Optional[str]:
@@ -351,7 +352,9 @@ class NflLivePricer:
         refs = [leg.ref for leg in legs]
         for spreads, totals in calib_refs.values():
             refs += [LegRef(m.market_id, 0) for m in spreads + totals]
+        _t_fetch = time.perf_counter()
         books = self.book_source.books(list(dict.fromkeys(refs)))
+        book_fetch_ms = round((time.perf_counter() - _t_fetch) * 1000.0, 2)
         now_ms = int(now.timestamp() * 1000)
         mark_inputs: List[LegMarkInput] = []
         for leg in legs:
@@ -368,6 +371,7 @@ class NflLivePricer:
         explanations: List[str] = []
         confidence_hits: List[Tuple[str, float]] = []
         max_gap = 0.0
+        _t_solve = time.perf_counter()
         for game, members in blocks.items():
             info = self._price_block(game, members, calib_refs[game], books, handle, now_ms)
             fair_yes *= info["fair"]
@@ -376,6 +380,7 @@ class NflLivePricer:
             quote.games.append(info["report"])
             explanations += info["explanations"]
             confidence_hits += info["confidence_hits"]
+        solve_ms = round((time.perf_counter() - _t_solve) * 1000.0, 2)
         for leg in independent:
             fair_yes *= leg.q  # type: ignore[operator]
             model_joint_yes *= leg.q  # type: ignore[operator]
@@ -417,6 +422,10 @@ class NflLivePricer:
             fair_override=fair_side)
         components = dict(decision.components)
         components.pop("naive_fair", None)  # YES-leg product; logged as naive_yes instead
+        # Compute-time breakdown so the dashboard can tell a slow book fetch
+        # (network) from a slow joint solve (numpy/scipy), not just their sum.
+        components["book_fetch_ms"] = book_fetch_ms
+        components["solve_ms"] = solve_ms
         quote.components = components
         quote.fair = round(fair_side, 6)
         leg_spread_bps = sum(float(m.get("spread_bps", 0.0)) for m in components.get("leg_marks", []))

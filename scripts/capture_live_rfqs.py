@@ -147,11 +147,15 @@ class RfqCapture:
                 input_snapshot_json=json.dumps(quote.to_dict(), sort_keys=True),
                 decided_by="headless-paper", decided_at=decided.isoformat())
         if rfq.received_at:
+            components = quote.components or {}
             self.store.record_live_latency(
                 rfq_id=rfq.rfq_id, posted_at=rfq.received_at,
                 started_at=started.isoformat(),
-                decided_at=datetime.now(timezone.utc).isoformat(),
-                quoted=quote.quoted)
+                decided_at=decided.isoformat(),
+                quoted=quote.quoted,
+                fetch_ms=components.get("book_fetch_ms"),
+                solve_ms=components.get("solve_ms"),
+                local_received_at=rfq.local_received_at)
 
     def heartbeat(self, adapter: InternationalQuoterGatewayAdapter) -> None:
         stats = adapter.stats()
@@ -244,7 +248,8 @@ class RfqCapture:
                     cash_order_qty=(str(raw["cashOrderQty"]) if raw.get("cashOrderQty") is not None else None),
                     submission_deadline_ms=int(raw["submission_deadline"])
                     if raw.get("submission_deadline") else None,
-                    received_at=raw.get("createdTime") or raw.get("exchange_ts"))
+                    received_at=raw.get("createdTime") or raw.get("exchange_ts"),
+                    local_received_at=now.isoformat())
                 if not self.quoter.submit(rfq):
                     self.selections.record_priced_quote({
                         "rfq_id": rfq_id, "priced_at": datetime.now(timezone.utc).isoformat(),
@@ -362,12 +367,15 @@ def main(argv: Optional[list] = None) -> int:
                 log.info(
                     "rfqs=%d nfl=%d trades=%d catalog=%d gateway_connected=%s "
                     "quoter_submitted=%d quoter_priced=%d quoter_queued=%d "
-                    "quoter_dropped=%d gateway_buffer_drops=%d",
+                    "quoter_dropped=%d gateway_buffer_drops=%d "
+                    "clob_fetches=%s gamma_fetches=%s book_last_error=%s",
                     capture.rfqs_seen, capture.nfl_rfqs_seen,
                     capture.trades_seen, len(capture.catalog), adapter.connected,
                     quoter_stats.get("submitted", 0), quoter_stats.get("priced", 0),
                     quoter_stats.get("queued", 0), quoter_stats.get("dropped", 0),
-                    adapter.stats()["buffer_drops"])
+                    adapter.stats()["buffer_drops"],
+                    quoter_stats.get("clob_fetches"), quoter_stats.get("gamma_fetches"),
+                    quoter_stats.get("book_last_error"))
                 last_log = time.monotonic()
             if args.duration is not None and time.monotonic() - start_time >= args.duration:
                 break

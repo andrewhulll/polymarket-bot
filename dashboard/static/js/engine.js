@@ -35,9 +35,18 @@ async function refreshEngine() {
 
   const dist = (d) => d || {};
   const w = dist(eng.wait), c = dist(eng.compute);
+  const dl = dist(eng.delivery), q = dist(eng.queue);
+  const fe = dist(eng.fetch), so = dist(eng.solve);
+  const row = (label, d, cls) =>
+    `<tr class="${cls || ""}"><td>${label}</td><td class="num">${fmtMs(d.p50)}</td>` +
+    `<td class="num">${fmtMs(d.p95)}</td><td class="num">${fmtMs(d.max)}</td></tr>`;
   setRows("latency-table",
-    `<tr><td>Wait (posted → engine)</td><td class="num">${fmtMs(w.p50)}</td><td class="num">${fmtMs(w.p95)}</td><td class="num">${fmtMs(w.max)}</td></tr>` +
-    `<tr><td>Compute (engine → decision)</td><td class="num">${fmtMs(c.p50)}</td><td class="num">${fmtMs(c.p95)}</td><td class="num">${fmtMs(c.max)}</td></tr>`);
+    row("Wait (posted → engine)", w) +
+    row("&nbsp;&nbsp;• delivery (network + clock)", dl, "dim") +
+    row("&nbsp;&nbsp;• queue (our backlog)", q, "dim") +
+    row("Compute (engine → decision)", c) +
+    row("&nbsp;&nbsp;• book fetch (network)", fe, "dim") +
+    row("&nbsp;&nbsp;• solve (model)", so, "dim"));
 
   const reasons = eng.reasons || [];
   const total = reasons.reduce((a, r) => a + (r.n || 0), 0) || 1;

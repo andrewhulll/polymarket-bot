@@ -135,7 +135,7 @@ class LiveLegBooks:
 
     def __init__(self, *, get_json: Callable[[str], Any] = _http_get_json,
                  post_json: Callable[[str, Any], Any] = _http_post_json,
-                 book_ttl_s: float = 3.0, meta_ttl_s: float = 600.0,
+                 book_ttl_s: float = 15.0, meta_ttl_s: float = 600.0,
                  clock: Callable[[], float] = time.time) -> None:
         self._get = get_json
         self._post = post_json

@@ -162,6 +162,10 @@ class LiveQuoter:
     def _handle(self, rfq: LiveRfq, trigger: str) -> LiveQuote:
         started = self._clock()
         quote = self.pricer.price(rfq, now=started)
+        # Stamp the decision the instant pricing returns, before the durable
+        # writes below. Otherwise "compute" latency would fold in SQLite write
+        # time and cross-worker lock contention, not just the pricing itself.
+        decided = self._clock()
         with self._lock:
             self.priced += 1
             if quote.quoted:
@@ -190,7 +194,7 @@ class LiveQuoter:
             log.warning("failed to store priced quote: %s", type(exc).__name__)
         if self.on_decision is not None:
             try:
-                self.on_decision(rfq, quote, started, self._clock())
+                self.on_decision(rfq, quote, started, decided)
             except Exception as exc:
                 with self._lock:
                     self.errors += 1
@@ -200,6 +204,14 @@ class LiveQuoter:
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:
-            return {"submitted": self.submitted, "priced": self.priced, "quoted": self.quoted,
-                    "declined": self.declined, "dropped": self.dropped, "errors": self.errors,
-                    "queued": self.queued, "last_error": self.last_error}
+            out = {"submitted": self.submitted, "priced": self.priced, "quoted": self.quoted,
+                   "declined": self.declined, "dropped": self.dropped, "errors": self.errors,
+                   "queued": self.queued, "last_error": self.last_error}
+        # Book-source counters live on the pricer; surface them so a slow or
+        # failing CLOB/Gamma fetch is visible without opening the pricer.
+        book = getattr(self.pricer, "book_source", None)
+        if book is not None:
+            out["clob_fetches"] = getattr(book, "clob_fetches", None)
+            out["gamma_fetches"] = getattr(book, "gamma_fetches", None)
+            out["book_last_error"] = getattr(book, "last_error", None)
+        return out

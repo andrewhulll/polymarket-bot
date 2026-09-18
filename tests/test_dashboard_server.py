@@ -250,24 +250,35 @@ def test_pricing_model_edge(server):
     assert one["market_price"] == 0.62 and one["market_source"] == "accepted trade"
     assert abs(one["model_edge"] - 0.04) < 1e-9    # -1 * (0.58 - 0.62): fair < market, selling is right
     assert abs(one["edge_vs_market"] - (-0.02)) < 1e-9  # -1 * (0.62 - 0.60): sold below market
+    # No accepted trade: the leg-implied naive price is the market reference,
+    # so the quote is still scored (BUY 0.40 sign +1; naive 0.38).
     no_trade = get_json(server, "/api/pricing/R3")
     assert no_trade["naive"] == 0.38
-    assert no_trade["market_price"] is None
-    assert no_trade["edge_vs_market"] is None
+    assert no_trade["market_price"] == 0.38
+    assert no_trade["market_source"] == "leg-implied naive"
+    assert abs(no_trade["edge_vs_market"] - (-0.02)) < 1e-9  # 1 * (0.38 - 0.40)
 
 
 def test_performance_endpoint(server):
     p = get_json(server, "/api/performance")
-    assert p["quoted"] == 2 and p["shadow_fills"] == 1
-    assert p["win_rate"] == 0.5
+    # R1 fills against its accepted trade, R3 against the naive reference.
+    assert p["quoted"] == 2 and p["shadow_fills"] == 2
+    assert p["win_rate"] == 1.0
     assert p["by_family"][0]["family"] == "Moneyline + Spread"
-    assert len(p["curve"]) == 1
+    assert len(p["curve"]) == 2
 
 
 def test_fills_endpoint(server):
     fills = get_json(server, "/api/fills")
-    assert fills["total"] == 1 and len(fills["rows"]) == 1
-    older = fills["rows"][0]
+    assert fills["total"] == 2 and len(fills["rows"]) == 2
+    newest, older = fills["rows"][0], fills["rows"][1]
+    # R3 (newest): BUY 0.40 vs naive 0.38, fair 0.42, single leg settled YES at 1.0
+    assert newest["rfq_id"] == "R3"
+    assert newest["market_source"] == "leg-implied naive"
+    assert abs(newest["quote_edge"] - (-0.02)) < 1e-9   # 1 * (0.38 - 0.40): bought above ref
+    assert abs(newest["model_edge"] - 0.04) < 1e-9      # 1 * (0.42 - 0.38)
+    assert abs(newest["expected_pnl"] - 0.2) < 1e-9     # 1 * (0.42 - 0.40) * 10
+    assert abs(newest["realized_pnl"] - 6.0) < 1e-9     # 1 * (1 - 0.40) * 10: bought a winner
     assert older["rfq_id"] == "R1"
     # R1: SELL 0.60 vs accepted trade 0.62, fair 0.58, settled YES at 1.0
     assert older["market_source"] == "accepted trade"
@@ -277,7 +288,7 @@ def test_fills_endpoint(server):
     assert abs(older["realized_pnl"] - (-10.0)) < 1e-9  # -1 * (1 - 0.60) * 25: sold a winner
     assert older["settled_legs"] == 2 and older["total_legs"] == 2
     page2 = get_json(server, "/api/fills?page=2")
-    assert page2["total"] == 1 and page2["rows"] == []
+    assert page2["total"] == 2 and page2["rows"] == []
 
 
 def test_exposure_endpoint(server):
