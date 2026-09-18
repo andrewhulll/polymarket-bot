@@ -7,7 +7,7 @@ async function refreshEngine() {
   ]);
 
   const ks = eng.kill_switch;
-  $("killswitch-badge").classList.toggle("hidden", !(ks && ks.state === "engaged"));
+  $("killswitch-badge").classList.toggle("hidden", !(ks && ks.state === "tripped"));
 
   const h = eng.health || {};
   const hbAge = h.heartbeat_at ? (Date.now() - new Date(h.heartbeat_at).getTime()) / 1000 : null;
@@ -25,7 +25,7 @@ async function refreshEngine() {
 
   let alerts = "";
   if (stale) alerts += `<div class="alert error">Stale heartbeat — last seen ${esc(h.heartbeat_at || "never")}. The capture process may be down.</div>`;
-  if (ks && ks.state === "engaged") alerts += `<div class="alert error">Kill switch ENGAGED — ${esc(ks.trigger || "")} at ${esc(ks.ts || "")}.</div>`;
+  if (ks && ks.state === "tripped") alerts += `<div class="alert error">Kill switch ENGAGED — ${esc(ks.trigger || "")} at ${esc(ks.ts || "")}.</div>`;
   $("engine-alerts").innerHTML = alerts;
 
   const budget = eng.budget_ms;

@@ -104,6 +104,34 @@ def test_kill_switch_latches_until_explicit_reset():
     assert not provider().kill_switch
 
 
+def test_widen_fires_above_soft_utilization():
+    cfg = RiskConfig(policy="inventory", max_game_loss=5000.0)
+    check = InventoryRiskCheck(cfg)
+    inv = InventoryState(exposures={"G": 4500.0}, markets={"LEG": 0.0},
+                         teams={}, buying_power=45500.0, net_by_game={"G": 0.0})
+    verdict = check.check(_draft(100), 50.0, inv, "G")
+    assert verdict.ok
+    assert verdict.action == "widen"
+    assert verdict.widen_bps > 0
+    assert verdict.skew_bps == 0
+    assert verdict.adjusted_buy_price > 0.52   # offer pushed up
+    assert verdict.adjusted_sell_price < 0.48  # bid pushed down
+
+
+def test_skew_tilts_against_net_position():
+    cfg = RiskConfig(policy="inventory", max_game_loss=5000.0)
+    check = InventoryRiskCheck(cfg)
+    inv = InventoryState(exposures={"G": 1000.0}, markets={"LEG": 0.0},
+                         teams={}, buying_power=49000.0, net_by_game={"G": 2000.0})
+    verdict = check.check(_draft(100), 50.0, inv, "G")
+    assert verdict.ok
+    assert verdict.action == "skew"
+    assert verdict.widen_bps == 0
+    assert verdict.skew_bps > 0  # long inventory: skew positive
+    assert verdict.adjusted_buy_price < 0.52   # discourage buying more
+    assert verdict.adjusted_sell_price < 0.48  # encourage selling
+
+
 def test_offsetting_fills_release_executed_risk_and_realize_pnl():
     store = EventStore()
     with store._conn:

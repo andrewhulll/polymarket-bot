@@ -136,6 +136,7 @@ async function refresh() {
     else if (state.tab === "pricing") await refreshPricing();
     else if (state.tab === "performance") await refreshPerformance();
     else if (state.tab === "engine") await refreshEngine();
+    else if (state.tab === "inventory") await refreshInventory();
     else if (state.tab === "nfl") await refreshNfl();
     $("updated").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) { console.warn(e); }

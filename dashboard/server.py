@@ -10,8 +10,10 @@ Read-only by construction: every live endpoint opens the capture database throug
 process remains the sole writer. The only write-capable routes are two tightly
 allowlisted NFL research runners (``/api/nfl/run`` and ``/api/nfl/explorer/price``),
 which execute only the whitelisted research scripts against the repo's research
-inputs -- they can never touch the live database, credentials, or the network.
-Nothing here can submit a quote -- paper or otherwise.
+inputs -- they can never touch the live database, credentials, or the network --
+plus the manual kill-switch control (``/api/risk/kill-switch``), which writes a
+single row to ``kill_switch_events`` in the capture database so the engine halts
+paper quoting. Nothing here can submit a quote -- paper or otherwise.
 
 Run from the repository root::
 
@@ -24,6 +26,7 @@ import json
 import logging
 import sqlite3
 from contextlib import closing
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -42,6 +45,7 @@ STATIC_FILES = {"index.html": "text/html; charset=utf-8",
                 "js/pricing.js": "application/javascript; charset=utf-8",
                 "js/performance.js": "application/javascript; charset=utf-8",
                 "js/engine.js": "application/javascript; charset=utf-8",
+                "js/inventory.js": "application/javascript; charset=utf-8",
                 "js/nfl.js": "application/javascript; charset=utf-8",
                 "vendor/vega.min.js": "application/javascript; charset=utf-8",
                 "vendor/vega-lite.min.js": "application/javascript; charset=utf-8",
@@ -136,6 +140,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(*self._api_fills(query))
             elif path == "/api/exposure":
                 self._respond(*self._api_exposure())
+            elif path == "/api/inventory":
+                self._respond(*self._api_inventory())
             elif path == "/api/latency/histogram":
                 self._respond(*self._api_latency_histogram(query))
             elif path == "/api/risk":
@@ -163,7 +169,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 (http.server naming)
         # The only POST surface: the NFL research actions (explorer pricing and
-        # the allowlisted offline research scripts). Everything else is read-only.
+        # the allowlisted offline research scripts), the data-source switch,
+        # and the manual kill-switch control. Everything else is read-only.
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/api/nfl/explorer/price":
@@ -172,8 +179,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(*self._api_nfl_run())
             elif parsed.path == "/api/sources/active":
                 self._respond(*self._api_sources_active())
+            elif parsed.path == "/api/risk/kill-switch":
+                self._respond(*self._api_kill_switch())
             else:
                 self._respond(*_json({"error": "not found"}, 404))
+        except _Waiting as exc:
+            self._respond(*_json({"waiting": True, "detail": str(exc)}))
         except ValueError as exc:  # bad request body
             self._respond(*_json({"error": str(exc)}, 400))
         except Exception:
@@ -262,6 +273,46 @@ class Handler(BaseHTTPRequestHandler):
     def _api_exposure(self) -> tuple[int, str, bytes]:
         with closing(_connect()) as conn:
             return _json(vm.exposure(conn))
+
+    def _api_inventory(self) -> tuple[int, str, bytes]:
+        with closing(_connect()) as conn:
+            return _json(vm.inventory_state(conn))
+
+    def _api_kill_switch(self) -> tuple[int, str, bytes]:
+        """Manual kill-switch control: trip halts paper quoting, reset resumes.
+
+        Writes one row to ``kill_switch_events`` -- the same table (and the
+        same ``tripped``/``reset`` states) the engine's ``InventoryProvider``
+        reads on every RFQ, so the new state takes effect immediately. The
+        write is a single raw INSERT: the dashboard never opens an
+        ``EventStore`` handle, so it can't run schema migrations on the live
+        database. Paper-only: no quotes, orders, or credentials are involved.
+        """
+        body = self._read_json_body()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
+        action = body.get("action")
+        if action not in ("trip", "reset"):
+            raise ValueError("action must be 'trip' or 'reset'")
+        reason = body.get("reason") or f"dashboard manual {action}"
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        path = _db_path()
+        if not path.exists():
+            raise _Waiting(f"{path} not found yet")
+        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        conn = sqlite3.connect(str(path), timeout=5.0)
+        try:
+            conn.execute(
+                "INSERT INTO kill_switch_events (ts,state,trigger,detail_json) "
+                "VALUES (?,?,?,?)",
+                (ts, "tripped" if action == "trip" else "reset",
+                 reason.strip()[:200], "{}"))
+            conn.commit()
+        finally:
+            conn.close()
+        with closing(_connect()) as conn:
+            return _json({"action": action, "kill_switch": vm._kill_switch(conn)})
 
     def _api_latency_histogram(self, query: dict) -> tuple[int, str, bytes]:
         try:

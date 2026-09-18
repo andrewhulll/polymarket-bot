@@ -27,7 +27,10 @@ def make_db(path: Path) -> None:
                           status TEXT NOT NULL, last_event_id TEXT);
         CREATE TABLE rfq_screen (rfq_id TEXT PRIMARY KEY, screen TEXT, n_legs INTEGER,
                           n_resolved INTEGER, n_nfl_legs INTEGER, checks_json TEXT,
-                          direction TEXT, side TEXT, submission_deadline TEXT);
+                          direction TEXT, side TEXT, submission_deadline TEXT,
+                          seq INTEGER NOT NULL DEFAULT 0, condition_id TEXT,
+                          rank INTEGER NOT NULL DEFAULT 0,
+                          catalog_version INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE rfq_legs (rfq_id TEXT, symbol TEXT, side TEXT, settlement_price REAL);
         CREATE TABLE priced_quotes (rfq_id TEXT, trigger TEXT, status TEXT,
                           reason_code TEXT, reason_detail TEXT, response_price REAL,
@@ -41,8 +44,8 @@ def make_db(path: Path) -> None:
                           gateway_connected INTEGER, heartbeat_at TEXT, buffer_drops INTEGER);
         CREATE TABLE quotes (quote_id TEXT, rfq_id TEXT, symbol TEXT, buy_price REAL,
                           sell_price REAL, buy_qty_decimal TEXT, sell_qty_decimal TEXT,
-                          created_time TEXT, status TEXT, model_version TEXT,
-                          params_version TEXT, decided_by TEXT);
+                          created_time TEXT, status TEXT, origin TEXT NOT NULL DEFAULT 'shadow',
+                          model_version TEXT, params_version TEXT, decided_by TEXT);
         CREATE TABLE books (symbol TEXT PRIMARY KEY, bid REAL, ask REAL,
                           bid_size REAL, ask_size REAL, seq INTEGER, ts TEXT);
         CREATE TABLE raw_events (id INTEGER PRIMARY KEY, event_id TEXT, event_type TEXT,
@@ -66,17 +69,17 @@ def make_db(path: Path) -> None:
                           trigger TEXT, detail_json TEXT);
     """)
     conn.execute("INSERT INTO rfq VALUES ('R1','NFL-KC-BUF-1',NULL,25,NULL,"
-                 "'2026-09-17T12:00:00Z',NULL,0,'open',NULL)");
+                 "'2026-09-17T12:00:00Z',NULL,0,'OPEN',NULL)");
     conn.execute("INSERT INTO rfq VALUES ('R2','NFL-DAL-PHI-1',NULL,10,NULL,"
-                 "'2026-09-17T12:01:00Z',NULL,0,'open',NULL)");
+                 "'2026-09-17T12:01:00Z',NULL,0,'OPEN',NULL)");
     conn.execute("INSERT INTO rfq VALUES ('R3','NFL-KC-BUF-2',NULL,10,NULL,"
-                 "'2026-09-17T12:02:00Z',NULL,0,'open',NULL)");
+                 "'2026-09-17T12:02:00Z',NULL,0,'OPEN',NULL)");
     conn.execute("INSERT INTO rfq_screen VALUES ('R1','QUOTABLE',2,2,2,"
-                 "'{\"known legs\": true}', 'BUY','YES',NULL)");
+                 "'{\"known legs\": true}', 'BUY','YES',NULL,1,NULL,0,3)");
     conn.execute("INSERT INTO rfq_screen VALUES ('R2','NON_NFL',2,2,0,"
-                 "'{\"known legs\": true}', 'BUY','YES',NULL)");
+                 "'{\"known legs\": true}', 'BUY','YES',NULL,2,NULL,90,3)");
     conn.execute("INSERT INTO rfq_screen VALUES ('R3','QUOTABLE',1,1,1,"
-                 "'{\"known legs\": true}', 'BUY','YES',NULL)");
+                 "'{\"known legs\": true}', 'BUY','YES',NULL,3,NULL,0,3)");
     conn.execute("INSERT INTO rfq_legs VALUES ('R1','NFL-KC-BUF-1-ML','YES',0.8)");
     conn.execute("INSERT INTO rfq_legs VALUES ('R1','NFL-KC-BUF-1-SPREAD','YES',0.9)");
     conn.execute("INSERT INTO rfq_legs VALUES ('R3','NFL-KC-BUF-2-TOTAL','YES',0.7)");
@@ -95,9 +98,9 @@ def make_db(path: Path) -> None:
                  "'2026-09-17T12:02:01Z','YES')", (detail3,))
     conn.execute("INSERT INTO live_trades VALUES ('R1',0.62,'25','2026-09-17T12:00:05Z')");
     conn.execute("INSERT INTO quotes VALUES ('Q1','R1','NFL-KC-BUF-1',0.55,0.60,'25','25',"
-                 "'2026-09-17T12:00:01Z','shadow','joint_v1','nfl_2026_w02','live_quoter')");
+                 "'2026-09-17T12:00:01Z','shadow','shadow','joint_v1','nfl_2026_w02','live_quoter')");
     conn.execute("INSERT INTO quotes VALUES ('Q3','R3','NFL-KC-BUF-2',0.38,0.42,'10','10',"
-                 "'2026-09-17T12:02:01Z','shadow','joint_v1','nfl_2026_w02','live_quoter')");
+                 "'2026-09-17T12:02:01Z','shadow','shadow','joint_v1','nfl_2026_w02','live_quoter')");
     conn.execute("INSERT INTO quote_latency (rfq_id,wait_ms,compute_ms,source) "
                  "VALUES ('R1',120.5,30.2,'live_capture')");
     conn.execute("INSERT INTO quote_latency (rfq_id,wait_ms,compute_ms,source) "
@@ -120,7 +123,7 @@ def make_db(path: Path) -> None:
     conn.execute("INSERT INTO exposure_snapshots (ts,equity,buying_power,pending_wcl,executed_wcl,total_wcl) "
                  "VALUES ('2026-09-17T12:05:00Z',50010.0,47900.0,120.0,60.0,180.0)");
     conn.execute("INSERT INTO kill_switch_events (ts,state,trigger) VALUES "
-                 "('2026-09-17T12:04:00Z','triggered','max_downswing')");
+                 "('2026-09-17T12:04:00Z','tripped','max_downswing')");
     conn.execute("ALTER TABLE priced_quotes ADD COLUMN after_deadline INTEGER DEFAULT 0")
     conn.commit()
     conn.close()
@@ -249,35 +252,22 @@ def test_pricing_model_edge(server):
     assert abs(one["edge_vs_market"] - (-0.02)) < 1e-9  # -1 * (0.62 - 0.60): sold below market
     no_trade = get_json(server, "/api/pricing/R3")
     assert no_trade["naive"] == 0.38
-    # No accepted trade: the leg-implied naive price is the market reference.
-    assert no_trade["market_price"] == 0.38
-    assert no_trade["market_source"] == "leg-implied naive"
-    assert abs(no_trade["edge_vs_market"] - (-0.02)) < 1e-9  # 1 * (0.38 - 0.40)
+    assert no_trade["market_price"] is None
+    assert no_trade["edge_vs_market"] is None
 
 
 def test_performance_endpoint(server):
     p = get_json(server, "/api/performance")
-    assert p["quoted"] == 2 and p["shadow_fills"] == 2
-    assert p["win_rate"] == 1.0
+    assert p["quoted"] == 2 and p["shadow_fills"] == 1
+    assert p["win_rate"] == 0.5
     assert p["by_family"][0]["family"] == "Moneyline + Spread"
-    assert len(p["curve"]) == 2
-    sources = {row["market_source"]: row["shadow_fills"]
-               for row in p["by_market_source"]}
-    assert sources == {"accepted trade": 1, "leg-implied naive": 1}
+    assert len(p["curve"]) == 1
 
 
 def test_fills_endpoint(server):
     fills = get_json(server, "/api/fills")
-    assert fills["total"] == 2 and len(fills["rows"]) == 2
-    # Newest first: R3 (naive fallback) then R1 (accepted trade).
-    naive_fill = fills["rows"][0]
-    assert naive_fill["rfq_id"] == "R3"
-    assert naive_fill["market_source"] == "leg-implied naive"
-    assert abs(naive_fill["quote_edge"] - (-0.02)) < 1e-9  # 1 * (0.38 - 0.40)
-    assert abs(naive_fill["model_edge"] - 0.04) < 1e-9     # 1 * (0.42 - 0.38)
-    assert abs(naive_fill["expected_pnl"] - 0.2) < 1e-9    # 1 * (0.42 - 0.40) * 10
-    assert abs(naive_fill["realized_pnl"] - 6.0) < 1e-9    # 1 * (1 - 0.40) * 10
-    older = fills["rows"][1]
+    assert fills["total"] == 1 and len(fills["rows"]) == 1
+    older = fills["rows"][0]
     assert older["rfq_id"] == "R1"
     # R1: SELL 0.60 vs accepted trade 0.62, fair 0.58, settled YES at 1.0
     assert older["market_source"] == "accepted trade"
@@ -287,7 +277,7 @@ def test_fills_endpoint(server):
     assert abs(older["realized_pnl"] - (-10.0)) < 1e-9  # -1 * (1 - 0.60) * 25: sold a winner
     assert older["settled_legs"] == 2 and older["total_legs"] == 2
     page2 = get_json(server, "/api/fills?page=2")
-    assert page2["total"] == 2 and page2["rows"] == []
+    assert page2["total"] == 1 and page2["rows"] == []
 
 
 def test_exposure_endpoint(server):
@@ -313,7 +303,7 @@ def test_risk_endpoint(server):
     assert len(r["events"]) == 1
     assert r["events"][0]["action"] == "throttle"
     assert r["events"][0]["reason"] == "max_quotes_per_min"
-    assert r["kill_switch"]["state"] == "triggered"
+    assert r["kill_switch"]["state"] == "tripped"
     assert r["kill_switch"]["trigger"] == "max_downswing"
 
 
@@ -324,7 +314,59 @@ def test_engine_endpoint(server):
     assert s["budget_ms"] == 400 and s["samples"] == 2
     assert [d["quote_id"] for d in s["drafts"]] == ["Q3", "Q1"]  # newest first
     assert s["drafts"][0]["buy_price"] == 0.38
-    assert s["kill_switch"]["state"] == "triggered"
+    assert s["kill_switch"]["state"] == "tripped"
+
+
+def test_inventory_endpoint(server):
+    inv = get_json(server, "/api/inventory")
+    # Q1 (sell 25 filled @0.60, buy 25 @0.55 still pending) + Q3 (10/10 pending).
+    assert inv["equity"] == 50000.0
+    # Q1: our offer 25 @0.55 filled (we sold 25 @0.60); buy 25 @0.55 still pending.
+    # Q3: 10/10 pending. Pending WCL = 15.0 + 6.2; executed WCL = 10.0.
+    assert inv["buying_power"] == pytest.approx(50000.0 - 15.0 - 10.0 - 6.2)
+    assert inv["realized_pnl"] == 0.0
+    assert inv["kill_switch"] is True
+    assert inv["kill_switch_event"]["state"] == "tripped"
+    assert set(inv["exposures"]) == set(inv["pending"]) | set(inv["executed"])
+    assert inv["pending"] and inv["executed"]
+    for game, total in inv["exposures"].items():
+        assert total == pytest.approx(inv["pending"].get(game, 0)
+                                      + inv["executed"].get(game, 0))
+    assert len(inv["markets"]) == 3 and len(inv["teams"]) == 4
+    assert inv["net_by_game"]  # signed positions tracked per game
+
+
+def test_kill_switch_post_trips_and_resets(server):
+    status, body = post_json(server, "/api/risk/kill-switch",
+                             {"action": "trip", "reason": "test trip"})
+    assert status == 200
+    assert body["action"] == "trip"
+    assert body["kill_switch"]["state"] == "tripped"
+    assert get_json(server, "/api/risk")["kill_switch"]["state"] == "tripped"
+    assert get_json(server, "/api/inventory")["kill_switch"] is True
+
+    status, body = post_json(server, "/api/risk/kill-switch", {"action": "reset"})
+    assert status == 200
+    assert body["kill_switch"]["state"] == "reset"
+    assert get_json(server, "/api/inventory")["kill_switch"] is False
+
+
+def test_kill_switch_post_rejects_bad_input(server):
+    status, body = post_json(server, "/api/risk/kill-switch", {"action": "nuke"})
+    assert status == 400 and "action" in body["error"]
+    status, body = post_json(server, "/api/risk/kill-switch", {})
+    assert status == 400
+    status, body = post_json(server, "/api/risk/kill-switch",
+                             {"action": "trip", "reason": "   "})
+    assert status == 400
+
+
+def test_inventory_tab_present(server):
+    status, body = get(server, "/")
+    assert status == 200
+    assert b'data-tab="inventory"' in body and b"/static/js/inventory.js" in body
+    status, _ = get(server, "/static/js/inventory.js")
+    assert status == 200
 
 
 def test_nfl_meta_without_results(server):

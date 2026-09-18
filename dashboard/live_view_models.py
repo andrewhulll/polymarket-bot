@@ -366,3 +366,45 @@ def exposure(conn: sqlite3.Connection, limit: int = 500) -> dict:
                        "FROM exposure_snapshots ORDER BY id DESC LIMIT ?", (limit,))
     series = rows[::-1]
     return {"latest": series[-1] if series else None, "series": series}
+
+
+class _InventoryStore:
+    """Read-only adapter exposing ``EventStore.inventory_rows()`` over a raw
+    connection, so the dashboard can rebuild the live inventory snapshot
+    without opening a writable handle on the capture database. The SELECTs
+    mirror ``combo_mm.store.EventStore.inventory_rows`` exactly."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def inventory_rows(self):
+        rfqs = [dict(r) for r in self._conn.execute(
+            "SELECT rfq_id, symbol, status, updated_time FROM rfq ORDER BY rfq_id")]
+        for rfq in rfqs:
+            rfq["legs"] = [dict(r) for r in self._conn.execute(
+                "SELECT symbol, side, settlement_price FROM rfq_legs "
+                "WHERE rfq_id=? ORDER BY rowid", (rfq["rfq_id"],))]
+        quotes = [dict(r) for r in self._conn.execute(
+            "SELECT quote_id, rfq_id, symbol, status, origin, buy_price, "
+            "sell_price, buy_qty_decimal, sell_qty_decimal, created_time "
+            "FROM quotes ORDER BY rowid")]
+        fills = [dict(r) for r in self._conn.execute(
+            "SELECT fill_id, rfq_id, quote_id, symbol, side, price, qty, "
+            "executed_time FROM fills ORDER BY fill_id")]
+        last = self._conn.execute(
+            "SELECT state FROM kill_switch_events ORDER BY id DESC LIMIT 1").fetchone()
+        return rfqs, quotes, fills, bool(last and last["state"] == "tripped")
+
+
+def inventory_state(conn: sqlite3.Connection) -> dict:
+    """Current paper inventory rebuilt from the event store.
+
+    Returns the full ``InventoryState`` snapshot (exposures by game/market/team,
+    pending vs executed, equity, buying power, realized PnL) plus the latest
+    kill-switch event. Backs the dashboard Inventory tab.
+    """
+    from combo_mm.inventory import InventoryProvider
+    state = InventoryProvider(_InventoryStore(conn))()
+    snap = state.to_snapshot()
+    snap["kill_switch_event"] = _kill_switch(conn)
+    return snap
