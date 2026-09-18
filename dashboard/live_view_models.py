@@ -96,8 +96,11 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
                p.response_action, p.size, p.size_unit, p.fair, p.naive,
                p.detail_json, p.priced_at, p.side, p.after_deadline,
                q.model_version, q.params_version, q.decided_by,
-               t.price AS market_price,
-               CASE WHEN t.price IS NOT NULL THEN 'accepted trade' END AS market_source,
+               CASE WHEN t.price IS NOT NULL THEN t.price
+                    WHEN p.status = 'QUOTED' THEN p.naive END AS market_price,
+               CASE WHEN t.price IS NOT NULL THEN 'accepted trade'
+                    WHEN p.status = 'QUOTED' AND p.naive IS NOT NULL
+                    THEN 'leg-implied naive' END AS market_source,
                t.size AS market_size,
                l.wait_ms, l.compute_ms
         FROM rfq_screen s JOIN rfq r USING (rfq_id)
@@ -128,16 +131,23 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
 
 
 def _fill_candidates(conn: sqlite3.Connection) -> list[dict]:
-    """Quoted RFQs that could have filled against the observed market."""
+    """Quoted RFQs that could have filled against the observed market.
+
+    The market reference is the accepted Combo trade when one was observed,
+    else the leg-implied naive price at quote time. Late quotes are included
+    and flagged on the fill (``after_deadline``) rather than dropped, so the
+    ledger reflects every shadow quote.
+    """
     return _rows(conn, """
         SELECT p.*,
-               t.price AS market_price,
-               'accepted trade' AS market_source,
+               CASE WHEN t.price IS NOT NULL THEN t.price ELSE p.naive END AS market_price,
+               CASE WHEN t.price IS NOT NULL THEN 'accepted trade'
+                    ELSE 'leg-implied naive' END AS market_source,
                t.executed_at, r.created_time, s.n_legs
-        FROM priced_quotes p JOIN live_trades t ON t.rfq_id = p.rfq_id
+        FROM priced_quotes p LEFT JOIN live_trades t ON t.rfq_id = p.rfq_id
         JOIN rfq r ON r.rfq_id = p.rfq_id JOIN rfq_screen s ON s.rfq_id = p.rfq_id
         WHERE p.trigger = 'auto' AND p.status = 'QUOTED'
-          AND COALESCE(p.after_deadline, 0) = 0
+          AND p.naive IS NOT NULL
           AND EXISTS (SELECT 1 FROM quotes q WHERE q.rfq_id = p.rfq_id
                       AND q.status = 'shadow')
         ORDER BY p.priced_at
@@ -199,7 +209,8 @@ def _to_fill(conn: sqlite3.Connection, row: dict) -> dict | None:
             "expected_pnl": sign * (float(fair or price) - price) * qty,
             "realized_pnl": sign * (outcome - price) * qty if outcome is not None else None,
             "net_notional": sign * price * qty,
-            "settled_legs": len(settled), "total_legs": len(settlements)}
+            "settled_legs": len(settled), "total_legs": len(settlements),
+            "after_deadline": bool(row["after_deadline"])}
 
 
 def _compute_fills(conn: sqlite3.Connection) -> list[dict]:
@@ -222,7 +233,12 @@ def fills_count(conn: sqlite3.Connection) -> int:
 
 
 def performance(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Paper fills against observed accepted RFQ trades only."""
+    """Paper fills for quoted RFQs.
+
+    The market reference is the accepted Combo trade when one was observed,
+    else the leg-implied naive price at quote time. Quotes priced after the
+    submission deadline are included and flagged on each fill.
+    """
     fills = _compute_fills(conn)
     cumulative = exposure = 0.0
     curve = []

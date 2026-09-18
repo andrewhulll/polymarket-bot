@@ -70,7 +70,7 @@ function refreshFillsTable(fills) {
   setRows("fills-table", fills.rows.map((r, i) =>
     `<tr class="clickable" data-i="${i}" data-rfq="${esc(r.rfq_id)}">` +
     `<td class="expander">▸</td>` +
-    `<td class="dim">${esc((r.time || "").slice(11, 19))}</td>` +
+    `<td class="dim">${esc((r.time || "").slice(11, 19))}${r.after_deadline ? ' <span class="badge warn" title="Quoted after the submission deadline">LATE</span>' : ""}</td>` +
     `<td>${shortId(r.rfq_id)}</td>` +
     `<td class="dim">${esc(r.game || "—")}</td>` +
     `<td>${esc(r.family || "—")}</td>` +
