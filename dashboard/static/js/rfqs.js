@@ -70,6 +70,7 @@ async function refreshRfqs() {
       `<td class="num">${esc(r.qty_decimal || r.cash_order_qty || "—")}</td>` +
       `<td>${deadlineStr(r.submission_deadline)}</td>` +
       `<td>${esc(r.status || "—")}</td>` +
+      `<td class="num" title="${esc(r.trade_executed_at || "No confirmed trade observed")}">${fmtPrice(r.trade_price)}</td>` +
       `<td class="dim">${esc((r.created_time || "").slice(11, 19))}</td></tr>`;
   }).join(""));
   document.querySelectorAll("#rfq-table tbody tr").forEach((tr) =>
@@ -116,6 +117,7 @@ async function openRfqDrawer(rfqId) {
       <dt>Side</dt><dd>${esc(s.side || r.side || "—")} ${esc(s.direction || "")}</dd>
       <dt>Deadline</dt><dd>${deadlineStr(s.submission_deadline)}</dd>
       <dt>Legs</dt><dd>${s.n_legs ?? "—"} known, ${s.n_nfl_legs ?? "—"} NFL</dd>
+      <dt>Accepted trade</dt><dd>${fmtPrice(d.trade?.price)}${d.trade ? ` · ${esc(d.trade.size)} shares · ${esc(d.trade.executed_at || "")}` : " · none observed"}</dd>
     </dl>
     <h3>Screen checks</h3>${checkRows || '<p class="caption">none recorded</p>'}
     <h3>Legs</h3>

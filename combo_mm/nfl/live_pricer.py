@@ -282,11 +282,7 @@ class NflLivePricer:
         quote = LiveQuote(rfq_id=rfq.rfq_id, priced_at=_iso(now), status="DECLINED",
                           reason_code=PRICER_ERROR, side=rfq.side, direction=rfq.direction,
                           size=rfq.size, size_unit=rfq.size_unit, method=self.model_config.method)
-        if rfq.submission_deadline_ms is not None:
-            quote.after_deadline = now.timestamp() * 1000 > rfq.submission_deadline_ms
         try:
-            if quote.after_deadline:
-                raise _Decline(QUOTE_DEADLINE_EXCEEDED, "RFQ deadline passed before pricing started")
             self._price(rfq, now, quote)
         except _Decline as d:
             quote.status, quote.reason_code, quote.reason_detail = "DECLINED", d.code, d.detail
@@ -295,18 +291,9 @@ class NflLivePricer:
             quote.status, quote.reason_code = "DECLINED", PRICER_ERROR
             quote.reason_detail = f"{type(exc).__name__}: {exc}"[:300]
         quote.latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
-        if quote.quoted:
-            if (rfq.submission_deadline_ms is not None
-                    and now.timestamp() * 1000 + quote.latency_ms > rfq.submission_deadline_ms):
-                quote.status, quote.reason_code = "DECLINED", QUOTE_DEADLINE_EXCEEDED
-                quote.reason_detail = "pricing finished after the RFQ deadline"
-                quote.after_deadline = True
-            elif quote.latency_ms > self.config.quote_latency_budget_ms:
-                quote.status, quote.reason_code = "DECLINED", QUOTE_LATENCY_EXCEEDED
-                quote.reason_detail = (f"pricing took {quote.latency_ms:.2f} ms; "
-                                       f"budget {self.config.quote_latency_budget_ms} ms")
-            if not quote.quoted:
-                quote.bid = quote.ask = quote.response_price = None
+        if rfq.submission_deadline_ms is not None:
+            quote.after_deadline = (now.timestamp() * 1000 + quote.latency_ms
+                                    > rfq.submission_deadline_ms)
         return quote
 
     # -- pipeline -------------------------------------------------------------

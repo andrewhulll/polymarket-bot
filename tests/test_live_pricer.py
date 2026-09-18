@@ -17,8 +17,6 @@ from combo_mm.nfl.live_pricer import (
     MODEL_MARKET_DISAGREE,
     NO_NFL_SAME_GAME,
     OTHER_SAME_GAME,
-    QUOTE_DEADLINE_EXCEEDED,
-    QUOTE_LATENCY_EXCEEDED,
     PARAMS_STALE,
     PARAMS_UNAVAILABLE,
     UNRESOLVED_LEG,
@@ -64,11 +62,12 @@ def price(pricer, *positions, side="YES", direction="BUY", qty="25", cash=None, 
                                 direction=direction, qty_decimal=qty, cash_order_qty=cash), now=now)
 
 
-def test_quote_declines_when_deadline_is_already_past_or_expires_during_pricing():
+def test_paper_quote_is_kept_after_deadline_and_latency_budget():
     positions = (ML_HOME, FAV_COVER)
     expired = build().price(LiveRfq("late", positions, qty_decimal="25",
                                    submission_deadline_ms=NOW_MS - 1), now=NOW)
-    assert expired.reason_code == QUOTE_DEADLINE_EXCEEDED
+    assert expired.quoted and expired.after_deadline
+    assert expired.bid is not None and expired.ask is not None
 
     class SlowBooks(StubBooks):
         def books(self, legs):
@@ -78,14 +77,14 @@ def test_quote_declines_when_deadline_is_already_past_or_expires_during_pricing(
     slow = build(SlowBooks(now_ms=NOW_MS))
     finished_late = slow.price(LiveRfq("slow", positions, qty_decimal="25",
                                        submission_deadline_ms=NOW_MS + 1), now=NOW)
-    assert finished_late.reason_code == QUOTE_DEADLINE_EXCEEDED
-    assert finished_late.bid is None and finished_late.ask is None
+    assert finished_late.quoted and finished_late.after_deadline
+    assert finished_late.bid is not None and finished_late.ask is not None
 
     over_budget = build(SlowBooks(now_ms=NOW_MS),
                         config=PipelineConfig(quote_latency_budget_ms=1)).price(
         LiveRfq("cold", positions, qty_decimal="25"), now=NOW)
-    assert over_budget.reason_code == QUOTE_LATENCY_EXCEEDED
-    assert over_budget.bid is None and over_budget.ask is None
+    assert over_budget.quoted and over_budget.latency_ms > 1
+    assert over_budget.bid is not None and over_budget.ask is not None
 
 
 # -- fair value -------------------------------------------------------------

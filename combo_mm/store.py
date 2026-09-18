@@ -347,7 +347,8 @@ class EventStore:
             )
 
     # -- raw event log ---------------------------------------------------------
-    def apply(self, event: NormalizedEvent, *, source: str = "stream") -> bool:
+    def apply(self, event: NormalizedEvent, *, source: str = "stream",
+              record_inventory: bool = True) -> bool:
         """Append a normalized event and project it. Returns False on dupes."""
         with self._lock, self._conn:
             cur = self._conn.cursor()
@@ -377,8 +378,8 @@ class EventStore:
                 log.debug("duplicate event ignored: %s", event.event_key)
                 return False
             self._project(cur, event)
-        if event.event_type in ("rfq_closed", "rfq_cancelled", "rfq_expired",
-                                "quote_deleted"):
+        if record_inventory and event.event_type in (
+                "rfq_closed", "rfq_cancelled", "rfq_expired", "quote_deleted"):
             from combo_mm.inventory import InventoryProvider
             InventoryProvider(self).record(event.event_at, f"event:{event.event_key}")
         return True
