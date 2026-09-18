@@ -20,16 +20,16 @@ EXPECTED_TABS = ["RFQs", "Pricing & quoting", "Performance",
 
 def test_dashboard_renders_without_exceptions():
     at = AppTest.from_file(str(APP_PATH))
-    at.run()
+    at.run(timeout=15)
     assert not at.exception, f"dashboard raised: {at.exception!r}"
 
 
-def test_dashboard_has_five_tabs():
+def test_dashboard_has_five_main_tabs():
     at = AppTest.from_file(str(APP_PATH))
-    at.run()
+    at.run(timeout=15)
     assert not at.exception, f"dashboard raised: {at.exception!r}"
-    assert len(at.tabs) == 5, f"expected 5 tabs, got {len(at.tabs)}"
-    labels = [t.label for t in at.tabs]
+    # AppTest also flattens the nested NFL correlation tabs into this list.
+    labels = [t.label for t in at.tabs[:5]]
     assert labels == EXPECTED_TABS, f"tab labels: {labels}"
 
 

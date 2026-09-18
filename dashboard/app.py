@@ -54,6 +54,7 @@ sys.path.insert(0, str(REPO))
 from combo_mm import PipelineConfig  # noqa: E402
 from combo_mm.auth import CredentialsNotConfigured  # noqa: E402
 from combo_mm.combo_markets import ComboMarketCatalog, LegMarket  # noqa: E402
+from combo_mm.capture_process import ensure_capture_running  # noqa: E402
 from combo_mm.intl_gateway import (  # noqa: E402
     GATEWAY_ENV_VARS,
     GatewayCredentials,
@@ -100,6 +101,10 @@ BANNER = (
 )
 st.warning(BANNER)
 st.title("Combo RFQ pipeline -- paper dashboard")
+
+capture_start_error = ensure_capture_running(REPO)
+if capture_start_error:
+    st.warning(capture_start_error)
 
 
 def _new_db(prefix: str) -> str:
@@ -198,7 +203,7 @@ def _start_live() -> Dict[str, Any]:
     return {"mode": "live", "db_path": str(db_path) if db_path.exists() else None,
             "monitor": None, "polling": True, "source": "headless capture",
             "error": None if db_path.exists() else
-            "Start `python scripts/capture_live_rfqs.py --data-dir data/live` first."}
+            (capture_start_error or "RFQ capture is starting; try again shortly.")}
 
 
 def _stop_live(run: Optional[Dict[str, Any]]) -> None:
