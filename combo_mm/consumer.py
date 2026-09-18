@@ -111,7 +111,8 @@ class StreamConsumer:
                  config: Optional[Any] = None, *,
                  rng: Optional[random.Random] = None,
                  enable_shadow: bool = False,
-                 catalog: Optional[Any] = None) -> None:
+                 catalog: Optional[Any] = None,
+                 catalog_path: Optional[Any] = None) -> None:
         self._transport = transport
         self._store = store
         self._pipeline_config = (
@@ -127,6 +128,12 @@ class StreamConsumer:
         #: Combo-market catalog for the shadow engine's NFL pricer adapter;
         #: None keeps the engine's naive default.
         self._catalog = catalog
+        #: Local combo-markets cache the consumer loads itself when no
+        #: catalog object was passed (shadow mode only). Explicit
+        #: ``catalog`` wins; None keeps the engine's naive default.
+        self._catalog_path = catalog_path
+        #: Shadow engine built by run(); None until the first run.
+        self._shadow_engine: Optional[Any] = None
         #: One RecoveryReport per (re)connect, in order.
         self.recovery_log: List[Any] = []
         self._stop = threading.Event()
@@ -202,13 +209,21 @@ class StreamConsumer:
         books = LegBookCache(staleness_ms=pipeline.staleness_ms)
         reference = ReferenceCache(self._transport,
                                    ttl_s=pipeline.reference_ttl_s)
-        pricer = (build_nfl_adapter(self._catalog, books, config=pipeline,
-                                    fallback_resolver=self._catalog.lookup)
-                  if self._catalog is not None else None)
+        catalog = self._catalog
+        if catalog is None and self._catalog_path is not None:
+            from combo_mm.combo_markets import ComboMarketCatalog
+            catalog = ComboMarketCatalog(cache_path=self._catalog_path)
+            catalog.load_cache()  # local file only; no crawl thread
+        pricer = (build_nfl_adapter(catalog, books, config=pipeline,
+                                    fallback_resolver=catalog.lookup)
+                  if catalog is not None else None)
         engine = (ShadowQuotingEngine(self._store, books, reference, pipeline,
                                       pricer=pricer,
                                       params_version=pipeline.params_version)
                   if self._enable_shadow else None)
+        #: The shadow quoting engine built for this run (None when shadow
+        #: mode is off); exposed for introspection and tests.
+        self._shadow_engine = engine
 
         stats = {"seen": 0, "applied": 0, "duplicates": 0, "books": 0,
                  "reconnects": 0, "recoveries": 0, "shadow_decisions": 0}

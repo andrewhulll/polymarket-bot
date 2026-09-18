@@ -401,3 +401,57 @@ def test_adapter_needs_no_network_on_cold_game(tmp_path):
                            decided_at=DECIDED_AT)
     assert result.extra.get("pricer_fallback") is True
     assert result.quotable
+
+
+# ------------------------------------------------- consumer catalog wiring
+def _shadow_consumer(tmp_path, **kw):
+    """StreamConsumer over the deterministic fixture session, shadow on."""
+    import random
+
+    from combo_mm import SimulatedTransport, fixtures
+    from combo_mm.consumer import StreamConsumer
+
+    session, combos = fixtures.build_session()
+    transport = SimulatedTransport(session, fixtures.SELF_USER_ID, combos)
+    store = EventStore(":memory:")
+    return StreamConsumer(transport, store, PipelineConfig(paper_mode=True),
+                          rng=random.Random(7), enable_shadow=True, **kw)
+
+
+def _write_catalog_cache(path: Path) -> Path:
+    seed = ComboMarketCatalog(cache_path=path)
+    seed.merge(parse_catalog_page(catalog_payload()))
+    seed.save_cache()
+    assert path.is_file()
+    return path
+
+
+def test_consumer_catalog_path_wires_nfl_adapter(tmp_path):
+    from combo_mm.nfl.pricer_adapter import NflPricerAdapter
+
+    cache = _write_catalog_cache(tmp_path / "combo_markets.json")
+    consumer = _shadow_consumer(tmp_path, catalog_path=cache)
+    stats = consumer.run()
+    assert stats["shadow_decisions"] > 0
+    assert isinstance(consumer._shadow_engine._pricer, NflPricerAdapter)
+
+
+def test_consumer_without_catalog_stays_naive(tmp_path):
+    consumer = _shadow_consumer(tmp_path)
+    stats = consumer.run()
+    assert stats["shadow_decisions"] > 0
+    assert isinstance(consumer._shadow_engine._pricer, V1NaivePricer)
+
+
+def test_consumer_explicit_catalog_wins_over_path(tmp_path):
+    from combo_mm.nfl.pricer_adapter import NflPricerAdapter
+
+    cache = _write_catalog_cache(tmp_path / "combo_markets.json")
+    explicit = _catalog()
+    consumer = _shadow_consumer(tmp_path, catalog=explicit,
+                                catalog_path=cache)
+    consumer.run()
+    pricer = consumer._shadow_engine._pricer
+    assert isinstance(pricer, NflPricerAdapter)
+    # The explicit catalog object is the one the adapter was built over.
+    assert pricer.catalog is explicit
