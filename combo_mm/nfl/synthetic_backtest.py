@@ -617,12 +617,12 @@ def edge_pnl(combos, column: str, threshold: float = 0.01):
 
 
 def _swings(np, cum) -> Tuple[float, float]:
-    if len(cum) == 0:
-        return 0.0, 0.0
-    c = np.concatenate([[0.0], np.asarray(cum, dtype=float)])
-    down = float((c - np.maximum.accumulate(c)).min())
-    up = float((c - np.minimum.accumulate(c)).max())
-    return -down, up
+    """Max downswing/upswing, delegated to the shared metrics module."""
+    from combo_mm.backtest.metrics import swings as _shared_swings
+    # zero-padded indices: the shared helper sorts timestamps as strings
+    s = _shared_swings(
+        [(f"{i:08d}", float(v)) for i, v in enumerate(np.asarray(cum, dtype=float))])
+    return s["max_downswing"], s["max_upswing"]
 
 
 def pnl_stats(trades) -> Dict[str, float]:

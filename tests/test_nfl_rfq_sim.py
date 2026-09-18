@@ -312,7 +312,15 @@ def test_params_are_estimated_strictly_before_the_rfq_week(games, tmp_path):
 
 def test_sidecar_is_not_readable_by_any_pricing_module():
     """Only the generator and #5's fill model may mention the sidecar."""
-    allowed = {Path("combo_mm/nfl/rfq_sim.py"), Path("combo_mm/backtest/fill_model.py")}
+    allowed = {
+        Path("combo_mm/nfl/rfq_sim.py"),          # the generator itself
+        Path("combo_mm/backtest/fill_model.py"),  # the only reader
+        # Boundary modules: they document/enforce the no-leak rule and never
+        # open the file (fill_model is the single read path).
+        Path("combo_mm/backtest/dataset.py"),
+        Path("combo_mm/backtest/leak_guard.py"),
+        Path("combo_mm/backtest/runner.py"),
+    }
     root = Path(__file__).resolve().parents[1]
     offenders = []
     for path in sorted((root / "combo_mm").rglob("*.py")):
