@@ -14,6 +14,10 @@ separate SQLite file that survives restarts. It holds only:
   bid and ask we would have shown, the fair value behind them, and the full
   per-leg / per-game detail (or the decline code). One row per (rfq, trigger)
   so an auto-priced RFQ and a later manual re-price are both kept.
+- ``quote_settlements`` -- what the final scores said about a priced quote:
+  per-leg settlement prices, the combo value, the Brier pair (model vs
+  naive) and the counterfactual 1-unit edges. Written by
+  ``scripts/settle_live_quotes.py``; ``priced_quotes`` is never mutated here.
 
 Receive-only: selecting an RFQ records intent, pricing records a price;
 nothing here sends a quote.
@@ -101,6 +105,34 @@ class QuoteSelectionStore:
                     executed_at TEXT,
                     recorded_at TEXT NOT NULL
                 );
+                -- What the NFL model quoted is immutable (priced_quotes); whether it was
+                -- right is a separate fact learned later, after the final whistle.
+                CREATE TABLE IF NOT EXISTS quote_settlements (
+                    rfq_id TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    settled_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason_detail TEXT,
+                    combo_value REAL,
+                    n_legs INTEGER NOT NULL,
+                    n_legs_settled INTEGER NOT NULL,
+                    legs_json TEXT NOT NULL,
+                    fair REAL,
+                    bid REAL,
+                    ask REAL,
+                    naive REAL,
+                    brier REAL,
+                    naive_brier REAL,
+                    edge_vs_naive REAL,
+                    hypo_edge_bid REAL,
+                    hypo_edge_ask REAL,
+                    scores_vintage TEXT,
+                    model_version TEXT,
+                    params_version TEXT,
+                    PRIMARY KEY (rfq_id, trigger)
+                );
+                CREATE INDEX IF NOT EXISTS idx_quote_settlements_status
+                    ON quote_settlements(status);
                 """
             )
         self._selected: Set[str] = {r["rfq_id"] for r in
@@ -221,6 +253,122 @@ class QuoteSelectionStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # -- quote settlements ----------------------------------------------------
+    # Settling a stored quote after the final whistle. priced_quotes is never
+    # mutated here: the model's quote-time record is immutable, settlement is
+    # a separate fact. Writes are idempotent on PRIMARY KEY (rfq_id, trigger);
+    # ``settled_at`` keeps the first computation so re-runs are stable.
+
+    _SETTLEMENT_COLUMNS = (
+        "rfq_id, trigger, settled_at, status, reason_detail, combo_value, "
+        "n_legs, n_legs_settled, legs_json, fair, bid, ask, naive, brier, "
+        "naive_brier, edge_vs_naive, hypo_edge_bid, hypo_edge_ask, "
+        "scores_vintage, model_version, params_version"
+    )
+
+    def record_quote_settlement(self, row: Dict[str, Any]) -> None:
+        """Write one settlement row (from ``settle_live.settle_quote``).
+
+        Idempotent: ``ON CONFLICT`` replaces the row but keeps the original
+        ``settled_at``, so re-running the same input is a no-op.
+        """
+        legs_json = json.dumps(row.get("legs") or [])
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"INSERT INTO quote_settlements ({self._SETTLEMENT_COLUMNS}) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (rfq_id, trigger) DO UPDATE SET "
+                "settled_at = quote_settlements.settled_at, "
+                "status = excluded.status, reason_detail = excluded.reason_detail, "
+                "combo_value = excluded.combo_value, n_legs = excluded.n_legs, "
+                "n_legs_settled = excluded.n_legs_settled, legs_json = excluded.legs_json, "
+                "fair = excluded.fair, bid = excluded.bid, ask = excluded.ask, "
+                "naive = excluded.naive, brier = excluded.brier, "
+                "naive_brier = excluded.naive_brier, edge_vs_naive = excluded.edge_vs_naive, "
+                "hypo_edge_bid = excluded.hypo_edge_bid, hypo_edge_ask = excluded.hypo_edge_ask, "
+                "scores_vintage = excluded.scores_vintage, "
+                "model_version = excluded.model_version, params_version = excluded.params_version",
+                (row["rfq_id"], row["trigger"], _now_iso(), row["status"],
+                 row.get("reason_detail"), row.get("combo_value"),
+                 row["n_legs"], row["n_legs_settled"], legs_json,
+                 row.get("fair"), row.get("bid"), row.get("ask"), row.get("naive"),
+                 row.get("brier"), row.get("naive_brier"), row.get("edge_vs_naive"),
+                 row.get("hypo_edge_bid"), row.get("hypo_edge_ask"),
+                 row.get("scores_vintage"), row.get("model_version"),
+                 row.get("params_version")))
+
+    def get_quote_settlement(self, rfq_id: str, trigger: str = "auto"
+                             ) -> Optional[Dict[str, Any]]:
+        """One settlement row, legs parsed, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM quote_settlements WHERE rfq_id = ? AND trigger = ?",
+                (rfq_id, trigger)).fetchone()
+        return self._settlement_dict(row) if row is not None else None
+
+    def list_quote_settlements(self, status: Optional[str] = None,
+                               limit: int = 2000) -> List[Dict[str, Any]]:
+        """Settlement rows newest first (optionally by status), legs parsed."""
+        sql = "SELECT * FROM quote_settlements"
+        args: List[Any] = []
+        if status is not None:
+            sql += " WHERE status = ?"
+            args.append(status)
+        sql += " ORDER BY settled_at DESC, rowid DESC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [self._settlement_dict(r) for r in rows]
+
+    def quotes_needing_settlement(self, since: Optional[str] = None,
+                                  limit: int = 5000) -> List[Dict[str, Any]]:
+        """QUOTED quotes with no terminal settlement row.
+
+        A quote is due when it has no settlement row, or its row is
+        PENDING/UNRESOLVED (a newer nflverse pull may now settle it).
+        Declines carry no fair price, so only QUOTED rows are scored.
+        """
+        sql = (
+            "SELECT q.* FROM priced_quotes q "
+            "LEFT JOIN quote_settlements s ON s.rfq_id = q.rfq_id AND s.trigger = q.trigger "
+            "WHERE q.status = 'QUOTED' "
+            "AND (s.status IS NULL OR s.status IN ('PENDING', 'UNRESOLVED'))"
+        )
+        args: List[Any] = []
+        if since is not None:
+            sql += " AND q.priced_at >= ?"
+            args.append(since)
+        sql += " ORDER BY q.priced_at ASC, q.rowid ASC LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["detail"] = json.loads(d.pop("detail_json") or "{}")
+            except ValueError:
+                d["detail"] = {}
+            out.append(d)
+        return out
+
+    @staticmethod
+    def _settlement_dict(r: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(r)
+        try:
+            d["legs"] = json.loads(d.pop("legs_json") or "[]")
+        except ValueError:
+            d["legs"] = []
+        return d
+
+    # -- accepted quote lookup for settlement ---------------------------------
+    def get_accepted_quote(self, rfq_id: str) -> Optional[Dict[str, Any]]:
+        """The accepted quote for one RFQ, if the pick-to-quote flow stored one."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM accepted_quotes WHERE rfq_id = ?", (rfq_id,)).fetchone()
+        return dict(row) if row is not None else None
 
 
 def _float(value: Any) -> Optional[float]:

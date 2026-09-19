@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -855,6 +856,136 @@ def _pricing_view(r: Dict[str, Any]) -> None:
         conn.close()
 
 
+def _run_settlement_subprocess(args: list) -> tuple:
+    """Run a repo script as a subprocess; return (returncode, last stdout line, stderr tail)."""
+    try:
+        proc = subprocess.run([sys.executable, *[str(a) for a in args]],
+                              capture_output=True, text=True, timeout=3600, cwd=str(REPO))
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out after 1 hour"
+    out_lines = (proc.stdout or "").strip().splitlines()
+    err_lines = (proc.stderr or "").strip().splitlines()
+    return proc.returncode, out_lines[-1] if out_lines else "", "\n".join(err_lines[-5:])
+
+
+def _settlement_section(selections: QuoteSelectionStore) -> None:
+    """Read-only settlement view: did the correlation model beat the naive maker?
+
+    Displays only; the runner computes. The button first refreshes the cached
+    nflverse scores (``scripts/refresh_params.py --pull``) and then settles
+    priced quotes (``scripts/settle_live_quotes.py``), both as subprocesses,
+    so the latency-sensitive live poll loop never competes with a scoring
+    pass. Nothing here writes a settlement row.
+    """
+    st.subheader("Settlement check -- after the final whistle")
+    st.caption(
+        "Scores each priced quote against final scores from the cached nflverse pull. "
+        "No live quote was ever submitted, so the honest headline is the Brier pair "
+        "(model vs naive), not P&L. The 'hypo edge' figures are counterfactual 1-unit "
+        "returns on quotes we never sent; only an accepted quote gets a real P&L column.")
+    if st.button("Check settlement", key="check_settlement",
+                 help="Pull the latest nflverse scores, then settle every priced quote "
+                      "that has no terminal settlement row. Both steps run as "
+                      "subprocesses, so the live poll loop is unaffected."):
+        with st.spinner("Refreshing scores, then settling priced quotes..."):
+            pull_rc, pull_line, pull_err = _run_settlement_subprocess(
+                [REPO / "scripts" / "refresh_params.py", "--pull",
+                 "--raw-root", str(RAW_ROOT)])
+            run_rc, run_line, run_err = _run_settlement_subprocess(
+                [REPO / "scripts" / "settle_live_quotes.py",
+                 "--db", str(LIVE_DATA / "quote_selections.db"),
+                 "--raw-root", str(RAW_ROOT)])
+        st.session_state["settlement_last_run"] = {
+            "pull_rc": pull_rc, "pull_line": pull_line, "pull_err": pull_err,
+            "run_rc": run_rc, "run_line": run_line, "run_err": run_err,
+        }
+    last = st.session_state.get("settlement_last_run")
+    if last is not None:
+        if last["pull_rc"] != 0:
+            st.warning("Score pull failed; settled against the previously cached pull. "
+                       + (last["pull_err"] or ""))
+        if last["run_rc"] != 0:
+            st.error("Settlement runner failed. " + (last["run_err"] or ""))
+        elif last["run_line"]:
+            st.success(last["run_line"])
+
+    rows = selections.list_quote_settlements()
+    if not rows:
+        st.info("No priced quote has been scored yet. "
+                "Click 'Check settlement' after games finish.")
+        return
+
+    counts = {"SETTLED": 0, "VOID": 0, "PENDING": 0, "UNRESOLVED": 0}
+    for s in rows:
+        counts[s["status"]] = counts.get(s["status"], 0) + 1
+    settled = [s for s in rows if s["status"] == "SETTLED"
+               and s["brier"] is not None and s["naive_brier"] is not None]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Settled", f"{counts['SETTLED']:,}")
+    c2.metric("Void", f"{counts['VOID']:,}")
+    c3.metric("Pending", f"{counts['PENDING']:,}")
+    c4.metric("Unresolved", f"{counts['UNRESOLVED']:,}")
+    if settled:
+        model_brier = sum(s["brier"] for s in settled) / len(settled)
+        naive_brier = sum(s["naive_brier"] for s in settled) / len(settled)
+        hit_rate = sum(1 for s in settled if s["combo_value"] == 1.0) / len(settled)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Model Brier (lower is better)", f"{model_brier:.4f}")
+        m2.metric("Naive Brier (lower is better)", f"{naive_brier:.4f}")
+        m3.metric("Naive - model (positive = we won)", f"{naive_brier - model_brier:+.4f}")
+        m4.metric("Combo hit rate", f"{hit_rate:.1%}")
+
+    quotes = {(q["rfq_id"], q["trigger"]): q
+              for q in selections.list_priced_quotes(limit=LIVE_ROW_LIMIT)}
+    table = []
+    for s in rows:
+        q = quotes.get((s["rfq_id"], s["trigger"])) or {}
+        detail = q.get("detail") or {}
+        games = detail.get("games") or []
+        game = ", ".join(str(g.get("game") or g.get("label") or "")
+                         for g in games) or q.get("legs_label") or "-"
+        row = {"rfq_id": s["rfq_id"], "trigger": s["trigger"], "game": game[:60],
+               "status": s["status"], "combo value": s["combo_value"],
+               "quoted bid": s["bid"], "quoted ask": s["ask"], "model fair": s["fair"],
+               "model Brier": s["brier"], "naive Brier": s["naive_brier"],
+               "naive-model Brier": (s["naive_brier"] - s["brier"]
+                                     if s["brier"] is not None and s["naive_brier"] is not None
+                                     else None),
+               "hypo bid edge*": s["hypo_edge_bid"], "hypo ask edge*": s["hypo_edge_ask"],
+               "realized P&L (accepted quote)": None}
+        acc = selections.get_accepted_quote(s["rfq_id"])
+        if acc is not None and s["status"] == "SETTLED" and s["combo_value"] is not None:
+            # Backtest sign convention: sign * (combo_value - fill_price) * fill_qty,
+            # sign = +1 for a BUY fill. Meaningful only for an accepted quote.
+            sign = 1.0 if (acc.get("direction") or "BUY") == "BUY" else -1.0
+            price = acc.get("price") or 0.0
+            qty = acc.get("size") or 0.0
+            row["realized P&L (accepted quote)"] = sign * (s["combo_value"] - price) * qty
+        table.append(row)
+    st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True,
+                 column_config={
+                     c: st.column_config.NumberColumn(format="%.4f")
+                     for c in ("combo value", "quoted bid", "quoted ask", "model fair",
+                               "model Brier", "naive Brier", "naive-model Brier",
+                               "hypo bid edge*", "hypo ask edge*",
+                               "realized P&L (accepted quote)")}
+                 | {"status": st.column_config.TextColumn()})
+    st.caption("*Hypothetical 1-unit edges are counterfactual -- no quote was ever submitted. "
+               "The Brier pair is the honest headline; realized P&L exists only where "
+               "an accepted quote was recorded.")
+    for s in rows:
+        with st.expander(f"{s['rfq_id']} | {s['trigger']} -- {s['status']}"):
+            if s["reason_detail"]:
+                st.write(f"_{s['reason_detail']}_")
+            st.table([{"position_id": (leg.get("position_id") or "")[:40],
+                       "side": leg.get("side") or "-",
+                       "settlement price": leg.get("settlement_price") if leg.get("settlement_price") is not None else "-",
+                       "resolved against": leg.get("game_id") or "-"}
+                      for leg in s["legs"]])
+            st.caption(f"Scores vintage `{s['scores_vintage']}` -- "
+                       f"model `{s['model_version']}` -- params `{s['params_version']}`.")
+
+
 def _live_pricing_view(monitor: Optional[LiveMonitor], r: Dict[str, Any]) -> None:
     """The NFL correlation model's bid/ask for the live RFQs we wanted to quote."""
     st.subheader("NFL correlation model -- live quotes")
@@ -885,6 +1016,7 @@ def _live_pricing_view(monitor: Optional[LiveMonitor], r: Dict[str, Any]) -> Non
              if q["status"] == "QUOTED" and q["corr_adjustment_bps"] is not None]
     c4.metric("Median |correlation edge|",
               f"{sorted(abs(e) for e in edges)[len(edges) // 2]:,.0f} bps" if edges else "-")
+    _settlement_section(selections)
     st.dataframe(_model_quote_rows(quotes), width="stretch", hide_index=True,
                  column_config={c: st.column_config.NumberColumn(format="%.3f")
                                 for c in _PRICE_COLS}
