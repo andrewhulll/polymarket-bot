@@ -379,9 +379,14 @@ off the feed's poll loop.
 **What it says on real flow.** Priced against the live DET @ BUF book
 (2026-09-17): *Bills ML + Bills −4.5* = 0.528 against a naive 0.368; *Bills ML +
 Lions +4.5* = 0.168 against a naive 0.329 — the two combos §4.2 shows the naive
-product getting most wrong (realized 49.8% and 16.9% in the test period), and
-*Bills −4.5 + over 54.5* reproduces the naive product exactly, as the tuned
-`league_constant` model implies.
+product getting most wrong (realized 49.8% and 16.9% in the test period). Since
+§0's fix, spread × total combos no longer reproduce the naive price exactly:
+the deployed model is `mean_linear`, not `league_constant`, so `Cov(margin,
+total) = sigma_home^2 - sigma_away^2` is nonzero per game. For example, on the
+live GB @ NYJ book (2026-09-20): *NYJ −4.5 + under 45.5* = 0.307023 against a
+naive 0.306358 (+6.6 bps); on the live SEA @ ARI book, *ARI −3.5 + over 40.5*
+= 0.265227 against a naive 0.264308 (+9.2 bps). `scripts/check_correlation_lift.py`
+verifies this holds across recent quotes, not just these two.
 
 ## 6. Module map
 
