@@ -4,6 +4,7 @@ polymarket.keys*
 
 # Local capture runtime files (datasets under data/ are versioned)
 data/live/rfq_capture.db
+data/live/quote_selections.db
 data/live/rfq_raw.jsonl
 data/live/combo_markets.json.gz
 data/live/*.log
