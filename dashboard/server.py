@@ -30,7 +30,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
+from urllib.request import urlopen
 
 from dashboard import live_view_models as vm
 
@@ -51,6 +53,21 @@ STATIC_FILES = {"index.html": "text/html; charset=utf-8",
                 "vendor/vega-lite.min.js": "application/javascript; charset=utf-8",
                 "vendor/vega-embed.min.js": "application/javascript; charset=utf-8"}
 PAGE_SIZE = 500
+
+
+def _transient(path: str, query: dict | None = None) -> dict | None:
+    """Read session-only screener rows from the local capture process."""
+    url = f"http://127.0.0.1:{_CONFIG['screen_port']}{path}"
+    if query:
+        url += "?" + urlencode({k: v for k, v in query.items() if v is not None})
+    try:
+        with urlopen(url, timeout=0.5) as response:
+            value = json.load(response)
+        if value.get("source") != str(Path(_CONFIG["data_dir"]).resolve()):
+            return None
+        return value
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        return None
 
 
 class _Waiting(Exception):
@@ -231,19 +248,43 @@ class Handler(BaseHTTPRequestHandler):
         screen = query.get("screen", [None])[0] or None
         search = query.get("search", [None])[0] or None
         page = max(1, int(query.get("page", ["1"])[0] or 1))
-        with closing(_connect()) as conn:
-            rows = vm.rfqs(conn, only_quotable=only, screen=screen, search=search,
-                           limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE)
-            total = vm.rfqs_count(conn, only_quotable=only, screen=screen, search=search)
-            return _json({"total": total, "page": page,
-                          "page_size": PAGE_SIZE, "rows": rows})
+        end = page * PAGE_SIZE
+        try:
+            with closing(_connect()) as conn:
+                durable = vm.rfqs(conn, only_quotable=only, screen=screen,
+                                  search=search, limit=end, offset=0)
+                durable_total = vm.rfqs_count(conn, only_quotable=only,
+                                              screen=screen, search=search)
+            waiting = None
+        except _Waiting as exc:
+            durable, durable_total = [], 0
+            waiting = exc
+        transient = (None if only or _CONFIG["active_db"] != "rfq_capture.db" else _transient("/rfqs", {
+            "limit": end, "screen": screen, "search": search}))
+        ephemeral = transient["rows"] if transient else []
+        if waiting is not None and not ephemeral:
+            raise waiting
+        rows_by_id = {row["rfq_id"]: row for row in ephemeral}
+        rows_by_id.update({row["rfq_id"]: row for row in durable})
+        rows = sorted(rows_by_id.values(),
+                      key=lambda row: (row.get("created_time") or "", row["rfq_id"]),
+                      reverse=True)
+        total = durable_total + (transient["total"] if transient else 0)
+        return _json({"total": total, "page": page, "page_size": PAGE_SIZE,
+                      "rows": rows[(page - 1) * PAGE_SIZE:end],
+                      "session_only": bool(transient)})
 
     def _api_rfqs_one(self, rfq_id: str) -> tuple[int, str, bytes]:
-        with closing(_connect()) as conn:
-            detail = vm.rfq_detail(conn, rfq_id)
-            if detail is None:
-                return _json({"error": "unknown rfq"}, 404)
-            return _json(detail)
+        try:
+            with closing(_connect()) as conn:
+                detail = vm.rfq_detail(conn, rfq_id)
+        except _Waiting:
+            detail = None
+        if detail is None:
+            transient = (_transient("/rfqs/" + quote(rfq_id, safe=""))
+                         if _CONFIG["active_db"] == "rfq_capture.db" else None)
+            detail = transient.get("detail") if transient else None
+        return _json(detail) if detail else _json({"error": "unknown rfq"}, 404)
 
     def _api_pricing(self, query: dict) -> tuple[int, str, bytes]:
         page = max(1, int(query.get("page", ["1"])[0] or 1))
@@ -433,7 +474,8 @@ class Handler(BaseHTTPRequestHandler):
         return _json(nfl.run_script(name, options, data_dir=_CONFIG["data_dir"]))
 
 
-_CONFIG = {"data_dir": str(REPO / "data" / "live"), "active_db": "rfq_capture.db"}
+_CONFIG = {"data_dir": str(REPO / "data" / "live"),
+           "active_db": "rfq_capture.db", "screen_port": 8765}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -442,8 +484,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--data-dir", default=str(REPO / "data" / "live"),
                         help="capture output directory (default: data/live)")
+    parser.add_argument("--screen-port", type=int, default=8765,
+                        help="local capture screener API port (default: 8765)")
     args = parser.parse_args(argv)
     _CONFIG["data_dir"] = args.data_dir
+    _CONFIG["screen_port"] = args.screen_port
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     log.info("live dashboard at http://127.0.0.1:%d (read-only; db=%s)",

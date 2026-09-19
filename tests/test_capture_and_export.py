@@ -123,6 +123,9 @@ def test_handle_stores_only_quoted_rfqs(tmp_path, monkeypatch):
     assert nfl_screen["n_nfl_legs"] == 2
     assert capture.store.get_rfq_screen("rfq_soccer") is None
     assert capture.store.count_raw_events() == 2
+    session = capture.transient_rfqs.page(limit=10)
+    assert [row["rfq_id"] for row in session["rows"]] == ["rfq_soccer"]
+    assert session["rows"][0]["screen"] == "OTHER_SAME_GAME"
     capture.stop()
 
 
@@ -144,6 +147,26 @@ def test_declined_and_unresolved_rfqs_are_not_stored(tmp_path):
     assert capture.store.get_rfq("unknown") is None
     assert capture.store.count_raw_events() == 0
     assert capture.raw_path.read_text() == ""
+    rows = capture.transient_rfqs.page(limit=10)["rows"]
+    assert {row["rfq_id"] for row in rows} == {"declined", "unknown"}
+    assert capture.transient_rfqs.detail("declined")["pricing"]["reason_code"] == "UNSUPPORTED_LEG"
+    assert capture.transient_rfqs.detail("unknown")["screen"]["screen"] == "UNRESOLVED"
+    capture.stop()
+
+
+def test_risk_rejection_stays_in_session_memory(tmp_path):
+    capture = _build_capture(tmp_path)
+    _attach_quoter(capture)
+    # Screening accepts one unrelated leg, but live inventory requires one game.
+    capture.handle({"kind": "event", "raw": _rfq_request(
+        "risk_rejected", ["100", "101", "200"])}, NOW)
+    assert capture.store.get_rfq("risk_rejected") is None
+    assert capture.store.count_raw_events() == 0
+    assert capture.raw_path.read_text() == ""
+    with capture.store._lock:
+        assert capture.store._conn.execute("SELECT COUNT(*) FROM risk_events").fetchone()[0] == 0
+    detail = capture.transient_rfqs.detail("risk_rejected")
+    assert detail["pricing"]["reason_code"] == "RISK_GAME_UNRESOLVED"
     capture.stop()
 
 

@@ -966,7 +966,6 @@ def _performance_view(r: Dict[str, Any]) -> None:
     c2.metric("RFQs declined", result.rfqs_rejected)
     c2.metric("RFQs executed", result.rfqs_executed)
     c3.metric("Quote rate", f"{result.quote_rate:.1%}")
-    c3.metric("Win rate (executed / quoted)", f"{result.execution_rate:.1%}")
     c4.metric("Fills", result.n_fills)
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Expected P&L", f"${result.expected_pnl:,.2f}")

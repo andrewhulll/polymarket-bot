@@ -39,7 +39,12 @@ function ageStr(iso) {
 
 function deadlineStr(iso) {
   if (!iso) return "—";
-  const s = (new Date(iso).getTime() - Date.now()) / 1000;
+  const numeric = Number(iso);
+  const deadline = Number.isFinite(numeric) && numeric > 1e9
+    ? new Date(numeric < 1e12 ? numeric * 1000 : numeric)
+    : new Date(iso);
+  if (Number.isNaN(deadline.getTime())) return "—";
+  const s = (deadline.getTime() - Date.now()) / 1000;
   if (s <= 0) return `<span class="deadline-hot">expired</span>`;
   const m = Math.floor(s / 60), h = Math.floor(m / 60);
   const txt = h ? `${h}h ${m % 60}m` : m ? `${m}m ${Math.floor(s % 60)}s` : `${Math.floor(s)}s`;

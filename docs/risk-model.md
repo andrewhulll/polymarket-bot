@@ -10,8 +10,8 @@ quotes reserve capacity until the RFQ closes or expires; decisions from multiple
 pricing workers are checked under the capture lock. Capture requires every leg
 to resolve to the same game for these limits. A manual halt can be latched or reset with
 `python -m scripts.risk_halt --db PATH --trip|--reset --reason TEXT`.
-Live capture saves risk rejections in `risk_events`; the Inventory tab shows
-them in Recent paper quote decisions and Risk & paper events.
+Live capture shows RFQs rejected by risk in the session-only RFQ screener.
+Their identifiers and reasons are not written to `risk_events` or the raw RFQ log.
 
 ## Accounting
 

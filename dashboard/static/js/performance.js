@@ -10,12 +10,9 @@ async function refreshPerformance() {
     get("/api/inventory").catch(() => null), get("/api/risk").catch(() => null),
   ]);
 
-  const kw = perf.win_rate != null ? badge(perf.win_rate >= 0.5 ? "q" : "warn",
-    (perf.win_rate * 100).toFixed(1) + "% win") : badge("—", "dim");
   $("perf-kpis").innerHTML =
     kpi("Quoted", fmtInt(perf.quoted)) +
     kpi("Shadow fills", fmtInt(perf.shadow_fills)) +
-    kpi("Win rate", kw) +
     kpi("Expected P&L", fmtMoney(perf.expected_pnl), perf.expected_pnl >= 0 ? "good" : "bad") +
     kpi("Realized P&L", fmtMoney(perf.realized_pnl), perf.realized_pnl >= 0 ? "good" : "bad") +
     kpi("Max downswing", fmtMoney(perf.max_downswing), "bad") +
