@@ -270,6 +270,36 @@ def test_performance_endpoint(server):
     assert len(p["curve"]) == 2
 
 
+def test_session_only_rejected_rfqs_join_durable_feed(server, tmp_path, monkeypatch):
+    from combo_mm.transient_rfqs import TransientRfqs, TransientRfqServer
+    from dashboard import server as srv
+
+    feed = TransientRfqs()
+    row = {"rfq_id": "REJECTED", "symbol": "soccer-combo",
+           "created_time": "2026-09-17T12:03:00Z", "screen": "OTHER_SAME_GAME",
+           "status": "RFQ_STATUS_OPEN", "quotable": False,
+           "filters": {"no unsupported same game": False}, "n_legs": 2}
+    feed.put(row, {"rfq": dict(row), "screen": {"screen": "OTHER_SAME_GAME",
+                                   "checks": row["filters"]},
+                   "legs": [], "events": [], "pricing": None, "trade": None})
+    bridge = TransientRfqServer(feed, tmp_path, port=0)
+    monkeypatch.setitem(srv._CONFIG, "screen_port", bridge.httpd.server_address[1])
+    bridge.start()
+    try:
+        all_rfqs = get_json(server, "/api/rfqs")
+        assert all_rfqs["total"] == 4
+        assert all_rfqs["rows"][0]["rfq_id"] == "REJECTED"
+        assert get_json(server, "/api/rfqs?only_quotable=1")["total"] == 2
+        assert get_json(server, "/api/rfqs?screen=OTHER_SAME_GAME")["rows"][0]["rfq_id"] == "REJECTED"
+        assert get_json(server, "/api/rfqs/REJECTED")["screen"]["screen"] == "OTHER_SAME_GAME"
+        with sqlite3.connect(tmp_path / "rfq_capture.db") as conn:
+            assert conn.execute("SELECT COUNT(*) FROM rfq WHERE rfq_id='REJECTED'").fetchone()[0] == 0
+    finally:
+        bridge.stop()
+
+    assert get_json(server, "/api/rfqs")["total"] == 3
+
+
 def test_fills_endpoint(server):
     fills = get_json(server, "/api/fills")
     # Newest first: R3 (no trade -> assumed win), then R1 (trade did not beat it).
@@ -384,9 +414,12 @@ def test_inventory_tab_present(server):
     assert status == 200
 
 
-def test_nfl_meta_without_results(server):
+def test_nfl_meta_without_results(server, tmp_path, monkeypatch):
+    from dashboard import nfl_api
+    monkeypatch.setattr(nfl_api, "RESULTS_DIR", tmp_path / "empty_results")
+    nfl_api._CACHE.pop("results", None)
     m = get_json(server, "/api/nfl/meta")
-    assert m["has_results"] is False  # no results/nfl_backtest in this repo checkout
+    assert m["has_results"] is False
 
 
 def _nfl_deps_ok():
@@ -394,7 +427,10 @@ def _nfl_deps_ok():
     return nfl_api.DEPS_OK
 
 
-def test_nfl_view_without_results(server):
+def test_nfl_view_without_results(server, tmp_path, monkeypatch):
+    from dashboard import nfl_api
+    monkeypatch.setattr(nfl_api, "RESULTS_DIR", tmp_path / "empty_results")
+    nfl_api._CACHE.pop("results", None)
     if not _nfl_deps_ok():
         try:
             get(server, "/api/nfl/overview")
@@ -411,7 +447,9 @@ def test_nfl_view_without_results(server):
         assert exc.code == 404
 
 
-def test_nfl_games_without_pull(server):
+def test_nfl_games_without_pull(server, tmp_path, monkeypatch):
+    from dashboard import nfl_api
+    monkeypatch.setattr(nfl_api, "RAW_ROOT", tmp_path / "empty_raw")
     if not _nfl_deps_ok():
         try:
             get(server, "/api/nfl/games")

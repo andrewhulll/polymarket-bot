@@ -1,8 +1,6 @@
 /* RFQs tab: dense feed + drill-down drawer. */
 "use strict";
 
-let screenOptionsLoaded = false;
-
 $("only-quotable").addEventListener("change", (e) => {
   state.rfqOnly = e.target.checked; state.rfqPage = 1; refreshRfqs();
 });
@@ -18,18 +16,14 @@ $("rfq-search").addEventListener("input", (e) => {
 $("rfq-prev").addEventListener("click", () => { if (state.rfqPage > 1) { state.rfqPage--; refreshRfqs(); } });
 $("rfq-next").addEventListener("click", () => { state.rfqPage++; refreshRfqs(); });
 
-function screenBadge(screen, quotable) {
+function screenBadge(screen, quotable, status) {
   if (quotable) return badge("QUOTABLE", "q");
+  if (screen === "QUOTABLE") return badge(status === "DECLINED" ? "DECLINED" : "PRICING", "warn");
   if (!screen) return badge("PENDING", "dim");
   return badge(screen, "no");
 }
 
 async function refreshRfqs() {
-  if (!screenOptionsLoaded) {
-    // populate screen filter from a cheap aggregate via the rfqs endpoint is overkill;
-    // use fixed known screens plus whatever the first page shows.
-    screenOptionsLoaded = true;
-  }
   const q = new URLSearchParams({
     only_quotable: state.rfqOnly ? "1" : "0",
     page: String(state.rfqPage),
@@ -64,7 +58,7 @@ async function refreshRfqs() {
     return `<tr class="clickable" data-rfq="${esc(r.rfq_id)}">` +
       `<td>${shortId(r.rfq_id)}</td>` +
       `<td class="num">${ageStr(r.created_time)}</td>` +
-      `<td>${screenBadge(r.screen, r.quotable)}${failed ? ` <span class="badge warn">${failed}✕</span>` : ""}</td>` +
+      `<td>${screenBadge(r.screen, r.quotable, r.status)}${failed ? ` <span class="badge warn">${failed}✕</span>` : ""}</td>` +
       `<td class="num">${r.n_legs ?? "—"}${r.n_nfl_legs ? ` <span class="dim">(${r.n_nfl_legs} NFL)</span>` : ""}</td>` +
       `<td>${esc(r.side || r.direction || "—")}</td>` +
       `<td class="num">${esc(r.qty_decimal || r.cash_order_qty || "—")}</td>` +
@@ -105,11 +99,12 @@ async function openRfqDrawer(rfqId) {
         <dt>Priced at</dt><dd>${esc(p.priced_at || "—")}</dd>
       </dl>
       <p><a href="#" onclick="event.preventDefault();openPricingDrawer('${esc(rfqId)}')">Open full pricing detail →</a></p>`
-    : `<p class="caption">Not priced yet.</p>`;
+    : `<p class="caption">${s.screen === "QUOTABLE" ? "Not priced yet." : "Rejected by the screener; no quote created."}</p>`;
 
   openDrawer(shortId(rfqId), `
-    <p>${screenBadge(s.screen, r.quotable ?? s.screen === "QUOTABLE")}
+    <p>${screenBadge(s.screen, r.quotable ?? s.screen === "QUOTABLE", r.status)}
        <span class="dim">${esc(r.status || "")} · ${esc(r.symbol || "")}</span></p>
+    ${r.quotable === false ? '<p class="caption">Session only. This RFQ is not stored and disappears when the logger restarts.</p>' : ""}
     <dl class="kv">
       <dt>Posted</dt><dd>${esc(r.created_time || "—")} (${ageStr(r.created_time)} ago)</dd>
       <dt>Updated</dt><dd>${esc(r.updated_time || "—")}</dd>

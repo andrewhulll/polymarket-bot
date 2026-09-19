@@ -3,7 +3,7 @@
 ## Testing
 
 - [ ] `python -m pytest tests/ -q` passes
-- [ ] README `## Status against the Totalis brief` table updated if a brief step changed
+- [ ] README `## Totalis brief and progress` table updated if a brief step changed
 
 ## Safety
 

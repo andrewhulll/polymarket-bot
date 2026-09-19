@@ -2,8 +2,17 @@
 polymarket.keys*
 .env
 
-# NFL pipeline: raw nflverse pulls and backtest outputs are regenerated locally
-data/
+# Local capture runtime files (datasets under data/ are versioned)
+data/live/rfq_capture.db
+data/live/rfq_raw.jsonl
+data/live/combo_markets.json.gz
+data/live/*.log
+data/live/*.lock
+data/live/*.tmp
+data/live/*-wal
+data/live/*-shm
+
+# NFL pipeline: backtest outputs are regenerated locally
 results/
 params/.staging/
 # Walk-forward weekly params for the simulated RFQ datasets: one file per

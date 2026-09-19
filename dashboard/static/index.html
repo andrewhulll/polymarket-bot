@@ -26,12 +26,13 @@
   <section id="tab-rfqs" class="tab active">
     <div class="toolbar">
       <label class="toggle"><input type="checkbox" id="only-quotable"> quotable only</label>
-      <select id="screen-filter"><option value="">all screens</option></select>
+      <select id="screen-filter"><option value="">all screens</option><option value="QUOTABLE">QUOTABLE</option><option value="UNRESOLVED">UNRESOLVED</option><option value="OTHER_SAME_GAME">OTHER_SAME_GAME</option><option value="NO_NFL_SAME_GAME">NO_NFL_SAME_GAME</option></select>
       <input type="search" id="rfq-search" placeholder="search id / symbol…  ( / )">
       <span class="spacer"></span>
       <button id="rfq-prev">‹</button><span id="rfq-page-label" class="page-label"></span><button id="rfq-next">›</button>
     </div>
     <p class="caption" id="rfq-count"></p>
+    <p class="caption">Rejected and pending RFQs are shown from logger memory for this session only. Only paper-quoted RFQs are saved.</p>
     <div class="table-wrap"><table id="rfq-table">
       <thead><tr><th>RFQ</th><th class="num">Age</th><th>Screen</th><th class="num">Legs</th><th>Side</th><th>Size</th><th>Deadline</th><th>Status</th><th class="num">Trade</th><th>Posted</th></tr></thead>
       <tbody></tbody>

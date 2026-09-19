@@ -61,7 +61,7 @@ from combo_mm.capture_process import CaptureLock
 from combo_mm.inventory import InventoryProvider
 from combo_mm.risk_config import RiskConfig
 from combo_mm.risk_policy import InventoryRiskCheck
-from combo_mm.risk import RiskVerdict
+from combo_mm.transient_rfqs import TransientRfqs, TransientRfqServer
 
 log = logging.getLogger("capture_live_rfqs")
 
@@ -104,6 +104,7 @@ class RfqCapture:
         self._pending: dict[str, dict[str, Any]] = {}
         self._quoted: set[str] = set()
         self._lock = threading.RLock()
+        self.transient_rfqs = TransientRfqs()
         self._risk_config = PipelineConfig(risk=RiskConfig(policy="inventory"))
         self._risk = InventoryRiskCheck(self._risk_config.risk)
         self._inventory = InventoryProvider(self.store,
@@ -151,9 +152,13 @@ class RfqCapture:
                          started: datetime, decided: datetime) -> None:
         with self._lock:
             pending = self._pending.pop(rfq.rfq_id, None)
-            if not quote.quoted or pending is None:
+            if pending is None:
+                return
+            if not quote.quoted:
+                self.transient_rfqs.decision(rfq.rfq_id, quote)
                 return
             if not self._check_quote_risk(rfq, quote, decided):
+                self.transient_rfqs.decision(rfq.rfq_id, quote)
                 return
             self.store.apply(pending["event"], source="live_capture",
                              record_inventory=False)
@@ -176,6 +181,7 @@ class RfqCapture:
                 input_snapshot_json=json.dumps(quote.to_dict(), sort_keys=True),
                 decided_by="headless-paper", decided_at=decided.isoformat())
             self._quoted.add(rfq.rfq_id)
+            self.transient_rfqs.remove(rfq.rfq_id)
             if rfq.received_at:
                 components = quote.components or {}
                 self.store.record_live_latency(
@@ -200,12 +206,6 @@ class RfqCapture:
             quote.status, quote.reason_code, quote.reason_detail = "DECLINED", code, message
             quote.bid = quote.ask = quote.response_price = None
             quote.bid_qty = quote.ask_qty = None
-            self.store.record_risk_event(
-                ts=decided.isoformat(), rfq_id=rfq.rfq_id, quote_id="",
-                game_id=game_id,
-                verdict=RiskVerdict(False, "0", "0", code,
-                                    {"message": message, "source": "live_capture"},
-                                    action="reject"))
             return False
 
         games = {self._resolve_game(position_id) for position_id in rfq.leg_position_ids}
@@ -315,13 +315,16 @@ class RfqCapture:
                     self._save_trade(raw, event, now)
                 elif event.rfq_id in self._pending:
                     self._pending[event.rfq_id]["trade"] = (raw, event, now)
+                else:
+                    self.transient_rfqs.change(
+                        event.rfq_id, status="CLOSED",
+                        trade_price=raw.get("price"),
+                        trade_executed_at=raw.get("executed_at"))
 
     def _screen(self, raw: Dict[str, Any], event: Any, now: datetime) -> None:
         rfq_id = event.rfq_id
         legs = [str(leg.get("symbol")) for leg in raw.get("comboLegs") or []
                 if isinstance(leg, dict) and leg.get("symbol") is not None]
-        if not legs:
-            return
         result = screen_legs(self.catalog.resolve(legs))
         qty = raw.get("qtyDecimal")
         try:
@@ -333,6 +336,34 @@ class RfqCapture:
         eligible = result.quotable and all(checks.values())
         if result.n_nfl_legs:
             self.nfl_rfqs_seen += 1
+        if rfq_id not in self._quoted:
+            row = {
+                "rfq_id": rfq_id, "symbol": event.symbol,
+                "created_time": raw.get("createdTime") or now.isoformat(),
+                "updated_time": raw.get("updatedTime") or now.isoformat(),
+                "qty_decimal": raw.get("qtyDecimal"),
+                "cash_order_qty": raw.get("cashOrderQty"),
+                "status": raw.get("status") or "RFQ_STATUS_OPEN",
+                "screen": result.screen, "quotable": False,
+                "n_legs": result.n_legs, "n_resolved": result.n_resolved,
+                "n_nfl_legs": result.n_nfl_legs, "filters": checks,
+                "side": _combo_side(raw), "direction": raw.get("direction"),
+                "submission_deadline": raw.get("submission_deadline"),
+                "trade_price": None, "trade_executed_at": None,
+            }
+            detail = {
+                "rfq": dict(row),
+                "screen": {"screen": result.screen, "n_legs": result.n_legs,
+                           "n_resolved": result.n_resolved,
+                           "n_nfl_legs": result.n_nfl_legs,
+                           "side": row["side"], "direction": row["direction"],
+                           "submission_deadline": row["submission_deadline"],
+                           "checks": checks},
+                "legs": [{"symbol": leg.get("symbol"), "side": leg.get("side")}
+                         for leg in raw.get("comboLegs") or [] if isinstance(leg, dict)],
+                "events": [], "pricing": None, "trade": None,
+            }
+            self.transient_rfqs.put(row, detail)
         if eligible and self.quoter is not None:
             with self._lock:
                 if rfq_id in self._quoted or rfq_id in self._pending:
@@ -361,9 +392,13 @@ class RfqCapture:
                 if not self.quoter.submit(rfq):
                     with self._lock:
                         self._pending.pop(rfq_id, None)
+                    self.transient_rfqs.change(rfq_id, status="DECLINED",
+                                               reason_code="QUOTER_QUEUE_FULL")
             except Exception:
                 with self._lock:
                     self._pending.pop(rfq_id, None)
+                self.transient_rfqs.change(rfq_id, status="DECLINED",
+                                           reason_code="PRICER_ERROR")
                 raise
 
     def rescreen_unresolved(self) -> None:
@@ -383,6 +418,8 @@ def main(argv: Optional[list] = None) -> int:
                         help="stop after N seconds (default: run until interrupted)")
     parser.add_argument("--quoter-workers", type=int, default=4,
                         help="pricing worker threads draining the RFQ queue (default: 4)")
+    parser.add_argument("--screen-port", type=int, default=8765,
+                        help="local session-only screener API port (default: 8765)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO,
@@ -404,12 +441,21 @@ def main(argv: Optional[list] = None) -> int:
         log.info("RFQ capture is already running for %s", args.data_dir)
         return 0
 
+    capture = None
+    screen_server = None
     try:
         capture = RfqCapture(Path(args.data_dir), price_live=True,
-                           quoter_workers=args.quoter_workers)
+                             quoter_workers=args.quoter_workers)
+        screen_server = TransientRfqServer(capture.transient_rfqs,
+                                           Path(args.data_dir), args.screen_port)
+        screen_server.start()
         capture.start()
         adapter.start()
     except BaseException:
+        if screen_server is not None:
+            screen_server.stop()
+        if capture is not None:
+            capture.stop()
         reader_lock.release()
         raise
 
@@ -420,6 +466,8 @@ def main(argv: Optional[list] = None) -> int:
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _handle_signal)
 
     start_time = time.monotonic()
     last_log = start_time
@@ -450,6 +498,7 @@ def main(argv: Optional[list] = None) -> int:
             adapter.wait_for_items(args.poll_interval)
     finally:
         adapter.stop()
+        screen_server.stop()
         capture.stop()
         reader_lock.release()
         log.info("capture stopped: rfqs=%d nfl=%d trades=%d",

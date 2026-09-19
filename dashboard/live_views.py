@@ -129,11 +129,10 @@ def _performance(conn) -> None:
     st.caption("Shadow fills count only our quoted RFQs whose price would have beaten the "
                "observed accepted RFQ trade. RFQs that never traded on the feed have no "
                "market reference and are not scored. Realized P&L requires settled legs.")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Quotes", p["quoted"])
     c2.metric("Shadow fills", p["shadow_fills"])
-    c3.metric("Win rate", f"{p['win_rate']:.1%}")
-    c4.metric("Net notional", f"${p['net_notional']:,.2f}")
+    c3.metric("Net notional", f"${p['net_notional']:,.2f}")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Expected P&L", f"${p['expected_pnl']:,.2f}")
     c2.metric("Realized P&L", f"${p['realized_pnl']:,.2f}")
