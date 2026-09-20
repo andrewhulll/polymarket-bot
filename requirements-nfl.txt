@@ -4,6 +4,5 @@
 numpy>=1.26
 scipy>=1.11
 pandas>=2.1
-streamlit>=1.40
 altair>=5
 pytest>=8

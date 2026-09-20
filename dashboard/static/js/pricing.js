@@ -3,6 +3,7 @@
 
 $("pricing-prev").addEventListener("click", () => { if (state.pricingPage > 1) { state.pricingPage--; refreshPricing(); } });
 $("pricing-next").addEventListener("click", () => { state.pricingPage++; refreshPricing(); });
+$("settlement-run").addEventListener("click", runSettlementCheck);
 
 function decisionBadge(status) {
   if (status === "QUOTED") return badge("QUOTED", "q");
@@ -11,7 +12,10 @@ function decisionBadge(status) {
 }
 
 async function refreshPricing() {
-  const data = await get(`/api/pricing?page=${state.pricingPage}`);
+  const [data, settlements] = await Promise.all([
+    get(`/api/pricing?page=${state.pricingPage}`), get("/api/settlements")
+  ]);
+  renderSettlementSummary(settlements);
   state.pricingTotal = data.total;
   const pages = Math.max(1, Math.ceil(data.total / data.page_size));
   if (state.pricingPage > pages) { state.pricingPage = pages; return refreshPricing(); }
@@ -47,6 +51,42 @@ async function refreshPricing() {
   ).join(""));
   document.querySelectorAll("#pricing-table tbody tr").forEach((tr) =>
     tr.addEventListener("click", () => openPricingDrawer(tr.dataset.rfq)));
+}
+
+function renderSettlementSummary(s) {
+  const score = (v) => v == null ? "—" : Number(v).toFixed(4);
+  $("settlement-kpis").innerHTML =
+    kpi("Eligible quotes", fmtInt(s.eligible)) +
+    kpi("Settled", fmtInt(s.settled), s.settled ? "good" : "") +
+    kpi("Pending", fmtInt(s.pending + s.unscored)) +
+    kpi("Void / unresolved", `${fmtInt(s.void)} / ${fmtInt(s.unresolved)}`) +
+    kpi("Model Brier", score(s.model_brier)) +
+    kpi("Naive − model", s.brier_advantage == null ? "—" : fmtEdge(s.brier_advantage));
+  $("settlement-last").textContent = s.last_checked
+    ? `last scored ${new Date(s.last_checked).toLocaleString()}`
+    : (s.available ? "not checked yet" : "waiting for the quote ledger");
+}
+
+async function runSettlementCheck() {
+  const button = $("settlement-run");
+  const result = $("settlement-result");
+  button.disabled = true;
+  button.textContent = "Refreshing scores and settling…";
+  result.innerHTML = '<div class="alert">This may take a few minutes.</div>';
+  try {
+    const res = await post("/api/settlements/run", {});
+    renderSettlementSummary(res.summary);
+    const pullWarning = res.pull.returncode === 0 ? ""
+      : ` Score refresh exited ${res.pull.returncode}; cached scores were used.`;
+    result.innerHTML = res.ok
+      ? `<div class="alert good">Settlement check finished.${esc(pullWarning)}</div>`
+      : `<div class="alert error">Settlement failed (exit ${res.settle.returncode}). ${esc(res.settle.output)}</div>`;
+  } catch (e) {
+    result.innerHTML = `<div class="alert error">Settlement check failed: ${esc(e.message)}</div>`;
+  } finally {
+    button.disabled = false;
+    button.textContent = "Check settlement for all priced RFQs";
+  }
 }
 
 async function openPricingDrawer(rfqId) {

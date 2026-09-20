@@ -14,11 +14,10 @@ what to do when the heartbeat goes stale.
 | Process lock | `data/live/rfq_capture.lock` — held by exactly one capture process; released by the OS when the owner dies | `combo_mm/capture_process.py` |
 | Supervisor | Restarts the capture when it exits (crash, kill, reboot) — even with the dashboard closed | `deploy/` units below |
 | Dead-man's checker | Exits non-zero when the heartbeat is older than 10 min (or never written) | `scripts/check_heartbeat.py` |
-| Dashboard banner | Engine-status tab warns when the heartbeat is stale | `dashboard/live_views.py` |
+| Dashboard banner | Engine tab warns when the heartbeat is stale | `dashboard/server.py`, `dashboard/static/js/engine.js` |
 
-The dashboard also auto-starts a capture via `ensure_capture_running()` when
-you open it and none is running — but that only covers the dashboard-open
-case. The supervisor covers everything else.
+The dashboard does not own the capture process. The supervisor keeps capture
+running whether or not a browser or dashboard server is open.
 
 ## Credentials
 

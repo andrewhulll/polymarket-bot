@@ -260,6 +260,58 @@ def test_pricing_model_edge(server):
     assert no_trade["model_edge"] is None
 
 
+def test_settlement_summary_and_runner(server, tmp_path, monkeypatch):
+    from combo_mm.quote_selections import QuoteSelectionStore
+    from dashboard import server as srv
+
+    store = QuoteSelectionStore(tmp_path / "quote_selections.db")
+    store.record_priced_quote({
+        "rfq_id": "R1", "priced_at": "2026-09-17T12:00:01Z",
+        "status": "QUOTED", "reason_code": "OK", "fair": 0.60,
+        "naive": 0.50, "bid": 0.58, "ask": 0.62, "detail": {},
+    })
+    store.record_quote_settlement({
+        "rfq_id": "R1", "trigger": "auto", "status": "SETTLED",
+        "reason_detail": None, "combo_value": 1.0, "n_legs": 2,
+        "n_legs_settled": 2, "legs": [], "fair": 0.60, "bid": 0.58,
+        "ask": 0.62, "naive": 0.50, "brier": 0.16, "naive_brier": 0.25,
+        "edge_vs_naive": 0.10, "hypo_edge_bid": 0.42,
+        "hypo_edge_ask": -0.38, "scores_vintage": "2026-09-19",
+        "model_version": "joint_v1", "params_version": "nfl_2026_w02",
+    })
+    store.close()
+
+    summary = get_json(server, "/api/settlements")
+    assert summary["available"] is True
+    assert summary["eligible"] == 1 and summary["settled"] == 1
+    assert summary["unscored"] == 0
+    assert summary["model_brier"] == pytest.approx(0.16)
+    assert summary["brier_advantage"] == pytest.approx(0.09)
+
+    expected = {"ok": True, "pull": {"returncode": 0, "output": "pulled"},
+                "settle": {"returncode": 0, "output": "settled"},
+                "summary": summary}
+    monkeypatch.setattr(srv, "_run_settlement_scripts", lambda: expected)
+    status, body = post_json(server, "/api/settlements/run", {})
+    assert status == 200 and body == expected
+
+    status, body = post_json(server, "/api/settlements/run", {"since": "anything"})
+    assert status == 400 and "empty JSON object" in body["error"]
+
+
+def test_settlement_summary_before_settlement_table_exists(server, tmp_path):
+    conn = sqlite3.connect(tmp_path / "quote_selections.db")
+    conn.execute("CREATE TABLE priced_quotes (rfq_id TEXT, trigger TEXT, status TEXT)")
+    conn.execute("INSERT INTO priced_quotes VALUES ('R1', 'auto', 'QUOTED')")
+    conn.commit()
+    conn.close()
+
+    summary = get_json(server, "/api/settlements")
+    assert summary["available"] is True
+    assert summary["eligible"] == 1 and summary["unscored"] == 1
+    assert summary["settled"] == 0
+
+
 def test_performance_endpoint(server):
     p = get_json(server, "/api/performance")
     # R3 never traded: its quote stands as an assumed win. R1's trade did not
@@ -412,6 +464,13 @@ def test_inventory_tab_present(server):
     assert b'data-tab="inventory"' in body and b"/static/js/inventory.js" in body
     status, _ = get(server, "/static/js/inventory.js")
     assert status == 200
+
+
+def test_settlement_button_present(server):
+    status, body = get(server, "/")
+    assert status == 200
+    assert b'id="settlement-run"' in body
+    assert b"Check settlement for all priced RFQs" in body
 
 
 def test_nfl_meta_without_results(server, tmp_path, monkeypatch):

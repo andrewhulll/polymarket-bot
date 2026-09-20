@@ -1,14 +1,12 @@
-"""JSON API over the NFL backtest research views (no Streamlit).
+"""JSON API over the NFL backtest research views.
 
-Refactored from ``dashboard/nfl_tab.py``: the same data loading, filtering,
-and Altair chart builders, but instead of drawing into Streamlit each view
-returns a JSON-serializable dict::
+Provides data loading, filtering and Altair chart builders for the static
+dashboard. Each view returns a JSON-serializable dict::
 
     {"metrics": [...], "specs": [{"id", "title", "spec"}], "tables": {...}, "notes": [...]}
 
 Altair charts compile to Vega-Lite dicts (``chart.to_dict()``); the browser
-renders them with vega-embed, so every chart from the Streamlit tab survives
-without being reimplemented. This module is only imported lazily by the
+renders them with vega-embed. This module is only imported lazily by the
 dashboard server (it needs pandas/altair). Nothing here quotes or trades.
 """
 from __future__ import annotations

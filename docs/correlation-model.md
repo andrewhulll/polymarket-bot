@@ -12,7 +12,7 @@ pip install -r requirements-nfl.txt
 python scripts/nfl_tune.py --pull            # nflverse pull + train-only tuning -> params/estimator.json
 python scripts/nfl_backtest.py              # walk-forward train 2006-2021 / test 2022-2025 -> results/nfl_backtest/
 python scripts/refresh_params.py             # weekly params file + gates -> params/
-streamlit run dashboard/app.py               # "NFL correlation" tab
+python -m dashboard.server                   # open the "NFL correlation" tab on :8000
 ```
 
 Numbers quoted here are from the nflverse pull of 2026-09-16 (sha256 `0ac6de43583d…`), seasons
@@ -405,4 +405,4 @@ verifies this holds across recent quotes, not just these two.
 | `combo_mm/leg_books.py` | live leg books for combo legs: CLOB via Gamma token ids, Gamma fallback |
 | `combo_mm/nfl/live_pricer.py` | live RFQ -> fair value -> bid/ask, with decline codes and explanations |
 | `combo_mm/live_quoter.py` | prices quotable live RFQs off the feed's thread and logs every quote |
-| `dashboard/nfl_tab.py` | Streamlit "NFL correlation" tab |
+| `dashboard/nfl_api.py`, `dashboard/static/js/nfl.js` | JSON API and static "NFL correlation" tab |

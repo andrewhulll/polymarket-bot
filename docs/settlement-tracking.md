@@ -1,7 +1,6 @@
 # Settling live quotes: scoring the model after the final whistle
 
-*Plan only — no behaviour change ships with this document. Scope: NFL only,
-same-game combos, paper trading only. Related: Step 5 backtest harness
+*Implemented for NFL same-game combos and paper trading only. Related: Step 5 backtest harness
 ([#5](https://github.com/andrewhulll/polymarket-bot/issues/5)) and the roadmap
 ([#17](https://github.com/andrewhulll/polymarket-bot/issues/17)).*
 
@@ -13,30 +12,18 @@ quote or decline — to `priced_quotes` in `data/live/quote_selections.db`. That
 file is durable: it survives closing the dashboard, and each live run appends
 to it.
 
-What is missing is the other half. Grep every reader of `priced_quotes` and you
-find exactly two, both of them display code: `dashboard/app.py:609` (per-RFQ
-detail) and `dashboard/app.py:927` (the live quotes table). Nothing revisits a
-stored quote after the game finishes. So the database accumulates *what we
-would have quoted* and never learns whether it was right — no realized
-outcome, no calibration, no answer to the only question that matters about a
-correlation model: **did pricing the same-game block jointly beat multiplying
-the legs independently?**
+The settlement runner revisits stored quotes after the game finishes and records
+the realized outcome and calibration scores. This answers the central question
+for the correlation model: **did pricing the same-game block jointly beat
+multiplying the legs independently?**
 
 The backtest answers that question, but only in-process and only on
 reconstructed history (`combo_mm/nfl/week_backtest.py` settles each RFQ against
 the final score before returning). Live quotes are priced against real books,
 on real flow, and then dropped on the floor.
 
-Two smaller gaps travel with this one:
-
-- The lifecycle event store is a throwaway. `_start_live` calls
-  `_new_db("combo_mm_live_")`, which is
-  `tempfile.NamedTemporaryFile(delete=False)` (`dashboard/app.py:113`), so RFQ
-  events, screen results and quote-latency rows land in a fresh `%TEMP%` file
-  per run that nothing ever reopens. These grow fast — a single run from
-  2026-09-16 left a 142 MB orphan.
-- There is no marker distinguishing a scored quote from an unscored one, so
-  any future job cannot tell what it has already processed.
+The durable `quote_settlements` table distinguishes terminal results from
+pending or unresolved quotes, so repeated checks are idempotent.
 
 ## What already exists (the plan adds no new data source)
 
@@ -47,7 +34,7 @@ not a data-collection project.
 | Need | Where it already is |
 | --- | --- |
 | Which legs the quote covered | `priced_quotes.detail_json` → `legs[]`, each with `position_id`, `slug`, `game`, `canonical`, book `bid`/`ask`, `q_market`, `p_model` |
-| Leg identity → market meaning | `data/live/combo_markets.json` (the `ComboMarketCatalog` cache, `dashboard/app.py:188`) maps `position_id` → `LegMarket(slug, outcome_index)`, durably across restarts |
+| Leg identity → market meaning | `data/live/combo_markets.json.gz` (the `ComboMarketCatalog` cache) maps `position_id` → `LegMarket(slug, outcome_index)`, durably across restarts |
 | Market meaning → settlement rule | `catalog_markets.parse_catalog_leg(slug, outcome_index)` → `(NflLegMarket, side)` |
 | Leg settlement | `markets.settlement_price(market, home_score, away_score, push_rule)` → `"1"` / `"0"` / `"0.5"` / `None` (void) — `combo_mm/nfl/markets.py:269` |
 | Final scores | the cached nflverse pull: `ingest.latest_pull()` → `load_games()` → `Game.home_score` / `away_score`, with `Game.played` guarding unplayed games |
@@ -161,24 +148,17 @@ load, and a scoring pass has no business competing with it.
 
 ## Part D — dashboard surface
 
-A read-only section in the existing live-quotes tab (`dashboard/app.py:915`,
-beside the metrics row it already renders): counts of settled / void / pending,
-model Brier vs naive Brier with the difference, combo hit rate, and a table
-joining `quote_settlements` to `priced_quotes` so each row shows quoted
-bid/ask/fair alongside the realized value. Per-quote detail lists each leg with
-its settlement price and the game it resolved against.
+A settlement section in the static dashboard's **Pricing** tab shows counts of
+settled / void / pending / unresolved quotes and model Brier vs naive Brier.
+**Check settlement for all priced RFQs** calls the fixed server-side runner,
+which refreshes the cached scores and launches `scripts/settle_live_quotes.py`.
+No user-supplied command or path reaches the subprocess.
 
-The dashboard displays; the runner computes. Nothing in the dashboard writes a
-settlement row.
+## Part E — durable event store
 
-## Part E — making the event store durable
-
-Change `_new_db("combo_mm_live_")` (`dashboard/app.py:113`) to a dated path
-under `data/live/` so screens, lifecycle events and latency history survive a
-restart alongside the quotes. `data/` is already gitignored, so nothing leaks
-into the repo. Given the observed growth rate (142 MB in one session), this
-lands with daily rotation and a retention cap rather than as an unbounded
-append — otherwise the fix trades a lost file for a full disk.
+The headless capture process owns `data/live/rfq_capture.db`; the static
+dashboard opens it read-only. Quote selections and settlements remain in the
+separate durable `data/live/quote_selections.db` ledger.
 
 ## Testing
 

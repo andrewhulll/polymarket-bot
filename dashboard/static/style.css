@@ -166,6 +166,8 @@ td.dim, .dim { color: var(--dim); }
 .alert.error::before { content: "⛔"; }
 .alert.warn { background: rgba(255,176,32,.08); border: 1px solid rgba(255,176,32,.5); color: #ffe6bd; }
 .alert.warn::before { content: "⚠"; }
+.alert.good { background: rgba(61,220,132,.09); border: 1px solid rgba(61,220,132,.45); color: #c9ffe0; }
+.alert.good::before { content: "✓"; color: var(--good); }
 
 /* ---- drawer ---- */
 #drawer {

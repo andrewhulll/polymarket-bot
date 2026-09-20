@@ -1,7 +1,7 @@
 {
   "data_vintage": {
-    "pull_date": "2026-09-17",
-    "sha256": "d15b71205791a1bbd0b0c7152f91eacaf724bfc8f4a41cf649785eea5f0dd543",
+    "pull_date": "2026-09-20",
+    "sha256": "15d5996120ef2b52e734fc5a0215dff16d8e4d89dece74337cf08b29ddd7f361",
     "source_url": "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv"
   },
   "estimator": {
@@ -37,7 +37,7 @@
     },
     {
       "detail": {
-        "bytes": 14474
+        "bytes": 14479
       },
       "name": "determinism",
       "passed": true

@@ -40,6 +40,15 @@
   </section>
 
   <section id="tab-pricing" class="tab">
+    <h2>Settlement check <span class="h-sub">after the final whistle</span></h2>
+    <div class="toolbar">
+      <button id="settlement-run" title="Refresh final NFL scores, then settle every eligible priced quote">Check settlement for all priced RFQs</button>
+      <span class="caption" id="settlement-last"></span>
+    </div>
+    <div id="settlement-result"></div>
+    <div class="kpis" id="settlement-kpis"></div>
+    <p class="caption">Only QUOTED decisions are eligible. Final-score checks are idempotent; pending games can be checked again later.</p>
+    <h2>Pricing decisions</h2>
     <div class="kpis" id="pricing-kpis"></div>
     <div class="toolbar">
       <span class="spacer"></span>

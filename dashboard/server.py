@@ -5,15 +5,17 @@ dashboard flicker and lose scroll position while the capture feed updates.
 This server keeps one page loaded in the browser; the page polls small JSON
 endpoints and patches the DOM in place, so nothing ever full-refreshes.
 
-Read-only by construction: every live endpoint opens the capture database through
+Read-only by default: every live data endpoint opens the capture database through
 :func:`dashboard.live_view_models.connect_readonly`, and the headless capture
 process remains the sole writer. The only write-capable routes are two tightly
 allowlisted NFL research runners (``/api/nfl/run`` and ``/api/nfl/explorer/price``),
 which execute only the whitelisted research scripts against the repo's research
 inputs -- they can never touch the live database, credentials, or the network --
-plus the manual kill-switch control (``/api/risk/kill-switch``), which writes a
-single row to ``kill_switch_events`` in the capture database so the engine halts
-paper quoting. Nothing here can submit a quote -- paper or otherwise.
+the settlement runner (``/api/settlements/run``), which refreshes public scores
+and writes only to the paper quote-settlement ledger, plus the manual kill-switch
+control (``/api/risk/kill-switch``), which writes a single row to
+``kill_switch_events`` in the capture database so the engine halts paper quoting.
+Nothing here can submit a quote -- paper or otherwise.
 
 Run from the repository root::
 
@@ -25,6 +27,9 @@ import argparse
 import json
 import logging
 import sqlite3
+import subprocess
+import sys
+import threading
 from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,6 +58,7 @@ STATIC_FILES = {"index.html": "text/html; charset=utf-8",
                 "vendor/vega-lite.min.js": "application/javascript; charset=utf-8",
                 "vendor/vega-embed.min.js": "application/javascript; charset=utf-8"}
 PAGE_SIZE = 500
+_SETTLEMENT_LOCK = threading.Lock()
 
 
 def _transient(path: str, query: dict | None = None) -> dict | None:
@@ -110,6 +116,80 @@ def _pricing_count(conn: sqlite3.Connection) -> int:
         "SELECT COUNT(*) FROM rfq_screen WHERE screen='QUOTABLE'").fetchone()[0]
 
 
+def _settlement_db_path() -> Path:
+    return Path(_CONFIG["data_dir"]) / "quote_selections.db"
+
+
+def _settlement_summary() -> dict:
+    """Compact scoring status for every QUOTED row in the durable ledger."""
+    path = _settlement_db_path()
+    empty = {"available": False, "eligible": 0, "unscored": 0,
+             "settled": 0, "void": 0, "pending": 0, "unresolved": 0,
+             "model_brier": None, "naive_brier": None, "brier_advantage": None,
+             "last_checked": None}
+    if not path.is_file():
+        return empty
+    try:
+        with closing(vm.connect_readonly(path)) as conn:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "priced_quotes" not in tables:
+                return empty
+            eligible = conn.execute(
+                "SELECT COUNT(*) FROM priced_quotes WHERE status='QUOTED'").fetchone()[0]
+            if "quote_settlements" not in tables:
+                return {**empty, "available": True, "eligible": eligible,
+                        "unscored": eligible}
+            counts = {r[0]: r[1] for r in conn.execute(
+                "SELECT status, COUNT(*) FROM quote_settlements GROUP BY status")}
+            unscored = conn.execute(
+                "SELECT COUNT(*) FROM priced_quotes q LEFT JOIN quote_settlements s "
+                "ON s.rfq_id=q.rfq_id AND s.trigger=q.trigger "
+                "WHERE q.status='QUOTED' AND s.rfq_id IS NULL").fetchone()[0]
+            metrics = conn.execute(
+                "SELECT AVG(brier), AVG(naive_brier), MAX(settled_at) "
+                "FROM quote_settlements WHERE status='SETTLED' "
+                "AND brier IS NOT NULL AND naive_brier IS NOT NULL").fetchone()
+    except (OSError, sqlite3.Error):
+        return empty
+    model_brier, naive_brier, last_checked = metrics
+    return {"available": True, "eligible": eligible, "unscored": unscored,
+            "settled": counts.get("SETTLED", 0), "void": counts.get("VOID", 0),
+            "pending": counts.get("PENDING", 0),
+            "unresolved": counts.get("UNRESOLVED", 0),
+            "model_brier": model_brier, "naive_brier": naive_brier,
+            "brier_advantage": (naive_brier - model_brier
+                                if model_brier is not None and naive_brier is not None
+                                else None),
+            "last_checked": last_checked}
+
+
+def _run_settlement_scripts() -> dict:
+    """Refresh public scores, then idempotently score every eligible quote."""
+    raw_root = REPO / "data" / "raw"
+    data_dir = Path(_CONFIG["data_dir"])
+    commands = (
+        [sys.executable, str(REPO / "scripts" / "refresh_params.py"),
+         "--pull", "--raw-root", str(raw_root)],
+        [sys.executable, str(REPO / "scripts" / "settle_live_quotes.py"),
+         "--db", str(_settlement_db_path()), "--raw-root", str(raw_root),
+         "--catalog", str(data_dir / "combo_markets.json.gz")],
+    )
+    results = []
+    for argv in commands:
+        try:
+            proc = subprocess.run(argv, cwd=REPO, capture_output=True, text=True,
+                                  timeout=3600)
+            tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-20:])
+            results.append({"returncode": proc.returncode,
+                            "output": tail or "(no output)"})
+        except subprocess.TimeoutExpired:
+            results.append({"returncode": 124, "output": "timed out after 1 hour"})
+    pull, settle = results
+    return {"ok": settle["returncode"] == 0, "pull": pull, "settle": settle,
+            "summary": _settlement_summary()}
+
+
 def _json(payload: Any, status: int = 200) -> tuple[int, str, bytes]:
     return status, "application/json; charset=utf-8", json.dumps(payload).encode()
 
@@ -151,6 +231,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(*self._api_pricing(query))
             elif path.startswith("/api/pricing/"):
                 self._respond(*self._api_pricing_one(unquote(path[len("/api/pricing/"):])))
+            elif path == "/api/settlements":
+                self._respond(*_json(_settlement_summary()))
             elif path == "/api/performance":
                 self._respond(*self._api_performance())
             elif path == "/api/fills":
@@ -198,6 +280,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(*self._api_sources_active())
             elif parsed.path == "/api/risk/kill-switch":
                 self._respond(*self._api_kill_switch())
+            elif parsed.path == "/api/settlements/run":
+                self._respond(*self._api_settlements_run())
             else:
                 self._respond(*_json({"error": "not found"}, 404))
         except _Waiting as exc:
@@ -299,6 +383,18 @@ class Handler(BaseHTTPRequestHandler):
             if not rows:
                 return _json({"error": "unknown rfq"}, 404)
             return _json(rows[0])
+
+    def _api_settlements_run(self) -> tuple[int, str, bytes]:
+        """Run the fixed score-refresh + paper-settlement pipeline once."""
+        body = self._read_json_body()
+        if not isinstance(body, dict) or body:
+            raise ValueError("body must be an empty JSON object")
+        if not _SETTLEMENT_LOCK.acquire(blocking=False):
+            return _json({"error": "settlement check already running"}, 409)
+        try:
+            return _json(_run_settlement_scripts())
+        finally:
+            _SETTLEMENT_LOCK.release()
 
     def _api_performance(self) -> tuple[int, str, bytes]:
         with closing(_connect()) as conn:
