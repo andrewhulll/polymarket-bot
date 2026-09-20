@@ -1,7 +1,7 @@
 """Durable record of the live RFQs we chose to quote and their accepted quotes.
 
-The live monitor's event store is a fresh temp DB per run; this store is a
-separate SQLite file that survives restarts. It holds only:
+The headless capture and the dashboard share one durable SQLite file. This
+store owns the selection, NFL pricing, and settlement tables within it:
 
 - ``selected_rfqs`` -- RFQs picked on the dashboard, with a snapshot of the
   request (direction, size, deadline, resolved legs) taken at pick time so
@@ -322,7 +322,7 @@ class QuoteSelectionStore:
         return [self._settlement_dict(r) for r in rows]
 
     def quotes_needing_settlement(self, since: Optional[str] = None,
-                                  limit: int = 5000) -> List[Dict[str, Any]]:
+                                  limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """QUOTED quotes with no terminal settlement row.
 
         A quote is due when it has no settlement row, or its row is
@@ -339,8 +339,10 @@ class QuoteSelectionStore:
         if since is not None:
             sql += " AND q.priced_at >= ?"
             args.append(since)
-        sql += " ORDER BY q.priced_at ASC, q.rowid ASC LIMIT ?"
-        args.append(limit)
+        sql += " ORDER BY q.priced_at ASC, q.rowid ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(limit)
         with self._lock:
             rows = self._conn.execute(sql, args).fetchall()
         out = []

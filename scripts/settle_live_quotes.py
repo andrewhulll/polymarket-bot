@@ -11,7 +11,7 @@ settlement button runs that first), and the catalog is read from its local
 cache only. Only QUOTED quotes are scored -- declines carry no fair price.
 
     python scripts/settle_live_quotes.py \
-        [--db data/live/quote_selections.db] [--raw-root data/raw] \
+        [--db data/live/rfq_capture.db] [--raw-root data/raw] \
         [--catalog data/live/combo_markets.json.gz] \
         [--since 2026-09-01T00:00:00Z] [--dry-run]
 """
@@ -35,8 +35,8 @@ TERMINAL = ("SETTLED", "VOID")
 def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--db", default=str(ROOT / "data" / "live" / "quote_selections.db"),
-                    help="durable quote-selections DB")
+    ap.add_argument("--db", default=str(ROOT / "data" / "live" / "rfq_capture.db"),
+                    help="durable live capture and quote ledger DB")
     ap.add_argument("--raw-root", default=str(ROOT / "data" / "raw"),
                     help="cached nflverse pulls")
     ap.add_argument("--catalog", default=str(ROOT / "data" / "live" / "combo_markets.json.gz"),

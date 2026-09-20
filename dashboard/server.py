@@ -117,7 +117,7 @@ def _pricing_count(conn: sqlite3.Connection) -> int:
 
 
 def _settlement_db_path() -> Path:
-    return Path(_CONFIG["data_dir"]) / "quote_selections.db"
+    return Path(_CONFIG["data_dir"]) / "rfq_capture.db"
 
 
 def _settlement_summary() -> dict:
