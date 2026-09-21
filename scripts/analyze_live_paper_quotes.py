@@ -18,7 +18,7 @@ def connect(path: Path) -> sqlite3.Connection:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--db", type=Path, default=Path("data/live/quote_selections.db"))
+    ap.add_argument("--db", type=Path, default=Path("data/live/rfq_capture.db"))
     ap.add_argument("--feed-db", type=Path)
     args = ap.parse_args()
     db = connect(args.db)

@@ -264,12 +264,7 @@ def test_settlement_summary_and_runner(server, tmp_path, monkeypatch):
     from combo_mm.quote_selections import QuoteSelectionStore
     from dashboard import server as srv
 
-    store = QuoteSelectionStore(tmp_path / "quote_selections.db")
-    store.record_priced_quote({
-        "rfq_id": "R1", "priced_at": "2026-09-17T12:00:01Z",
-        "status": "QUOTED", "reason_code": "OK", "fair": 0.60,
-        "naive": 0.50, "bid": 0.58, "ask": 0.62, "detail": {},
-    })
+    store = QuoteSelectionStore(tmp_path / "rfq_capture.db")
     store.record_quote_settlement({
         "rfq_id": "R1", "trigger": "auto", "status": "SETTLED",
         "reason_detail": None, "combo_value": 1.0, "n_legs": 2,
@@ -283,8 +278,8 @@ def test_settlement_summary_and_runner(server, tmp_path, monkeypatch):
 
     summary = get_json(server, "/api/settlements")
     assert summary["available"] is True
-    assert summary["eligible"] == 1 and summary["settled"] == 1
-    assert summary["unscored"] == 0
+    assert summary["eligible"] == 2 and summary["settled"] == 1
+    assert summary["unscored"] == 1
     assert summary["model_brier"] == pytest.approx(0.16)
     assert summary["brier_advantage"] == pytest.approx(0.09)
 
@@ -300,15 +295,9 @@ def test_settlement_summary_and_runner(server, tmp_path, monkeypatch):
 
 
 def test_settlement_summary_before_settlement_table_exists(server, tmp_path):
-    conn = sqlite3.connect(tmp_path / "quote_selections.db")
-    conn.execute("CREATE TABLE priced_quotes (rfq_id TEXT, trigger TEXT, status TEXT)")
-    conn.execute("INSERT INTO priced_quotes VALUES ('R1', 'auto', 'QUOTED')")
-    conn.commit()
-    conn.close()
-
     summary = get_json(server, "/api/settlements")
     assert summary["available"] is True
-    assert summary["eligible"] == 1 and summary["unscored"] == 1
+    assert summary["eligible"] == 2 and summary["unscored"] == 2
     assert summary["settled"] == 0
 
 

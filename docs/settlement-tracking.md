@@ -8,9 +8,8 @@
 
 The live feed already prices. Every RFQ the screen calls `QUOTABLE` goes to
 `LiveQuoter`, which prices it off the poll thread and writes the outcome —
-quote or decline — to `priced_quotes` in `data/live/quote_selections.db`. That
-file is durable: it survives closing the dashboard, and each live run appends
-to it.
+quote or decline — to `priced_quotes` in `data/live/rfq_capture.db`. That file
+is durable: it survives closing the dashboard, and each live run appends to it.
 
 The settlement runner revisits stored quotes after the game finishes and records
 the realized outcome and calibration scores. This answers the central question
@@ -132,7 +131,7 @@ BUY fill — and keep it in a separate column from the counterfactual figures.
 
 ```
 python scripts/settle_live_quotes.py \
-    [--db data/live/quote_selections.db] [--raw-root data/raw] \
+    [--db data/live/rfq_capture.db] [--raw-root data/raw] \
     [--since 2026-09-01T00:00:00Z] [--dry-run]
 ```
 
@@ -158,7 +157,7 @@ No user-supplied command or path reaches the subprocess.
 
 The headless capture process owns `data/live/rfq_capture.db`; the static
 dashboard opens it read-only. Quote selections and settlements remain in the
-separate durable `data/live/quote_selections.db` ledger.
+same durable `data/live/rfq_capture.db` ledger.
 
 ## Testing
 
