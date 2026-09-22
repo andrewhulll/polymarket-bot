@@ -5,13 +5,25 @@ $("fills-prev").addEventListener("click", () => { if (state.fillsPage > 1) { sta
 $("fills-next").addEventListener("click", () => { state.fillsPage++; refreshFills(); });
 
 async function refreshPerformance() {
-  const [perf, fills, inv, risk] = await Promise.all([
+  const [perf, fills, inv, risk, source] = await Promise.all([
     get("/api/performance"), get(`/api/fills?page=${state.fillsPage}`),
     get("/api/inventory").catch(() => null), get("/api/risk").catch(() => null),
+    get("/api/source/meta").catch(() => null),
   ]);
+
+  const m = source?.meta || {};
+  $("source-meta").textContent = source
+    ? `${source.label}${m.n_rfqs != null ? ` · ${m.n_rfqs} RFQs across ${m.n_games ?? "?"} games` : ""}` +
+      `${m.data_vintage?.pull_date ? ` · data ${m.data_vintage.pull_date}` : ""}` +
+      `${m.params_version ? ` · params ${m.params_version}` : ""}`
+    : "";
 
   $("perf-kpis").innerHTML =
     kpi("Quoted", fmtInt(perf.quoted)) +
+    kpi("RFQs received", fmtInt(perf.rfqs_received)) +
+    kpi("Declined", fmtInt(perf.rfqs_declined)) +
+    kpi("Executed", fmtInt(perf.rfqs_executed)) +
+    kpi("Quote rate", fmtPct(perf.quote_rate)) +
     kpi("Shadow fills", fmtInt(perf.shadow_fills)) +
     kpi("Expected P&L", fmtMoney(perf.expected_pnl), perf.expected_pnl >= 0 ? "good" : "bad") +
     kpi("Realized P&L", fmtMoney(perf.realized_pnl), perf.realized_pnl >= 0 ? "good" : "bad") +
@@ -48,7 +60,8 @@ async function refreshPerformance() {
   $("perf-breakdowns").innerHTML =
     mkTable("By family", perf.by_family, "family") +
     mkTable("By leg count", perf.by_legs, "n_legs") +
-    mkTable("By game", (perf.by_game || []).slice(0, 12), "game") +
+    mkTable("By game", perf.by_game, "game") +
+    mkTable("By requester side", perf.by_requester_side, "requester_side") +
     mkTable("By market source", perf.by_market_source, "market_source");
 }
 

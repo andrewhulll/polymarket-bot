@@ -1,7 +1,8 @@
 """Headless paper quoting engine and capture of live Polymarket RFQs.
 
 The websocket adapter wakes this process on each frame. It screens RFQs and
-prices eligible requests on a worker thread. Only quoted RFQs are stored. The dashboard
+prices eligible requests on a worker thread. Quoted RFQs and capital-limit
+rejections are stored. The dashboard
 reads the resulting SQLite database. No order is submitted. Uses the
 receive-only quoter-gateway adapter
 (``combo_mm.intl_gateway.InternationalQuoterGatewayAdapter``). Run it
@@ -14,8 +15,9 @@ Writes, under ``--data-dir`` (default ``data/live``):
 
 - ``rfq_raw.jsonl``     -- raw request and trade frames for RFQs we actually
   paper quote. The trade's accepted price/size also survive in ``live_trades``.
-- ``rfq_capture.db``    -- quoted RFQs, their screens, paper drafts and trades,
-  plus one live health row. Rejected and declined RFQs remain in memory only.
+- ``rfq_capture.db``    -- quoted RFQs, capital-limit rejections, their screens,
+  paper drafts and trades, plus one live health row. Other rejected and declined
+  RFQs remain in memory only.
 - ``combo_markets.json.gz`` -- compressed leg catalog cache (same cache the dashboard
   uses, so a restart resolves legs immediately either way).
 
@@ -59,6 +61,8 @@ from combo_mm.nfl.tuning import SELECTION_PATH, load_selection
 from combo_mm.quote_selections import QuoteSelectionStore
 from combo_mm.capture_process import CaptureLock
 from combo_mm.inventory import InventoryProvider
+from combo_mm.paper_capital import PaperCapitalState, replay_paper_capital
+from combo_mm.risk import RISK_CAPITAL
 from combo_mm.risk_config import RiskConfig
 from combo_mm.risk_policy import InventoryRiskCheck
 from combo_mm.transient_rfqs import TransientRfqs, TransientRfqServer
@@ -110,11 +114,17 @@ class RfqCapture:
         self._inventory = InventoryProvider(self.store,
                                             capital=self._risk_config.initial_capital,
                                             game_resolver=self._resolve_game)
+        self._paper_capital = PaperCapitalState(self._risk_config.initial_capital)
         # Only quoted RFQs are durable. Reload their ids so trade broadcasts
         # after a restart can still be joined to the saved quotes.
         with self.store._lock:
             self._quoted.update(row[0] for row in self.store._conn.execute(
                 "SELECT rfq_id FROM quotes WHERE status = 'shadow'"))
+        if self.selections is not None:
+            equity = self._inventory().equity
+            with self.selections._lock:
+                self._paper_capital = replay_paper_capital(
+                    self.selections._conn, equity)
         if price_live:
             repo = Path(__file__).resolve().parents[1]
             params = ParamsProvider(repo / "params")
@@ -158,6 +168,14 @@ class RfqCapture:
                 self.transient_rfqs.decision(rfq.rfq_id, quote)
                 return
             if not self._check_quote_risk(rfq, quote, decided):
+                if quote.reason_code == RISK_CAPITAL and self.selections is not None:
+                    self.store.apply(pending["event"], source="live_capture",
+                                     record_inventory=False)
+                    self.store.upsert_rfq_screen(rfq.rfq_id, **pending["screen"])
+                    self._write_raw_frame(pending["now"], pending["raw"])
+                    self.selections.record_priced_quote(quote.to_dict(), "auto")
+                    self.transient_rfqs.remove(rfq.rfq_id)
+                    return
                 self.transient_rfqs.decision(rfq.rfq_id, quote)
                 return
             self.store.apply(pending["event"], source="live_capture",
@@ -207,6 +225,10 @@ class RfqCapture:
             quote.bid = quote.ask = quote.response_price = None
             quote.bid_qty = quote.ask_qty = None
             return False
+
+        if self._paper_capital.exhausted:
+            return decline(RISK_CAPITAL,
+                           "paper net notional has exhausted available equity")
 
         games = {self._resolve_game(position_id) for position_id in rfq.leg_position_ids}
         if None in games or len(games) != 1:
@@ -264,10 +286,35 @@ class RfqCapture:
         quote.response_price = quote.ask if rfq.direction == "BUY" else quote.bid
         if quote.response_price is None:
             return decline("RISK_SIZE_REDUCED", "requested RFQ side has no capacity", game)
+        response_action = quote.response_action or (
+            "SELL" if rfq.direction == "BUY" else "BUY")
+        response_qty = buy_qty if response_action == "SELL" else sell_qty
+        proposed = (1 if response_action == "BUY" else -1) * response_qty * quote.response_price
+        allocated = self._paper_capital.available_allocation(proposed)
+        if abs(allocated) < 1e-9:
+            return decline(RISK_CAPITAL,
+                           "paper net notional has no remaining equity", game)
+        allowed_qty = math.floor(abs(allocated) / quote.response_price + 1e-9)
+        if allowed_qty < response_qty:
+            if allowed_qty < 1:
+                return decline(RISK_CAPITAL,
+                               "remaining paper equity cannot fund one share", game)
+            if response_action == "SELL":
+                buy_qty = allowed_qty
+                quote.ask_qty = str(buy_qty)
+            else:
+                sell_qty = allowed_qty
+                quote.bid_qty = str(sell_qty)
+            response_qty = allowed_qty
+            proposed = ((1 if response_action == "BUY" else -1)
+                        * response_qty * quote.response_price)
+        self._paper_capital.commit(rfq.rfq_id, proposed, quote.response_price)
         quote.components["risk"] = {
             "game": game, "action": verdict.action, "notional_before": notional,
             "game_notional_before": used, "game_loss_before": inventory.exposures.get(game, 0),
             "game_loss_limit": self._risk_config.risk.max_game_loss,
+            "paper_net_notional_after": self._paper_capital.net_notional,
+            "paper_equity_limit": self._paper_capital.equity,
         }
         return True
 
@@ -275,6 +322,14 @@ class RfqCapture:
         if self.store.apply(event, source="live_capture", record_inventory=False):
             self.store.record_live_trade(event.rfq_id, raw.get("price"), raw.get("size"),
                                          raw.get("executed_at"))
+            allocated = self._paper_capital.allocations.get(event.rfq_id)
+            if allocated is not None:
+                market_price = float(raw.get("price") or 0)
+                our_price = self._paper_capital.response_prices.get(event.rfq_id, 0.0)
+                lost = ((allocated > 0 and our_price < market_price) or
+                        (allocated < 0 and our_price > market_price))
+                if lost:
+                    self._paper_capital.release_lost_quote(event.rfq_id)
             self._write_raw_frame(now, raw)
 
     def heartbeat(self, adapter: InternationalQuoterGatewayAdapter) -> None:

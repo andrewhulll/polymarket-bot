@@ -126,6 +126,7 @@ def _settlement_summary() -> dict:
     empty = {"available": False, "eligible": 0, "unscored": 0,
              "settled": 0, "void": 0, "pending": 0, "unresolved": 0,
              "model_brier": None, "naive_brier": None, "brier_advantage": None,
+             "hit_rate": None,
              "last_checked": None}
     if not path.is_file():
         return empty
@@ -147,21 +148,79 @@ def _settlement_summary() -> dict:
                 "ON s.rfq_id=q.rfq_id AND s.trigger=q.trigger "
                 "WHERE q.status='QUOTED' AND s.rfq_id IS NULL").fetchone()[0]
             metrics = conn.execute(
-                "SELECT AVG(brier), AVG(naive_brier), MAX(settled_at) "
+                "SELECT AVG(brier), AVG(naive_brier), "
+                "AVG(CASE WHEN combo_value=1.0 THEN 1.0 ELSE 0.0 END) "
                 "FROM quote_settlements WHERE status='SETTLED' "
                 "AND brier IS NOT NULL AND naive_brier IS NOT NULL").fetchone()
+            last_checked = conn.execute(
+                "SELECT MAX(settled_at) FROM quote_settlements").fetchone()[0]
     except (OSError, sqlite3.Error):
         return empty
-    model_brier, naive_brier, last_checked = metrics
+    model_brier, naive_brier, hit_rate = metrics
     return {"available": True, "eligible": eligible, "unscored": unscored,
             "settled": counts.get("SETTLED", 0), "void": counts.get("VOID", 0),
             "pending": counts.get("PENDING", 0),
             "unresolved": counts.get("UNRESOLVED", 0),
             "model_brier": model_brier, "naive_brier": naive_brier,
+            "hit_rate": hit_rate,
             "brier_advantage": (naive_brier - model_brier
                                 if model_brier is not None and naive_brier is not None
                                 else None),
             "last_checked": last_checked}
+
+
+def _settlements(page: int = 1) -> dict:
+    """Settlement summary plus a paginated per-quote ledger."""
+    summary = _settlement_summary()
+    path = _settlement_db_path()
+    payload = {**summary, "page": page, "page_size": PAGE_SIZE,
+               "total": 0, "rows": []}
+    if not summary["available"] or not path.is_file():
+        return payload
+    with closing(vm.connect_readonly(path)) as conn:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "quote_settlements" not in tables:
+            return payload
+        payload["total"] = conn.execute(
+            "SELECT COUNT(*) FROM quote_settlements").fetchone()[0]
+        have_accepted = "accepted_quotes" in tables
+        priced_columns = {r[1] for r in conn.execute("PRAGMA table_info(priced_quotes)")}
+        qcol = lambda name: f"q.{name}" if name in priced_columns else f"NULL AS {name}"
+        join = "LEFT JOIN accepted_quotes a ON a.rfq_id=s.rfq_id" if have_accepted else ""
+        accepted = ("a.price AS accepted_price, a.size AS accepted_size, "
+                    "a.direction AS accepted_direction, a.executed_at AS accepted_executed_at"
+                    if have_accepted else
+                    "NULL AS accepted_price, NULL AS accepted_size, "
+                    "NULL AS accepted_direction, NULL AS accepted_executed_at")
+        rows = conn.execute(f"""
+            SELECT s.*, {qcol('legs_label')}, {qcol('direction')}, {qcol('side')},
+                   {qcol('priced_at')}, {qcol('detail_json')}, {accepted}
+            FROM quote_settlements s
+            LEFT JOIN priced_quotes q ON q.rfq_id=s.rfq_id AND q.trigger=s.trigger
+            {join}
+            ORDER BY s.settled_at DESC, s.rowid DESC LIMIT ? OFFSET ?
+        """, (PAGE_SIZE, (page - 1) * PAGE_SIZE)).fetchall()
+        for raw in rows:
+            row = dict(raw)
+            try:
+                row["legs"] = json.loads(row.pop("legs_json") or "[]")
+            except (TypeError, ValueError):
+                row["legs"] = []
+            try:
+                detail = json.loads(row.pop("detail_json") or "{}")
+            except (TypeError, ValueError):
+                detail = {}
+            games = detail.get("games") or []
+            row["game"] = ", ".join(str(g.get("game") or g.get("label") or "")
+                                      for g in games).strip(", ") or row.get("legs_label")
+            row["realized_pnl"] = None
+            if (row["accepted_price"] is not None and row["accepted_size"] is not None
+                    and row["status"] == "SETTLED" and row["combo_value"] is not None):
+                sign = 1.0 if (row["accepted_direction"] or "BUY") == "BUY" else -1.0
+                row["realized_pnl"] = sign * (row["combo_value"] - row["accepted_price"]) * row["accepted_size"]
+            payload["rows"].append(row)
+    return payload
 
 
 def _run_settlement_scripts() -> dict:
@@ -232,7 +291,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/api/pricing/"):
                 self._respond(*self._api_pricing_one(unquote(path[len("/api/pricing/"):])))
             elif path == "/api/settlements":
-                self._respond(*_json(_settlement_summary()))
+                page = max(1, int(query.get("page", ["1"])[0] or 1))
+                self._respond(*_json(_settlements(page)))
             elif path == "/api/performance":
                 self._respond(*self._api_performance())
             elif path == "/api/fills":
@@ -249,10 +309,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(*self._api_engine())
             elif path == "/api/sources":
                 self._respond(*self._api_sources())
+            elif path == "/api/source/meta":
+                self._respond(*self._api_source_meta())
             elif path == "/api/nfl/meta":
                 self._respond(*self._api_nfl_meta())
             elif path == "/api/nfl/games":
                 self._respond(*self._api_nfl_games())
+            elif path == "/api/nfl/params/download":
+                self._respond(*self._api_nfl_params_download(query))
             elif path.startswith("/api/nfl/"):
                 self._respond(*self._api_nfl_view(path[len("/api/nfl/"):], query))
             else:
@@ -325,23 +389,30 @@ class Handler(BaseHTTPRequestHandler):
         except _Waiting:
             waiting = True
         return _json({"ok": True, "waiting": waiting,
-                      "db": str(_db_path()), "page_size": PAGE_SIZE})
+                      "db": str(_db_path()), "page_size": PAGE_SIZE,
+                      "capture_start_error": _CONFIG.get("capture_start_error")})
 
     def _api_rfqs(self, query: dict) -> tuple[int, str, bytes]:
         only = query.get("only_quotable", ["0"])[0] == "1"
         screen = query.get("screen", [None])[0] or None
+        status = query.get("status", [None])[0] or None
+        game = query.get("game", [None])[0] or None
         search = query.get("search", [None])[0] or None
         page = max(1, int(query.get("page", ["1"])[0] or 1))
         end = page * PAGE_SIZE
         try:
             with closing(_connect()) as conn:
                 durable = vm.rfqs(conn, only_quotable=only, screen=screen,
+                                  status=status, game=game,
                                   search=search, limit=end, offset=0)
                 durable_total = vm.rfqs_count(conn, only_quotable=only,
-                                              screen=screen, search=search)
+                                              screen=screen, status=status, game=game,
+                                              search=search)
+                filter_options = vm.rfq_filter_options(conn)
             waiting = None
         except _Waiting as exc:
             durable, durable_total = [], 0
+            filter_options = {"statuses": [], "games": []}
             waiting = exc
         transient = (None if only or _CONFIG["active_db"] != "rfq_capture.db" else _transient("/rfqs", {
             "limit": end, "screen": screen, "search": search}))
@@ -356,7 +427,8 @@ class Handler(BaseHTTPRequestHandler):
         total = durable_total + (transient["total"] if transient else 0)
         return _json({"total": total, "page": page, "page_size": PAGE_SIZE,
                       "rows": rows[(page - 1) * PAGE_SIZE:end],
-                      "session_only": bool(transient)})
+                      "session_only": bool(transient),
+                      "filter_options": filter_options})
 
     def _api_rfqs_one(self, rfq_id: str) -> tuple[int, str, bytes]:
         try:
@@ -492,6 +564,18 @@ class Handler(BaseHTTPRequestHandler):
         _CONFIG["active_db"] = name
         return _json({"active": name})
 
+    def _api_source_meta(self) -> tuple[int, str, bytes]:
+        name = _CONFIG["active_db"]
+        path = Path(_CONFIG["data_dir"]) / (Path(name).stem + ".meta.json")
+        meta = {}
+        if path.is_file():
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                meta = value if isinstance(value, dict) else {}
+            except (OSError, ValueError):
+                meta = {}
+        return _json({"source": name, "label": _source_label(name), "meta": meta})
+
     # -- NFL research -----------------------------------------------------
     def _api_nfl_meta(self) -> tuple[int, str, bytes]:
         nfl = _nfl_api()
@@ -505,6 +589,14 @@ class Handler(BaseHTTPRequestHandler):
         if not nfl.DEPS_OK:
             return _json({"error": "nfl research deps unavailable"}, 503)
         return _json({"games": nfl.explorer_games()})
+
+    def _api_nfl_params_download(self, query: dict) -> tuple[int, str, bytes]:
+        nfl = _nfl_api()
+        name = query.get("file", [""])[0]
+        allowed = {p.name: p for _, p in nfl.list_params(nfl.PARAMS_DIR)}
+        if name not in allowed:
+            return _json({"error": "unknown params file"}, 404)
+        return 200, "application/json; charset=utf-8", allowed[name].read_bytes()
 
     def _api_nfl_view(self, view: str, query: dict) -> tuple[int, str, bytes]:
         nfl = _nfl_api()
@@ -571,7 +663,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 _CONFIG = {"data_dir": str(REPO / "data" / "live"),
-           "active_db": "rfq_capture.db", "screen_port": 8765}
+           "active_db": "rfq_capture.db", "screen_port": 8765,
+           "capture_start_error": None}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -582,10 +675,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="capture output directory (default: data/live)")
     parser.add_argument("--screen-port", type=int, default=8765,
                         help="local capture screener API port (default: 8765)")
+    parser.add_argument("--no-start-capture", action="store_true",
+                        help="do not auto-start the headless capture process")
     args = parser.parse_args(argv)
     _CONFIG["data_dir"] = args.data_dir
     _CONFIG["screen_port"] = args.screen_port
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if not args.no_start_capture:
+        from combo_mm.capture_process import ensure_capture_running
+        _CONFIG["capture_start_error"] = ensure_capture_running(
+            REPO, Path(args.data_dir))
+        if _CONFIG["capture_start_error"]:
+            log.warning("%s", _CONFIG["capture_start_error"])
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     log.info("live dashboard at http://127.0.0.1:%d (read-only; db=%s)",
              args.port, _db_path())

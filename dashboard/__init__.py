@@ -1,1 +1,1 @@
-"""Streamlit dashboard package (demo/observability, not production)."""
+"""Static live dashboard package (demo/observability, not production)."""

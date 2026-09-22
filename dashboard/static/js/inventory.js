@@ -9,7 +9,9 @@ function invMoney(x) {
 }
 
 async function refreshInventory() {
-  const [inv, risk] = await Promise.all([get("/api/inventory"), get("/api/risk")]);
+  const [inv, risk, exposure] = await Promise.all([
+    get("/api/inventory"), get("/api/risk"), get("/api/exposure")
+  ]);
 
   const ks = inv.kill_switch_event || {};
   const engaged = inv.kill_switch === true || ks.state === "tripped";
@@ -59,6 +61,12 @@ async function refreshInventory() {
     `<td class="num">${invMoney(games[g])}</td>` +
     `<td class="num">${net[g] != null ? esc(Number(net[g]).toLocaleString("en-US", {maximumFractionDigits: 2})) : "—"}</td></tr>`
   ).join("") || `<tr><td colspan="5" class="dim">no exposure</td></tr>`);
+
+  multiLineChart("chart-wcl", exposure.series || [], [
+    { key: "pending_wcl", label: "pending WCL", color: "#ffb020" },
+    { key: "executed_wcl", label: "executed WCL", color: "#4da3ff" },
+    { key: "total_wcl", label: "total WCL", color: "#ff6b6b" },
+  ]);
 
   const mk = (obj) => Object.keys(obj || {}).sort((a, b) => obj[b] - obj[a]);
   setRows("inv-markets", mk(inv.markets).map((m) =>

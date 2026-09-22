@@ -57,35 +57,45 @@ function readNflFilters() {
   document.querySelectorAll("#nfl-filters [data-filter]").forEach((el) => {
     if (el.multiple) {
       const sel = [...el.selectedOptions].map((o) => o.value);
-      if (sel.length) out[el.dataset.filter] = sel.join(",");
+      out[el.dataset.filter] = sel.join(",");
     } else if (el.type === "checkbox") {
       out[el.dataset.filter] = el.checked ? "1" : "0";
     } else if (el.value) {
       out[el.dataset.filter] = el.value;
     }
   });
+  state.nflFilters = out;
   return out;
 }
 
 function buildNflFilters() {
   const o = (nflMeta && nflMeta.filter_options) || {};
   const v = state.nflView;
+  const saved = state.nflFilters || {};
+  const one = (key, fallback) => saved[key] ?? fallback;
+  const many = (key, fallback) => saved[key] ? String(saved[key]).split(",") : fallback;
   if (v === "explorer") { $("nfl-filters").innerHTML = ""; return; }
   let html =
-    singleSelect("season_min", "Season from", o.seasons, o.season_default && o.season_default[0]) +
-    singleSelect("season_max", "Season to", o.seasons, o.season_default && o.season_default[1]) +
-    multiSelect("families", "Families", o.families, o.families || []) +
-    multiSelect("buckets", "Spread buckets", o.buckets, o.buckets || []) +
-    singleSelect("primary", "Model", o.models, o.primary_model) +
-    singleSelect("sample", "Sample", o.samples, o.sample_default) +
-    `<label class="toggle" style="flex-direction:row"><input type="checkbox" data-filter="include_nested" checked> include nested</label>`;
+    singleSelect("season_min", "Season from", o.seasons, one("season_min", o.season_default && o.season_default[0])) +
+    singleSelect("season_max", "Season to", o.seasons, one("season_max", o.season_default && o.season_default[1])) +
+    multiSelect("families", "Families", o.families, many("families", o.families || [])) +
+    multiSelect("buckets", "Spread buckets", o.buckets, many("buckets", o.buckets || [])) +
+    multiSelect("game_types", "Games", o.game_types, many("game_types", o.game_types || [])) +
+    singleSelect("primary", "Model", o.models, one("primary", o.primary_model)) +
+    singleSelect("sample", "Sample", o.samples, one("sample", o.sample_default)) +
+    `<label class="toggle" style="flex-direction:row"><input type="checkbox" data-filter="include_nested" ${one("include_nested", "1") === "0" ? "" : "checked"}> include nested</label>`;
   if (v === "combo_pricing") html += singleSelect("heat_metric", "Heatmap metric", o.heatmap_metrics, o.heatmap_metrics && o.heatmap_metrics[0]);
-  if (v === "calibration") html += singleSelect("width", "Bin width", o.cal_widths, 0.05);
+  if (v === "calibration") html += singleSelect("width", "Bin width", o.cal_widths, one("width", 0.05)) +
+    singleSelect("combo", "Combo", state.nflCalibrationOptions || ["All filtered"], one("combo", "All filtered"));
   if (v === "structure") html += singleSelect("param", "Parameter", o.param_history_params, "sigma_at_mean_points");
   if (v === "sensitivity") html +=
     `<label>Families (comma-sep)<input type="search" data-filter="sens_families" style="width:220px" value="${esc((o.sensitivity_families_default || []).join(", "))}"></label>` +
     `<label>Edge thr<input type="search" data-filter="thr" style="width:80px" value="${esc(o.edge_threshold_default ?? 0.01)}"></label>`;
-  if (v === "params") html += singleSelect("params_file", "Params file", o.params_files, (o.params_files || []).slice(-1)[0]);
+  if (v === "params") {
+    const chosen = one("params_file", (o.params_files || []).slice(-1)[0]);
+    html += singleSelect("params_file", "Params file", o.params_files, chosen) +
+      (chosen ? `<a class="button-link" href="/api/nfl/params/download?file=${encodeURIComponent(chosen)}" download="${esc(chosen)}">Download params JSON</a>` : "");
+  }
   $("nfl-filters").innerHTML = html;
   document.querySelectorAll("#nfl-filters [data-filter]").forEach((el) =>
     el.addEventListener("change", refreshNflView));
@@ -104,6 +114,11 @@ async function refreshNflView() {
   const box = $("nfl-charts");
   box.innerHTML = "";
   $("nfl-tables").innerHTML = "";
+  if (state.nflView === "calibration" && data.combo_options) {
+    state.nflCalibrationOptions = data.combo_options;
+    buildNflFilters();
+  }
+  if (state.nflView === "params") buildNflFilters();
   renderNflPayloadInto(data, box);
 }
 
@@ -145,8 +160,23 @@ async function renderExplorer() {
         <label>Total<input type="search" id="exp-total" style="width:70px" value="47.5"></label>
         <label>Team<select id="exp-team"></select></label>
         <label>Model<select id="exp-model">${(o.models || []).map((m) => `<option>${esc(m)}</option>`).join("")}</select></label>
+        <label>Params<select id="exp-params">${(o.params_files || []).map((p, i, a) => `<option ${i === a.length - 1 ? "selected" : ""}>${esc(p)}</option>`).join("")}</select></label>
         <label>Corr scale<input type="search" id="exp-corr" style="width:60px" value="1.0"></label>
         <label class="toggle" style="flex-direction:row"><input type="checkbox" id="exp-three"> all 3-leg combos</label>
+      </div>
+      <h3>Market prices (de-vigged)</h3>
+      <div class="filterbar">
+        <label>Team cover P<input type="number" id="exp-p-cover" min="0.01" max="0.99" step="0.005" value="0.5"></label>
+        <label>Over P<input type="number" id="exp-p-over" min="0.01" max="0.99" step="0.005" value="0.5"></label>
+        <label class="toggle" style="flex-direction:row"><input type="checkbox" id="exp-use-ml"> use market moneyline</label>
+        <label>Team win P<input type="number" id="exp-p-ml" min="0.01" max="0.99" step="0.005" value="0.5" disabled></label>
+      </div>
+      <h3>Model overrides</h3>
+      <div class="filterbar">
+        <label class="toggle" style="flex-direction:row"><input type="checkbox" id="exp-override"> override σ / ρ</label>
+        <label>σ home<input type="number" id="exp-sig-home" min="5" max="16" step="0.1" value="9.5" disabled></label>
+        <label>σ away<input type="number" id="exp-sig-away" min="5" max="16" step="0.1" value="9.0" disabled></label>
+        <label>ρ<input type="number" id="exp-rho" min="-0.5" max="0.5" step="0.01" value="0.05" disabled></label>
       </div>
       <h3>Legs</h3><div id="exp-legs"></div>
       <div class="toolbar"><button id="exp-add">+ add leg</button><span class="spacer"></span><button id="exp-price">Price combo</button></div>
@@ -156,18 +186,36 @@ async function renderExplorer() {
   legsBox.appendChild(explorerLegRow());
   legsBox.appendChild(explorerLegRow());
   $("exp-add").addEventListener("click", () => legsBox.appendChild(explorerLegRow()));
+  const syncMarket = () => {
+    const g = games.find((x) => x.game_id === $("exp-game").value);
+    const teamIsHome = $("exp-team").value === (g?.home || $("exp-home").value);
+    $("exp-p-cover").value = g?.p_home_cover == null ? "0.5" : String(teamIsHome ? g.p_home_cover : 1 - g.p_home_cover);
+    $("exp-p-over").value = g?.p_over == null ? "0.5" : String(g.p_over);
+    const ml = g?.p_home_ml == null ? null : (teamIsHome ? g.p_home_ml : 1 - g.p_home_ml);
+    $("exp-use-ml").checked = ml != null;
+    $("exp-p-ml").disabled = ml == null;
+    $("exp-p-ml").value = String(ml ?? 0.5);
+  };
   $("exp-game").addEventListener("change", (e) => {
     const g = games.find((x) => x.game_id === e.target.value);
     const team = $("exp-team");
     if (g) {
       team.innerHTML = `<option>${esc(g.home)}</option><option>${esc(g.away)}</option>`;
+      $("exp-home").value = g.home; $("exp-away").value = g.away;
+      $("exp-spread").value = g.spread_home; $("exp-total").value = g.total;
       ["exp-home", "exp-away", "exp-spread", "exp-total"].forEach((id) => $(id).disabled = true);
     } else {
       team.innerHTML = `<option>KC</option><option>BUF</option>`;
       ["exp-home", "exp-away", "exp-spread", "exp-total"].forEach((id) => $(id).disabled = false);
     }
+    syncMarket();
   });
   $("exp-team").innerHTML = `<option>KC</option><option>BUF</option>`;
+  $("exp-team").addEventListener("change", syncMarket);
+  $("exp-use-ml").addEventListener("change", () => $("exp-p-ml").disabled = !$("exp-use-ml").checked);
+  $("exp-override").addEventListener("change", () => {
+    ["exp-sig-home", "exp-sig-away", "exp-rho"].forEach((id) => $(id).disabled = !$("exp-override").checked);
+  });
   $("exp-price").addEventListener("click", async () => {
     const payload = {
       legs: [...legsBox.children].map((row) => ({
@@ -176,8 +224,18 @@ async function renderExplorer() {
       })),
       team: $("exp-team").value,
       model: $("exp-model").value,
-      corr_scale: parseFloat($("exp-corr").value) || 1.0,
+      params_file: $("exp-params").value || null,
+      corr_scale: Number.isFinite(parseFloat($("exp-corr").value)) ? parseFloat($("exp-corr").value) : 1.0,
+      p_team_cover: parseFloat($("exp-p-cover").value),
+      p_over: parseFloat($("exp-p-over").value),
+      use_ml: $("exp-use-ml").checked,
+      p_team_ml: parseFloat($("exp-p-ml").value),
       three_leg: $("exp-three").checked,
+    };
+    if ($("exp-override").checked) payload.override = {
+      sigma_home: parseFloat($("exp-sig-home").value),
+      sigma_away: parseFloat($("exp-sig-away").value),
+      rho: parseFloat($("exp-rho").value),
     };
     const gid = $("exp-game").value;
     if (gid) payload.game_id = gid;
@@ -233,10 +291,10 @@ function renderNflPayloadInto(data, root) {
     const cols = Object.keys(rows[0]);
     const div = document.createElement("div");
     div.className = "chart";
-    div.innerHTML = `<h3>${esc(name)}${rows.length > 200 ? ` (first 200 of ${rows.length})` : ""}</h3>
+    div.innerHTML = `<h3>${esc(name)} (${rows.length})</h3>
       <div class="table-wrap" style="max-height:none"><table>
       <thead><tr>${cols.map((c) => `<th class="${typeof rows[0][c] === "number" ? "num" : ""}">${esc(c)}</th>`).join("")}</tr></thead>
-      <tbody>${rows.slice(0, 200).map((r) => `<tr>${cols.map((c) => {
+      <tbody>${rows.map((r) => `<tr>${cols.map((c) => {
         const val = r[c];
         return `<td class="${typeof val === "number" ? "num" : ""}">${typeof val === "number" ? val.toFixed(4) : esc(val)}</td>`;
       }).join("")}</tr>`).join("")}</tbody></table></div>`;
@@ -245,15 +303,19 @@ function renderNflPayloadInto(data, root) {
 }
 
 $("nfl-run-params").addEventListener("click", () => nflRun("refresh_params"));
-$("nfl-run-backtest").addEventListener("click", () => nflRun("run_backtest"));
+$("nfl-pull-data").addEventListener("click", () => nflRun("pull_data"));
+$("nfl-run-backtest").addEventListener("click", () => nflRun("run_backtest", false, {
+  first_season: parseInt($("nfl-first-season").value, 10),
+  last_season: parseInt($("nfl-last-season").value, 10),
+}));
 $("nfl-run-week1").addEventListener("click", () => nflRun("run_week_backtest", true));
 
-async function nflRun(script, switchToWeek1 = false) {
+async function nflRun(script, switchToWeek1 = false, options = {}) {
   const out = $("nfl-run-output");
   out.classList.remove("hidden");
   out.textContent = `running ${script}…`;
   try {
-    const res = await post("/api/nfl/run", { script });
+    const res = await post("/api/nfl/run", { script, options });
     out.textContent = `$ ${script} → exit ${res.returncode}\n\n${res.output || res.stdout || ""}`;
     nflMeta = null;
     if (switchToWeek1 && res.returncode === 0) {

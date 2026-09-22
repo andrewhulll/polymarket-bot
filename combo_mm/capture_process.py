@@ -93,9 +93,9 @@ def _recent_heartbeat(db_path: Path, max_age_s: float = 10.0) -> bool:
     return heartbeat_is_fresh(db_path, max_age_s)
 
 
-def ensure_capture_running(repo: Path) -> Optional[str]:
+def ensure_capture_running(repo: Path, data_dir: Optional[Path] = None) -> Optional[str]:
     """Return an error for the UI, or None when capture is running."""
-    data_dir = repo / "data" / "live"
+    data_dir = Path(data_dir) if data_dir is not None else repo / "data" / "live"
     data_dir.mkdir(parents=True, exist_ok=True)
     lock = CaptureLock(data_dir / "rfq_capture.lock")
     if not lock.acquire():

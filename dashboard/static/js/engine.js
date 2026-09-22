@@ -56,11 +56,24 @@ async function refreshEngine() {
     `<td><div class="sharebar"><i style="width:${(100 * r.n / total).toFixed(1)}%"></i></div></td></tr>`
   ).join("") || `<tr><td colspan="4" class="dim">no declines recorded</td></tr>`);
 
+  const corr = eng.correlation_lift || {};
+  $("corr-kpis").innerHTML = corr.n
+    ? kpi("Quotes sampled", fmtInt(corr.n)) +
+      kpi("Mean |corr adj|", `${Number(corr.mean_abs_bps).toFixed(2)} bps`) +
+      kpi("p50 |corr adj|", `${Number(corr.p50_abs_bps).toFixed(2)} bps`) +
+      kpi("p95 |corr adj|", `${Number(corr.p95_abs_bps).toFixed(2)} bps`) +
+      kpi("Max |corr adj|", `${Number(corr.max_abs_bps).toFixed(2)} bps`)
+    : kpi("Quotes sampled", "0");
+  $("corr-alerts").innerHTML = corr.degenerate
+    ? `<div class="alert error">${fmtPct(corr.frac_degenerate)} of recent auto-quotes moved less than ${esc(corr.threshold_bps)} bps from naive. The correlation model is not materially affecting live prices.</div>`
+    : (corr.n ? `<p class="caption">Joint-model movement versus the independent-leg product.</p>` : `<p class="caption">No quoted rows with a correlation adjustment yet.</p>`);
+
   setRows("risk-table", (risk.events || []).map((e) =>
     `<tr><td class="dim">${esc((e.ts || "").slice(0, 19))}</td>` +
     `<td>${e.rfq_id ? shortId(e.rfq_id) : "—"}</td>` +
+    `<td class="mono">${esc(e.game_id || "—")}</td>` +
     `<td>${esc(e.action || "—")}</td><td>${esc(e.reason || "")}</td></tr>`
-  ).join("") || `<tr><td colspan="4" class="dim">no risk events</td></tr>`);
+  ).join("") || `<tr><td colspan="5" class="dim">no risk events</td></tr>`);
 
   setRows("drafts-table", (eng.drafts || []).map((d) =>
     `<tr><td class="mono">${esc(d.quote_id || "")}</td><td>${shortId(d.rfq_id)}</td>` +

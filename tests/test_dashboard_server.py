@@ -204,6 +204,11 @@ def test_rfqs_screen_and_search_params(server):
     assert both["total"] == 1 and both["rows"][0]["rfq_id"] == "R3"
     none = get_json(server, "/api/rfqs?search=ZZZ")
     assert none["total"] == 0 and none["rows"] == []
+    by_status = get_json(server, "/api/rfqs?status=OPEN")
+    assert by_status["total"] == 3
+    by_game = get_json(server, "/api/rfqs?game=KC%40BUF")
+    assert by_game["total"] == 2
+    assert set(by_game["filter_options"]["games"]) == {"KC@BUF"}
 
 
 def test_rfq_detail_endpoint(server):
@@ -282,6 +287,10 @@ def test_settlement_summary_and_runner(server, tmp_path, monkeypatch):
     assert summary["unscored"] == 1
     assert summary["model_brier"] == pytest.approx(0.16)
     assert summary["brier_advantage"] == pytest.approx(0.09)
+    assert summary["naive_brier"] == pytest.approx(0.25)
+    assert summary["hit_rate"] == pytest.approx(1.0)
+    assert summary["total"] == 1 and summary["rows"][0]["rfq_id"] == "R1"
+    assert summary["rows"][0]["scores_vintage"] == "2026-09-19"
 
     expected = {"ok": True, "pull": {"returncode": 0, "output": "pulled"},
                 "settle": {"returncode": 0, "output": "settled"},
@@ -309,6 +318,9 @@ def test_performance_endpoint(server):
     assert p["win_rate"] == 1.0
     assert p["by_family"][0]["family"] == "Moneyline + Spread"
     assert len(p["curve"]) == 2
+    assert p["rfqs_received"] == 3 and p["rfqs_executed"] == 1
+    assert p["quote_rate"] == pytest.approx(2 / 3)
+    assert p["by_requester_side"][0]["requester_side"] == "BUY"
 
 
 def test_session_only_rejected_rfqs_join_durable_feed(server, tmp_path, monkeypatch):
@@ -460,6 +472,11 @@ def test_settlement_button_present(server):
     assert status == 200
     assert b'id="settlement-run"' in body
     assert b"Check settlement for all priced RFQs" in body
+    assert b'id="poll-toggle"' in body
+    assert b'id="corr-kpis"' in body
+    assert b'id="chart-wcl"' in body
+    assert b'id="game-filter"' in body and b'id="status-filter"' in body
+    assert b'id="settlement-table"' in body
 
 
 def test_nfl_meta_without_results(server, tmp_path, monkeypatch):
@@ -589,6 +606,11 @@ def test_sources_list_and_switch(serve_dir, tmp_path):
     assert status == 200
     assert body["active"] == "week1_backtest.db"
     assert get_json(base, "/api/sources")["active"] == "week1_backtest.db"
+    (tmp_path / "week1_backtest.meta.json").write_text(
+        json.dumps({"n_rfqs": 42, "params_version": "v1"}), encoding="utf-8")
+    meta = get_json(base, "/api/source/meta")
+    assert meta["label"] == "Week 1 backtest"
+    assert meta["meta"]["n_rfqs"] == 42
 
     # unknown files and traversal are rejected
     for bad in ["nope.db", "../evil.db", "sub/dir.db", ""]:
@@ -608,5 +630,6 @@ def test_build_argv_week_backtest(repo_path):
     assert argv == ["scripts/run_week_backtest.py", "--data-dir", "/tmp/x"]
     argv = nfl_api._build_argv("run_backtest", {"first_season": 2020})
     assert argv == ["scripts/nfl_backtest.py", "--first-season", "2020"]
+    assert nfl_api._build_argv("pull_data", {})[0] == "-c"
     with pytest.raises(ValueError):
         nfl_api._build_argv("nope", {})

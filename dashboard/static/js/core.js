@@ -6,10 +6,11 @@ const SLOW_POLL_MS = 15000;
 
 const state = {
   tab: "rfqs",
-  timer: null,
+  timer: null, manualPaused: false,
   hidden: document.hidden,
-  rfqPage: 1, rfqOnly: false, rfqScreen: "", rfqSearch: "", rfqTotal: 0,
+  rfqPage: 1, rfqOnly: false, rfqScreen: "", rfqStatus: "", rfqGame: "", rfqSearch: "", rfqTotal: 0,
   pricingPage: 1, pricingTotal: 0,
+  settlementPage: 1,
   fillsPage: 1, fillsTotal: 0,
   nflView: "overview", nflFilters: {},
 };
@@ -110,15 +111,22 @@ document.addEventListener("keydown", (e) => {
 
 document.addEventListener("visibilitychange", () => {
   state.hidden = document.hidden;
-  $("paused").classList.toggle("hidden", !state.hidden);
+  $("paused").classList.toggle("hidden", !state.hidden && !state.manualPaused);
+  restartPolling();
+});
+
+$("poll-toggle").addEventListener("click", () => {
+  state.manualPaused = !state.manualPaused;
+  $("poll-toggle").textContent = state.manualPaused ? "Resume" : "Pause";
+  $("paused").classList.toggle("hidden", !state.hidden && !state.manualPaused);
   restartPolling();
 });
 
 function restartPolling() {
   clearInterval(state.timer);
   state.timer = null;
-  refresh();
-  if (!state.hidden && state.tab !== "nfl") {
+  if (!state.manualPaused) refresh();
+  if (!state.hidden && !state.manualPaused && state.tab !== "nfl") {
     const ms = state.tab === "performance" ? SLOW_POLL_MS : POLL_MS;
     state.timer = setInterval(refresh, ms);
   }
@@ -132,12 +140,14 @@ async function loadSources() {
     sel.innerHTML = data.sources.map((s) =>
       `<option value="${esc(s.id)}" ${s.id === data.active ? "selected" : ""}>${esc(s.label)}</option>`).join("");
     sel.onchange = () => switchSource(sel.value);
+    state.source = data.active;
   } catch (e) { console.warn(e); }
 }
 
 async function switchSource(id) {
   try {
     await post("/api/sources/active", { id });
+    state.source = id;
     closeDrawer();
     state.rfqPage = 1; state.pricingPage = 1; state.fillsPage = 1;
     restartPolling();
@@ -150,6 +160,7 @@ async function refresh() {
     const health = await get("/api/health");
     $("health-dot").className = "dot " + (health.waiting ? "wait" : "ok");
     $("waiting").classList.toggle("hidden", !health.waiting);
+    if (health.waiting) $("waiting").textContent = health.capture_start_error || "Waiting for the headless capture database…";
     if (health.waiting) return;
     if (state.tab === "rfqs") await refreshRfqs();
     else if (state.tab === "pricing") await refreshPricing();
@@ -192,6 +203,25 @@ function lineChart(svgId, points, key, { color = "#4da3ff", fill = true } = {}) 
     (fill ? `<path class="area" d="${d} L${X(vals.length - 1).toFixed(1)},${H - PAD} L${PAD},${H - PAD} Z"/>` : "") +
     `<path class="line" d="${d}" style="stroke:${color}"/>` +
     `<text x="${W - PAD}" y="${Y(vals[vals.length - 1]).toFixed(1) - 5}" text-anchor="end">${vals[vals.length - 1].toFixed(2)}</text>`;
+}
+
+function multiLineChart(svgId, points, series) {
+  const svg = $(svgId), W = 600, H = 180, PAD = 10;
+  if (!points || !points.length) {
+    svg.innerHTML = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle">no data</text>`;
+    return;
+  }
+  const vals = points.flatMap((p) => series.map((s) => Number(p[s.key] ?? 0)));
+  const lo = Math.min(0, ...vals), hi = Math.max(0, ...vals), span = hi - lo || 1;
+  const X = (i) => PAD + (i / Math.max(1, points.length - 1)) * (W - 2 * PAD);
+  const Y = (v) => PAD + (1 - (v - lo) / span) * (H - 2 * PAD);
+  let html = `<line x1="${PAD}" y1="${Y(0)}" x2="${W - PAD}" y2="${Y(0)}" stroke="#232d42"/>`;
+  series.forEach((s, si) => {
+    const d = points.map((p, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(Number(p[s.key] ?? 0)).toFixed(1)}`).join(" ");
+    html += `<path class="line" d="${d}" style="stroke:${s.color}"/>` +
+      `<text x="${PAD + si * 150}" y="${PAD + 10}" fill="${s.color}">${esc(s.label)}</text>`;
+  });
+  svg.innerHTML = html;
 }
 
 function histogram(svgId, buckets, budgetMs) {

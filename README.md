@@ -11,11 +11,12 @@ python -m pip install -r requirements-nfl.txt websockets
 For the live RFQ logger, set `POLYMARKET_API_KEY`, `POLYMARKET_SECRET`, `POLYMARKET_PASSPHRASE`, and `POLYMARKET_ADDRESS` in your environment or a repo-root `.env` file. Keep `.env` private. Then run these in separate terminals from the repository root:
 
 ```bash
-# Terminal 1: capture and paper-price live RFQs
-python scripts/capture_live_rfqs.py --data-dir data/live
-
-# Terminal 2: open the dashboard at http://localhost:8000
+# Open the dashboard at http://localhost:8000. It starts capture if needed.
 python -m dashboard.server --data-dir data/live --port 8000
+
+# Optional: manage capture separately and keep dashboard startup read-only.
+python scripts/capture_live_rfqs.py --data-dir data/live
+python -m dashboard.server --data-dir data/live --port 8000 --no-start-capture
 ```
 
 A paper-trading bot for Totalis that listens to Polymarket combo RFQs, prices them, manages paper exposure, and evaluates decisions through replay. It stores draft quotes but never submits quotes or orders.
