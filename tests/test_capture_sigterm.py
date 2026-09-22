@@ -13,6 +13,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from combo_mm.capture_process import CaptureLock, read_heartbeat_age_s
 
 REPO = Path(__file__).resolve().parents[1]
@@ -24,7 +26,9 @@ DUMMY_CREDS = {
 }
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows SIGTERM terminates the child process")
 def test_sigterm_drains_and_releases_lock(tmp_path):
+    pytest.importorskip("websockets", reason="live capture dependency is optional")
     data_dir = tmp_path / "data" / "live"
     env = dict(os.environ, **DUMMY_CREDS)
     proc = subprocess.Popen(
