@@ -42,7 +42,10 @@ def test_sigterm_drains_and_releases_lock(tmp_path):
             if read_heartbeat_age_s(db_path) is not None:
                 break
             time.sleep(0.2)
-        assert proc.poll() is None, "capture exited before writing a heartbeat"
+        if proc.poll() is not None:
+            output = proc.stdout.read()
+            raise AssertionError(
+                f"capture exited before writing a heartbeat\n{output}")
         assert read_heartbeat_age_s(db_path) is not None, \
             "capture never wrote a heartbeat"
 
