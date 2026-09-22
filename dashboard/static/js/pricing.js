@@ -4,6 +4,8 @@
 $("pricing-prev").addEventListener("click", () => { if (state.pricingPage > 1) { state.pricingPage--; refreshPricing(); } });
 $("pricing-next").addEventListener("click", () => { state.pricingPage++; refreshPricing(); });
 $("settlement-run").addEventListener("click", runSettlementCheck);
+$("settlement-prev").addEventListener("click", () => { if (state.settlementPage > 1) { state.settlementPage--; refreshPricing(); } });
+$("settlement-next").addEventListener("click", () => { state.settlementPage++; refreshPricing(); });
 
 function decisionBadge(status) {
   if (status === "QUOTED") return badge("QUOTED", "q");
@@ -13,7 +15,7 @@ function decisionBadge(status) {
 
 async function refreshPricing() {
   const [data, settlements] = await Promise.all([
-    get(`/api/pricing?page=${state.pricingPage}`), get("/api/settlements")
+    get(`/api/pricing?page=${state.pricingPage}`), get(`/api/settlements?page=${state.settlementPage}`)
   ]);
   renderSettlementSummary(settlements);
   state.pricingTotal = data.total;
@@ -59,12 +61,44 @@ function renderSettlementSummary(s) {
     kpi("Eligible quotes", fmtInt(s.eligible)) +
     kpi("Settled", fmtInt(s.settled), s.settled ? "good" : "") +
     kpi("Pending", fmtInt(s.pending + s.unscored)) +
-    kpi("Void / unresolved", `${fmtInt(s.void)} / ${fmtInt(s.unresolved)}`) +
+    kpi("Void", fmtInt(s.void)) +
+    kpi("Unresolved", fmtInt(s.unresolved)) +
     kpi("Model Brier", score(s.model_brier)) +
+    kpi("Naive Brier", score(s.naive_brier)) +
+    kpi("Combo hit rate", fmtPct(s.hit_rate)) +
     kpi("Naive − model", s.brier_advantage == null ? "—" : fmtEdge(s.brier_advantage));
   $("settlement-last").textContent = s.last_checked
     ? `last scored ${new Date(s.last_checked).toLocaleString()}`
     : (s.available ? "not checked yet" : "waiting for the quote ledger");
+
+  const pages = Math.max(1, Math.ceil((s.total || 0) / (s.page_size || 500)));
+  if (state.settlementPage > pages) { state.settlementPage = pages; return refreshPricing(); }
+  $("settlement-page-label").textContent = `p ${s.page || 1}/${pages}`;
+  $("settlement-prev").disabled = (s.page || 1) <= 1;
+  $("settlement-next").disabled = (s.page || 1) >= pages;
+  setRows("settlement-table", (s.rows || []).map((r, i) =>
+    `<tr class="clickable" data-i="${i}"><td>${shortId(r.rfq_id)}</td>` +
+    `<td class="dim">${esc(r.game || "—")}</td><td>${decisionBadge(r.status)}</td>` +
+    `<td class="num">${fmtPrice(r.combo_value)}</td><td class="num">${fmtPrice(r.fair)}</td>` +
+    `<td class="num">${fmtPrice(r.naive)}</td><td class="num">${score(r.brier)}</td>` +
+    `<td class="num">${score(r.naive_brier)}</td><td class="num">${fmtEdge(r.hypo_edge_bid)}</td>` +
+    `<td class="num">${fmtEdge(r.hypo_edge_ask)}</td><td class="num">${fmtMoney(r.realized_pnl)}</td></tr>`
+  ).join("") || `<tr><td colspan="11" class="dim">no settlement rows yet</td></tr>`);
+  (s.rows || []).forEach((r, i) => {
+    const tr = document.querySelector(`#settlement-table tbody tr[data-i="${i}"]`);
+    if (tr) tr.addEventListener("click", () => openSettlementDrawer(r));
+  });
+}
+
+function openSettlementDrawer(r) {
+  const legs = (r.legs || []).map((l) => `<tr><td class="mono">${esc(l.position_id || "")}</td>` +
+    `<td>${esc(l.side || "—")}</td><td>${l.settlement_price == null ? "—" : esc(l.settlement_price)}</td>` +
+    `<td class="mono">${esc(l.game_id || "—")}</td></tr>`).join("");
+  openDrawer(shortId(r.rfq_id), `
+    <p>${decisionBadge(r.status)} <span class="dim">${esc(r.reason_detail || "")}</span></p>
+    <div class="kpis">${kpi("Combo value", fmtPrice(r.combo_value))}${kpi("Model Brier", r.brier == null ? "—" : Number(r.brier).toFixed(4))}${kpi("Naive Brier", r.naive_brier == null ? "—" : Number(r.naive_brier).toFixed(4))}${kpi("Accepted P&L", fmtMoney(r.realized_pnl))}</div>
+    <dl class="kv"><dt>Trigger</dt><dd>${esc(r.trigger)}</dd><dt>Quoted bid / ask</dt><dd>${fmtPrice(r.bid)} / ${fmtPrice(r.ask)}</dd><dt>Fair / naive</dt><dd>${fmtPrice(r.fair)} / ${fmtPrice(r.naive)}</dd><dt>Hypothetical edges</dt><dd>bid ${fmtEdge(r.hypo_edge_bid)} · ask ${fmtEdge(r.hypo_edge_ask)}</dd><dt>Accepted quote</dt><dd>${fmtPrice(r.accepted_price)} × ${esc(r.accepted_size || "—")} ${esc(r.accepted_direction || "")}</dd><dt>Scores vintage</dt><dd>${esc(r.scores_vintage || "—")}</dd><dt>Model / params</dt><dd class="mono">${esc(r.model_version || "—")} · ${esc(r.params_version || "—")}</dd></dl>
+    <h3>Settled legs (${r.n_legs_settled ?? 0}/${r.n_legs ?? 0})</h3><div class="table-wrap"><table><thead><tr><th>Position</th><th>Side</th><th>Settlement</th><th>Game</th></tr></thead><tbody>${legs || '<tr><td colspan="4" class="dim">no leg detail</td></tr>'}</tbody></table></div>`);
 }
 
 async function runSettlementCheck() {
@@ -75,7 +109,7 @@ async function runSettlementCheck() {
   result.innerHTML = '<div class="alert">This may take a few minutes.</div>';
   try {
     const res = await post("/api/settlements/run", {});
-    renderSettlementSummary(res.summary);
+    renderSettlementSummary(await get(`/api/settlements?page=${state.settlementPage}`));
     const pullWarning = res.pull.returncode === 0 ? ""
       : ` Score refresh exited ${res.pull.returncode}; cached scores were used.`;
     result.innerHTML = res.ok

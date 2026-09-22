@@ -17,6 +17,7 @@ cached nflverse pull under ``data/raw`` (``python scripts/refresh_params.py
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -47,6 +48,8 @@ def main(argv=None) -> int:
         week=week_backtest.BACKTEST_WEEK,
     )
     meta = out.meta
+    (data_dir / "week1_backtest.meta.json").write_text(
+        json.dumps(meta, indent=2, default=str), encoding="utf-8")
     print(f"wrote {out.db_path}: {meta['n_rfqs']} RFQs across "
           f"{meta['n_games']} games "
           f"(pull {meta.get('data_vintage', {}).get('pull_date', '?')})")

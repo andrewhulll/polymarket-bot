@@ -81,6 +81,9 @@ VIEWS = ["overview", "combo_pricing", "calibration", "structure", "sensitivity",
 
 # Scripts the dashboard may run, mapped to argv (run via sys.executable, cwd=REPO).
 RUN_ALLOWLIST = {
+    "pull_data": ["-c", "from combo_mm.nfl.ingest import pull_games; "
+                  "p=pull_games('data/raw', force=True); "
+                  "print(p.directory, p.sha256, p.manifest['validation'])"],
     "refresh_params": ["scripts/refresh_params.py"],
     "run_backtest": ["scripts/nfl_backtest.py"],
     "run_week_backtest": ["scripts/run_week_backtest.py"],
@@ -290,19 +293,14 @@ def parse_filter_params(data: Dict[str, Any], qs: Dict[str, str]) -> Dict:
         except (KeyError, ValueError, TypeError):
             return None
 
-    def lst(key: str) -> Optional[List[str]]:
-        v = qs.get(key)
-        return v.split(",") if v else None
-
     lo, hi = num("season_min"), num("season_max")
     if lo is not None:
         p["season_min"] = lo
     if hi is not None:
         p["season_max"] = hi
     for key in ("families", "buckets", "game_types"):
-        v = lst(key)
-        if v:
-            p[key] = v
+        if key in qs:
+            p[key] = qs[key].split(",") if qs[key] else []
     if qs.get("primary"):
         p["primary"] = qs["primary"]
     if qs.get("include_nested") in ("0", "false", "False"):
@@ -326,7 +324,7 @@ def apply_filters(data: Dict[str, Any], params: Dict) -> Dict[str, Any]:
     if not params.get("include_nested", True):
         sel &= ~combos["nested"]
     types = set(params.get("game_types") or [])
-    if types and types != {"REG", "Playoffs"}:
+    if types != {"REG", "Playoffs"}:
         want_reg, want_po = "REG" in types, "Playoffs" in types
         sel &= ((combos["game_type"] == "REG") & want_reg
                 | (combos["game_type"] != "REG") & want_po)
@@ -885,6 +883,9 @@ def explorer_games() -> List[Dict]:
     return [{"game_id": g["game_id"], "season": g["season"], "week": g["week"],
              "home": g["home"], "away": g["away"], "spread_home": g["spread_line"],
              "total": g["total_line"], "played": g["played"],
+             "p_home_cover": devig_pair(g["home_spread_odds"], g["away_spread_odds"]),
+             "p_over": devig_pair(g["over_odds"], g["under_odds"]),
+             "p_home_ml": devig_pair(g["home_moneyline"], g["away_moneyline"]),
              "label": f"{g['away']} @ {g['home']}  (home {-g['spread_line']:+g}, "
                       f"total {g['total_line']:g})"
                       + (f" - final {g['away_score']}-{g['home_score']}" if g["played"]

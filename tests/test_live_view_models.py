@@ -46,13 +46,19 @@ def test_paper_notional_stays_within_inventory_equity_and_reduces_buying_power(t
         inventory = inventory_state(conn)
         ledger = fills(conn)
     assert max(abs(point["net_notional"]) for point in perf["curve"]) <= inventory["equity"]
-    assert perf["net_notional"] == inventory["paper_net_notional"] == 40000.0
-    assert inventory["buying_power"] == 10000.0
+    assert perf["net_notional"] == inventory["paper_net_notional"] == 50000.0
+    assert inventory["buying_power"] == 0.0
     assert inventory["pending"] == {}
-    assert inventory["executed"]["KC@BUF"] == inventory["paper_wcl"] == 60000.0
-    assert inventory["exposures"]["KC@BUF"] == 60000.0
-    assert inventory["markets"]["kc-buf-moneyline"] == 60000.0
-    assert inventory["teams"]["KC"] == inventory["teams"]["BUF"] == 60000.0
+    assert inventory["executed"]["KC@BUF"] == inventory["paper_wcl"] == 50000.0
+    assert inventory["exposures"]["KC@BUF"] == 50000.0
+    assert inventory["markets"]["kc-buf-moneyline"] == 50000.0
+    assert inventory["teams"]["KC"] == inventory["teams"]["BUF"] == 50000.0
+    assert perf["quoted"] == perf["shadow_fills"] == 2
+    assert perf["rfqs_declined"] == 1
+    with connect_readonly(path) as conn:
+        decisions = {row["rfq_id"]: row for row in pricing(conn)}
+    assert decisions["R3"]["status"] == "DECLINED"
+    assert decisions["R3"]["reason_code"] == "RISK_CAPITAL"
     assert any(event["action"] == "paper quote" for event in inventory["paper_events"])
     assert any(event["action"] == "capital cap" for event in inventory["paper_events"])
     assert any(row.get("capacity_limited") for row in ledger)

@@ -10,7 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from capture_live_rfqs import RfqCapture  # noqa: E402
 from export_nfl_rfqs import build_rows, load_trade_extras  # noqa: E402
-from combo_mm.nfl.live_pricer import LiveQuote
+from combo_mm.nfl.live_pricer import LiveQuote, LiveRfq
+from combo_mm.paper_capital import PaperCapitalState
+from combo_mm.risk import RISK_CAPITAL
 
 NOW = datetime(2026, 9, 18, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -167,6 +169,24 @@ def test_risk_rejection_stays_in_session_memory(tmp_path):
         assert capture.store._conn.execute("SELECT COUNT(*) FROM risk_events").fetchone()[0] == 0
     detail = capture.transient_rfqs.detail("risk_rejected")
     assert detail["pricing"]["reason_code"] == "RISK_GAME_UNRESOLVED"
+    capture.stop()
+
+
+def test_equity_cap_rejects_every_later_quote_even_if_it_would_unwind(tmp_path):
+    capture = _build_capture(tmp_path)
+    capture._paper_capital = PaperCapitalState(
+        equity=50000.0, net_notional=-50000.0, exhausted=True)
+    rfq = LiveRfq(rfq_id="after-cap", leg_position_ids=("100", "101"),
+                  direction="SELL")
+    quote = LiveQuote(rfq_id=rfq.rfq_id, priced_at=NOW.isoformat(),
+                      status="QUOTED", reason_code="QUOTED_OK", fair=0.5,
+                      bid=0.48, ask=0.52, bid_qty="10", ask_qty="10",
+                      response_action="BUY", response_price=0.48)
+
+    assert not capture._check_quote_risk(rfq, quote, NOW)
+    assert quote.status == "DECLINED"
+    assert quote.reason_code == RISK_CAPITAL
+    assert quote.response_price is None
     capture.stop()
 
 

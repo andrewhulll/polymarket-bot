@@ -16,8 +16,11 @@ what to do when the heartbeat goes stale.
 | Dead-man's checker | Exits non-zero when the heartbeat is older than 10 min (or never written) | `scripts/check_heartbeat.py` |
 | Dashboard banner | Engine tab warns when the heartbeat is stale | `dashboard/server.py`, `dashboard/static/js/engine.js` |
 
-The dashboard does not own the capture process. The supervisor keeps capture
-running whether or not a browser or dashboard server is open.
+The dashboard starts the capture process when it is not already running. The
+capture lock prevents a duplicate logger, and `--no-start-capture` disables
+this convenience when capture is managed separately. For an always-on setup,
+the supervisor remains the owner of process restarts and keeps capture running
+whether or not a browser or dashboard server is open.
 
 ## Credentials
 

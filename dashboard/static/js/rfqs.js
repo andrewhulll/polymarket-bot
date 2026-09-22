@@ -7,6 +7,12 @@ $("only-quotable").addEventListener("change", (e) => {
 $("screen-filter").addEventListener("change", (e) => {
   state.rfqScreen = e.target.value; state.rfqPage = 1; refreshRfqs();
 });
+$("status-filter").addEventListener("change", (e) => {
+  state.rfqStatus = e.target.value; state.rfqPage = 1; refreshRfqs();
+});
+$("game-filter").addEventListener("change", (e) => {
+  state.rfqGame = e.target.value; state.rfqPage = 1; refreshRfqs();
+});
 $("rfq-search").addEventListener("input", (e) => {
   clearTimeout($("rfq-search")._t);
   $("rfq-search")._t = setTimeout(() => {
@@ -28,6 +34,8 @@ async function refreshRfqs() {
     only_quotable: state.rfqOnly ? "1" : "0",
     page: String(state.rfqPage),
     ...(state.rfqScreen ? { screen: state.rfqScreen } : {}),
+    ...(state.rfqStatus ? { status: state.rfqStatus } : {}),
+    ...(state.rfqGame ? { game: state.rfqGame } : {}),
     ...(state.rfqSearch ? { search: state.rfqSearch } : {}),
   });
   const data = await get(`/api/rfqs?${q}`);
@@ -46,6 +54,13 @@ async function refreshRfqs() {
       sel.appendChild(o);
     }
   });
+  const syncOptions = (id, values, emptyLabel) => {
+    const el = $(id), current = el.value;
+    el.innerHTML = `<option value="">${emptyLabel}</option>` + (values || []).map((v) =>
+      `<option value="${esc(v)}" ${v === current ? "selected" : ""}>${esc(v)}</option>`).join("");
+  };
+  syncOptions("status-filter", data.filter_options?.statuses, "all statuses");
+  syncOptions("game-filter", data.filter_options?.games, "all games");
 
   $("rfq-page-label").textContent = `p ${data.page}/${pages}`;
   $("rfq-prev").disabled = data.page <= 1;
@@ -60,6 +75,7 @@ async function refreshRfqs() {
       `<td class="num">${ageStr(r.created_time)}</td>` +
       `<td>${screenBadge(r.screen, r.quotable, r.status)}${failed ? ` <span class="badge warn">${failed}✕</span>` : ""}</td>` +
       `<td class="num">${r.n_legs ?? "—"}${r.n_nfl_legs ? ` <span class="dim">(${r.n_nfl_legs} NFL)</span>` : ""}</td>` +
+      `<td class="dim">${esc(r.game || "—")}</td>` +
       `<td>${esc(r.side || r.direction || "—")}</td>` +
       `<td class="num">${esc(r.qty_decimal || r.cash_order_qty || "—")}</td>` +
       `<td>${deadlineStr(r.submission_deadline)}</td>` +
@@ -108,6 +124,7 @@ async function openRfqDrawer(rfqId) {
     <dl class="kv">
       <dt>Posted</dt><dd>${esc(r.created_time || "—")} (${ageStr(r.created_time)} ago)</dd>
       <dt>Updated</dt><dd>${esc(r.updated_time || "—")}</dd>
+      <dt>Requester</dt><dd>${esc(r.creator_user_id || "—")}</dd>
       <dt>Size</dt><dd>${esc(r.qty_decimal || r.cash_order_qty || "—")}</dd>
       <dt>Side</dt><dd>${esc(s.side || r.side || "—")} ${esc(s.direction || "")}</dd>
       <dt>Deadline</dt><dd>${deadlineStr(s.submission_deadline)}</dd>

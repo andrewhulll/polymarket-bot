@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from combo_mm.backtest.metrics import swings as _swings
+from combo_mm.paper_capital import PaperCapitalState, replay_paper_capital
 
 
 def connect_readonly(path: str | Path) -> sqlite3.Connection:
@@ -31,19 +32,25 @@ def _rows(conn: sqlite3.Connection, sql: str, args: tuple = ()) -> list[dict]:
 
 
 def rfqs(conn: sqlite3.Connection, *, only_quotable: bool = False,
-         screen: str | None = None, search: str | None = None,
+         screen: str | None = None, status: str | None = None,
+         game: str | None = None, search: str | None = None,
          limit: int = 500, offset: int = 0) -> list[dict]:
     rows = _rows(conn, """
         SELECT r.*, s.screen, s.n_legs, s.n_resolved, s.n_nfl_legs, s.checks_json,
                s.direction, s.side, s.submission_deadline,
-               t.price AS trade_price, t.executed_at AS trade_executed_at
+               t.price AS trade_price, t.executed_at AS trade_executed_at,
+               p.detail_json AS pricing_detail_json
         FROM rfq r LEFT JOIN rfq_screen s USING (rfq_id)
         LEFT JOIN live_trades t USING (rfq_id)
+        LEFT JOIN priced_quotes p ON p.rfq_id = r.rfq_id AND p.trigger = 'auto'
         WHERE (? = 0 OR s.screen = 'QUOTABLE')
           AND (? IS NULL OR s.screen = ?)
+          AND (? IS NULL OR r.status = ?)
+          AND (? IS NULL OR p.detail_json LIKE ? ESCAPE '\\')
           AND (? IS NULL OR r.rfq_id LIKE ? ESCAPE '\\' OR r.symbol LIKE ? ESCAPE '\\')
         ORDER BY r.rowid DESC LIMIT ? OFFSET ?
-    """, (int(only_quotable), screen, screen, search,
+    """, (int(only_quotable), screen, screen, status, status, game,
+          _like_contains(game), search,
           _like_prefix(search), _like_prefix(search), limit, offset))
     for row in rows:
         row["filters"] = json.loads(row["checks_json"]) if row["checks_json"] else {
@@ -52,6 +59,12 @@ def rfqs(conn: sqlite3.Connection, *, only_quotable: bool = False,
             "no unsupported same game": row["screen"] != "OTHER_SAME_GAME",
         }
         row["quotable"] = row["screen"] == "QUOTABLE"
+        detail = json.loads(row.pop("pricing_detail_json") or "{}")
+        games = detail.get("games") or []
+        row["game"] = ", ".join(str(g.get("game") or g.get("label") or "")
+                                  for g in games).strip(", ") or None
+        row["family"] = " + ".join(sorted(_leg_family(leg)
+                                             for leg in detail.get("legs") or [])) or None
     return rows
 
 
@@ -61,12 +74,18 @@ def _like_prefix(value: str | None) -> str | None:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
+def _like_contains(value: str | None) -> str | None:
+    prefix = _like_prefix(value)
+    return None if prefix is None else "%" + prefix
+
+
 def rfqs_count(conn: sqlite3.Connection, *, only_quotable: bool = False,
-               screen: str | None = None, search: str | None = None) -> int:
+               screen: str | None = None, status: str | None = None,
+               game: str | None = None, search: str | None = None) -> int:
     # The unfiltered feed is the common polling path. Counting through the
     # screen join scans millions of rows on a live capture and can take longer
     # than the browser's refresh interval, leaving the RFQ table blank.
-    if search is None:
+    if search is None and status is None and game is None:
         if screen is None and not only_quotable:
             return conn.execute("SELECT COUNT(*) FROM rfq").fetchone()[0]
         if screen is not None and only_quotable and screen != "QUOTABLE":
@@ -83,11 +102,33 @@ def rfqs_count(conn: sqlite3.Connection, *, only_quotable: bool = False,
                             (selected,)).fetchone()[0]
     return conn.execute("""
         SELECT COUNT(*) FROM rfq r LEFT JOIN rfq_screen s USING (rfq_id)
+        LEFT JOIN priced_quotes p ON p.rfq_id = r.rfq_id AND p.trigger = 'auto'
         WHERE (? = 0 OR s.screen = 'QUOTABLE')
           AND (? IS NULL OR s.screen = ?)
+          AND (? IS NULL OR r.status = ?)
+          AND (? IS NULL OR p.detail_json LIKE ? ESCAPE '\\')
           AND (? IS NULL OR r.rfq_id LIKE ? ESCAPE '\\' OR r.symbol LIKE ? ESCAPE '\\')
-    """, (int(only_quotable), screen, screen, search,
+    """, (int(only_quotable), screen, screen, status, status, game,
+          _like_contains(game), search,
           _like_prefix(search), _like_prefix(search))).fetchone()[0]
+
+
+def rfq_filter_options(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Observed status and game choices for the historical RFQ filters."""
+    statuses = [str(r[0]) for r in conn.execute(
+        "SELECT DISTINCT status FROM rfq WHERE status IS NOT NULL ORDER BY status")]
+    games = set()
+    if _has_table(conn, "priced_quotes"):
+        for row in conn.execute("SELECT detail_json FROM priced_quotes WHERE trigger='auto'"):
+            try:
+                detail = json.loads(row[0] or "{}")
+            except (TypeError, ValueError):
+                continue
+            for item in detail.get("games") or []:
+                value = item.get("game") or item.get("label")
+                if value:
+                    games.add(str(value))
+    return {"statuses": statuses, "games": sorted(games)}
 
 
 def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
@@ -112,7 +153,13 @@ def pricing(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
         WHERE s.screen = 'QUOTABLE' AND (? IS NULL OR r.rfq_id = ?)
         ORDER BY r.rowid DESC LIMIT ? OFFSET ?
     """, (rfq_id, rfq_id, limit, offset))
+    capital = _paper_capital_state(conn)
     for row in rows:
+        if row["rfq_id"] in capital.rejected_ids:
+            row["status"] = "DECLINED"
+            row["reason_code"] = "RISK_CAPITAL"
+            row["reason_detail"] = "paper equity was already fully allocated"
+            row["response_price"] = None
         row["status"] = row["status"] or "PENDING"
         row["reason_code"] = row["reason_code"] or "AWAITING_DECISION"
         row["detail"] = json.loads(row.pop("detail_json") or "{}")
@@ -143,7 +190,7 @@ def _fill_candidates(conn: sqlite3.Connection) -> list[dict]:
         SELECT p.*,
                t.price AS market_price,
                CASE WHEN t.price IS NOT NULL THEN 'accepted trade' END AS market_source,
-               t.executed_at, r.created_time, s.n_legs
+               t.executed_at, r.created_time, s.n_legs, s.direction
         FROM priced_quotes p LEFT JOIN live_trades t ON t.rfq_id = p.rfq_id
         JOIN rfq r ON r.rfq_id = p.rfq_id JOIN rfq_screen s ON s.rfq_id = p.rfq_id
         WHERE p.trigger = 'auto' AND p.status = 'QUOTED'
@@ -224,6 +271,7 @@ def _to_fill(conn: sqlite3.Connection, row: dict) -> dict | None:
     return {"rfq_id": row["rfq_id"], "time": row["priced_at"],
             "after_deadline": bool(row["after_deadline"]),
             "game": game, "family": family, "n_legs": row["n_legs"],
+            "requester_side": row.get("direction"),
             "market_keys": market_keys, "team_keys": team_keys,
             "quantity": qty,
             "side": row["side"], "response_action": action,
@@ -241,24 +289,30 @@ def _to_fill(conn: sqlite3.Connection, row: dict) -> dict | None:
             "settled_legs": len(settled), "total_legs": len(settlements)}
 
 
-def _compute_fills(conn: sqlite3.Connection, equity_limit: float | None = None) -> list[dict]:
-    """Capital-limited shadow fills, oldest first (for cumulative curves)."""
-    if not _has_table(conn, "priced_quotes"):
-        return []
+def _paper_capital_state(conn: sqlite3.Connection,
+                         equity_limit: float | None = None) -> PaperCapitalState:
     if equity_limit is None:
         from combo_mm.inventory import InventoryProvider
         equity_limit = InventoryProvider(_InventoryStore(conn))().equity
-    limit = max(0.0, equity_limit)
-    net_notional = 0.0
+    return replay_paper_capital(conn, equity_limit)
+
+
+def _compute_fills(conn: sqlite3.Connection, equity_limit: float | None = None,
+                   capital: PaperCapitalState | None = None) -> list[dict]:
+    """Capital-limited shadow fills, oldest first (for cumulative curves)."""
+    if not _has_table(conn, "priced_quotes"):
+        return []
+    capital = capital or _paper_capital_state(conn, equity_limit)
     out = []
     for row in _fill_candidates(conn):
+        if row["rfq_id"] in capital.rejected_ids:
+            continue
         fill = _to_fill(conn, row)
         if fill is not None:
             if fill["realized_pnl"] is None:
                 proposed = fill["net_notional"]
-                bounded = max(-limit, min(limit, net_notional + proposed))
-                allocated = bounded - net_notional
-                if abs(allocated) < 1e-9:
+                allocated = capital.allocations.get(row["rfq_id"])
+                if allocated is None or abs(allocated) < 1e-9:
                     continue
                 fraction = allocated / proposed
                 if fraction < 1 - 1e-9:
@@ -268,7 +322,6 @@ def _compute_fills(conn: sqlite3.Connection, equity_limit: float | None = None) 
                     fill["expected_pnl"] *= fraction
                     fill["net_notional"] = allocated
                     fill["capacity_limited"] = True
-                net_notional = bounded
             out.append(fill)
     return out
 
@@ -285,12 +338,14 @@ def fills_count(conn: sqlite3.Connection) -> int:
 def performance(conn: sqlite3.Connection) -> dict[str, Any]:
     """Paper fills: every auto-quoted shadow RFQ, minus the ones an observed
     accepted trade beat."""
-    fills = _compute_fills(conn)
+    capital = _paper_capital_state(conn)
+    fills = _compute_fills(conn, capital=capital)
     cumulative = exposure = 0.0
     curve = []
     for fill in fills:
         cumulative += fill["realized_pnl"] or 0
         exposure += fill["net_notional"] if fill["realized_pnl"] is None else 0
+        exposure = max(-capital.equity, min(capital.equity, exposure))
         curve.append({"time": fill["time"], "realized_pnl": cumulative,
                       "net_notional": exposure})
     def breakdown(key: str) -> list[dict]:
@@ -303,17 +358,24 @@ def performance(conn: sqlite3.Connection) -> dict[str, Any]:
                 for name, group in sorted(groups.items(), key=lambda item: str(item[0]))]
     sw = _swings([(p["time"], p["realized_pnl"]) for p in curve])
     downswing, upswing = -sw["max_downswing"], sw["max_upswing"]
-    quoted = conn.execute("SELECT COUNT(DISTINCT q.rfq_id) FROM quotes q "
-                          "JOIN priced_quotes p ON p.rfq_id=q.rfq_id "
-                          "WHERE q.status='shadow' AND p.trigger='auto' "
-                          "AND p.status='QUOTED'").fetchone()[0]
+    quoted = len(capital.admitted_ids)
+    stored_declines = conn.execute(
+        "SELECT COUNT(DISTINCT rfq_id) FROM priced_quotes "
+        "WHERE trigger='auto' AND status!='QUOTED'").fetchone()[0]
+    received = conn.execute("SELECT COUNT(*) FROM rfq").fetchone()[0]
     return {"quoted": quoted,
+            "rfqs_received": received,
+            "rfqs_declined": stored_declines + len(capital.rejected_ids),
+            "rfqs_executed": conn.execute(
+                "SELECT COUNT(DISTINCT rfq_id) FROM fills").fetchone()[0],
+            "quote_rate": quoted / max(1, received),
             "shadow_fills": len(fills), "win_rate": len(fills) / quoted if quoted else 0,
             "expected_pnl": sum(x["expected_pnl"] for x in fills),
-            "realized_pnl": cumulative, "net_notional": exposure,
+            "realized_pnl": cumulative, "net_notional": capital.net_notional,
             "max_downswing": downswing, "max_upswing": upswing,
             "curve": curve, "by_family": breakdown("family"),
             "by_legs": breakdown("n_legs"), "by_game": breakdown("game"),
+            "by_requester_side": breakdown("requester_side"),
             "by_market_source": breakdown("market_source")}
 
 
@@ -547,11 +609,14 @@ def inventory_state(conn: sqlite3.Connection) -> dict:
     provider = InventoryProvider(_InventoryStore(conn),
                                  game_resolver=_quote_game_resolver(conn))
     recorded_state = provider()
-    paper_fills = _compute_fills(conn, recorded_state.equity)
+    capital = _paper_capital_state(conn, recorded_state.equity)
+    paper_fills = _compute_fills(conn, recorded_state.equity, capital)
     # A simulated fill consumes its RFQ's quote. Do not reserve that same
     # draft as pending while also showing it as paper executed exposure.
-    state = provider(exclude_pending_rfqs={fill["rfq_id"] for fill in paper_fills
-                                               if fill["realized_pnl"] is None})
+    consumed_or_rejected = {
+        fill["rfq_id"] for fill in paper_fills if fill["realized_pnl"] is None
+    } | capital.rejected_ids
+    state = provider(exclude_pending_rfqs=consumed_or_rejected)
     snap = state.to_snapshot()
     snap["kill_switch_event"] = _kill_switch(conn)
     paper_executed = defaultdict(float)
@@ -581,10 +646,10 @@ def inventory_state(conn: sqlite3.Connection) -> dict:
         for key in sorted(set(snap["pending"]) | set(snap["executed"]))
     }
     snap["paper_wcl"] = sum(paper_executed.values())
-    paper_net = sum(fill["net_notional"] for fill in paper_fills
-                    if fill["realized_pnl"] is None)
+    paper_net = capital.net_notional
     snap["paper_net_notional"] = paper_net
-    snap["buying_power"] = min(state.buying_power, state.equity - abs(paper_net))
+    paper_buying_power = min(state.buying_power, state.equity - abs(paper_net))
+    snap["buying_power"] = 0.0 if abs(paper_buying_power) < 1e-9 else paper_buying_power
     now = datetime.now(timezone.utc)
     activity = _rows(conn, """
         SELECT q.quote_id, q.rfq_id, q.created_time, q.buy_price, q.sell_price,
@@ -609,9 +674,12 @@ def inventory_state(conn: sqlite3.Connection) -> dict:
                 expired = expires <= now
             except (ValueError, OverflowError):
                 pass
-        row["state"] = ("closed" if not open_rfq else
+        row["state"] = ("rejected" if row["rfq_id"] in capital.rejected_ids else
+                        "closed" if not open_rfq else
                         "expired" if expired
                         else "open")
+        if row["rfq_id"] in capital.rejected_ids:
+            row["reason_code"] = "RISK_CAPITAL"
     rejected = _rows(conn, """
         SELECT ts AS created_time, rfq_id, reason AS reason_code, detail_json
         FROM risk_events WHERE action='reject' ORDER BY id DESC LIMIT 20
@@ -630,7 +698,7 @@ def inventory_state(conn: sqlite3.Connection) -> dict:
                          "buy_qty_decimal": None, "sell_qty_decimal": None})
     activity.sort(key=lambda row: row["created_time"] or "", reverse=True)
     snap["activity"] = {
-        "paper_quotes": conn.execute("SELECT COUNT(*) FROM quotes WHERE origin='shadow'").fetchone()[0],
+        "paper_quotes": len(capital.admitted_ids),
         "recorded_fills": conn.execute("SELECT COUNT(*) FROM fills").fetchone()[0],
         "recent_quotes": activity[:20],
     }
@@ -644,12 +712,16 @@ def inventory_state(conn: sqlite3.Connection) -> dict:
         """)
     else:
         paper_events = []
-    snap["paper_events"] = [
-        {"ts": row["ts"], "rfq_id": row["rfq_id"],
-         "action": "paper quote" if row["status"] == "QUOTED" else "paper decline",
-         "reason": row["reason_code"] or row["status"]}
-        for row in paper_events
-    ]
+    snap["paper_events"] = []
+    for row in paper_events:
+        capital_rejected = row["rfq_id"] in capital.rejected_ids
+        snap["paper_events"].append({
+            "ts": row["ts"], "rfq_id": row["rfq_id"],
+            "action": "paper decline" if capital_rejected or row["status"] != "QUOTED"
+                      else "paper quote",
+            "reason": "RISK_CAPITAL" if capital_rejected
+                      else row["reason_code"] or row["status"],
+        })
     snap["paper_events"].extend(
         {"ts": fill["time"], "rfq_id": fill["rfq_id"],
          "action": "capital cap", "reason": "paper fill size reduced to fit equity"}

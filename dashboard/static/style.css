@@ -168,6 +168,12 @@ td.dim, .dim { color: var(--dim); }
 .alert.warn::before { content: "⚠"; }
 .alert.good { background: rgba(61,220,132,.09); border: 1px solid rgba(61,220,132,.45); color: #c9ffe0; }
 .alert.good::before { content: "✓"; color: var(--good); }
+.button-link {
+  align-self: end; padding: 6px 10px; border: 1px solid var(--line);
+  border-radius: 5px; color: var(--text); text-decoration: none; background: var(--panel);
+}
+.button-link:hover { border-color: var(--accent); }
+.compact-run-options input { width: 78px; }
 
 /* ---- drawer ---- */
 #drawer {
