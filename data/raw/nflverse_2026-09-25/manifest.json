@@ -1,0 +1,17 @@
+{
+  "bytes": 2180915,
+  "pull_date": "2026-09-25",
+  "sha256": "216a56f2660cdaf1739ed0d0dcdd11d232d22816a42ba26a693a048fab68fc5e",
+  "source_url": "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv",
+  "validation": {
+    "errors": [],
+    "n_played": 7309,
+    "n_rows": 7548,
+    "n_scheduled": 239,
+    "ok": true,
+    "warnings": [
+      "2022 BUF: 16 regular-season games (expected 17)",
+      "2022 CIN: 16 regular-season games (expected 17)"
+    ]
+  }
+}

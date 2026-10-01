@@ -199,6 +199,27 @@ def test_credentials_env_wins_over_dotenv(tmp_path):
     assert creds.api_key == "fromenv"
 
 
+def test_credentials_proxy_wallet_identity(tmp_path):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        "POLYMARKET_API_KEY=k\nPOLYMARKET_SECRET=s\nPOLYMARKET_PASSPHRASE=p\n"
+        "POLYMARKET_ADDRESS=0xproxy\nPOLYMARKET_SIGNER_ADDRESS=0xsigner\n"
+        "POLYMARKET_SIGNATURE_TYPE=1\n")
+    creds = GatewayCredentials.from_env(env={}, dotenv_path=dotenv)
+    assert (creds.wallet_address, creds.signer, creds.signature_type) == (
+        "0xproxy", "0xsigner", 1)
+    frame = InternationalQuoterGatewayAdapter(creds)._auth_frame()
+    assert frame["identity"] == {"signer_address": "0xsigner",
+                                 "maker_address": "0xproxy", "signature_type": 1}
+
+
+def test_credentials_defaults_to_eoa_identity():
+    assert (CREDS.signer, CREDS.signature_type) == ("0xabc", 0)
+    with pytest.raises(ValueError):
+        GatewayCredentials(api_key="k", api_secret="s", api_passphrase="p",
+                           wallet_address="0xabc", signature_type=7)
+
+
 # ---------------------------------------------------------------------------
 # Fake gateway server
 # ---------------------------------------------------------------------------
@@ -443,3 +464,41 @@ def test_no_trading_code_paths():
     banned_substrings = ("signed_order", "maker/quotes", "RFQ_QUOTE", "v1/maker")
     hits = [s for s in strings for b in banned_substrings if b in s]
     assert not hits, f"trading wire tokens found in string literals: {hits[:3]}"
+
+
+def test_trades_survive_rfq_buffer_overflow():
+    adapter = InternationalQuoterGatewayAdapter(CREDS, max_buffer=2)
+    adapter._emit({"rfq_id": "r1", "event_type": "rfq_created"}, "rfq")
+    adapter._emit({"rfq_id": "r1", "event_type": "rfq_closed", "price": "0.4"}, "trade")
+    for i in range(5):  # flood past max_buffer: only RFQ requests are evicted
+        adapter._emit({"rfq_id": f"x{i}", "event_type": "rfq_created"}, "rfq")
+    raws = [item["raw"] for item in adapter.poll(datetime.now(timezone.utc))]
+    assert [r["rfq_id"] for r in raws] == ["x3", "x4", "r1"]
+    assert raws[-1]["event_type"] == "rfq_closed"
+    assert adapter.stats()["buffer_drops"] == 4
+
+
+def _request_frame(rfq_id, legs):
+    return json.dumps({"type": "RFQ_REQUEST", "rfq_id": rfq_id, "leg_position_ids": legs,
+                       "direction": "BUY", "side": "YES", "condition_id": "0xc",
+                       "requested_size": {"unit": "shares", "value_e6": 5_000_000}})
+
+
+def test_request_filter_drops_unwanted_rfqs_but_never_trades():
+    adapter = InternationalQuoterGatewayAdapter(
+        CREDS, request_filter=lambda legs: "nfl" in legs)
+    adapter._on_frame(_request_frame("keep", ["nfl", "x"]))
+    adapter._on_frame(_request_frame("drop", ["nba", "x"]))
+    adapter._on_frame(json.dumps({"type": "RFQ_TRADE", "rfq_id": "drop", "price_e6": 400000}))
+    ids = [(i["raw"]["event_type"], i["raw"]["rfq_id"])
+           for i in adapter.poll(datetime.now(timezone.utc))]
+    assert ids == [("rfq_created", "keep"), ("rfq_closed", "drop")]
+    assert adapter.stats()["rfqs_filtered"] == 1
+
+
+def test_request_filter_error_keeps_the_rfq():
+    def boom(legs):
+        raise RuntimeError("catalog hiccup")
+    adapter = InternationalQuoterGatewayAdapter(CREDS, request_filter=boom)
+    adapter._on_frame(_request_frame("r1", ["a", "b"]))
+    assert len(adapter.poll(datetime.now(timezone.utc))) == 1

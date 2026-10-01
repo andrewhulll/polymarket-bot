@@ -1,0 +1,53 @@
+{
+  "data_vintage": {
+    "pull_date": "2026-09-25",
+    "sha256": "216a56f2660cdaf1739ed0d0dcdd11d232d22816a42ba26a693a048fab68fc5e",
+    "source_url": "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv"
+  },
+  "estimator": {
+    "factor_max": 1.6,
+    "factor_min": 0.6,
+    "half_life_seasons": 4.0,
+    "min_seasons": 3,
+    "offseason_regression": 0.5,
+    "ratio_cap": 9.0,
+    "shrink_k_games": 5.0,
+    "sigma_max": 16.0,
+    "sigma_min": 5.0,
+    "var_shrink_multiplier": 1.0,
+    "variance_model": "mean_linear",
+    "window_seasons": null
+  },
+  "gates": [
+    {
+      "detail": {},
+      "name": "range_sanity",
+      "passed": true
+    },
+    {
+      "detail": {
+        "candidate_brier": 0.18740858137069444,
+        "n_combos": 1080,
+        "naive_brier": 0.18724299862383595,
+        "previous_brier": 0.18740707638762558,
+        "previous_file": "nfl_2026_w02.json",
+        "tolerance": 0.001
+      },
+      "name": "no_regression",
+      "passed": true
+    },
+    {
+      "detail": {
+        "bytes": 14502
+      },
+      "name": "determinism",
+      "passed": true
+    }
+  ],
+  "path": "nfl_2026_w03.json",
+  "report_path": null,
+  "season": 2026,
+  "staging_path": null,
+  "status": "promoted",
+  "week": 3
+}

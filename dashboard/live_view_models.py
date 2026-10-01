@@ -186,12 +186,36 @@ def _fill_candidates(conn: sqlite3.Connection) -> list[dict]:
     optimistic paper assumption, flagged via ``market_source``. Late
     (after-deadline) quotes stay in the ledger, flagged on the fill.
     """
-    return _rows(conn, """
+    if _has_table(conn, "quote_settlements"):
+        settlement_columns = """
+               qs.status AS settlement_status,
+               qs.combo_value AS settlement_combo_value,
+               qs.n_legs AS settlement_n_legs,
+               qs.n_legs_settled AS settlement_n_legs_settled,
+               qs.legs_json AS settlement_legs_json,
+               qs.settled_at AS settlement_time,"""
+        settlement_join = """
+        LEFT JOIN quote_settlements qs
+          ON qs.rfq_id = p.rfq_id AND qs.trigger = p.trigger"""
+    else:
+        # Capture databases created before the settlement ledger remain
+        # readable; _to_fill falls back to exchange-provided rfq_legs values.
+        settlement_columns = """
+               NULL AS settlement_status,
+               NULL AS settlement_combo_value,
+               NULL AS settlement_n_legs,
+               NULL AS settlement_n_legs_settled,
+               NULL AS settlement_legs_json,
+               NULL AS settlement_time,"""
+        settlement_join = ""
+    return _rows(conn, f"""
         SELECT p.*,
+               {settlement_columns}
                t.price AS market_price,
                CASE WHEN t.price IS NOT NULL THEN 'accepted trade' END AS market_source,
                t.executed_at, r.created_time, s.n_legs, s.direction
         FROM priced_quotes p LEFT JOIN live_trades t ON t.rfq_id = p.rfq_id
+        {settlement_join}
         JOIN rfq r ON r.rfq_id = p.rfq_id JOIN rfq_screen s ON s.rfq_id = p.rfq_id
         WHERE p.trigger = 'auto' AND p.status = 'QUOTED'
           AND EXISTS (SELECT 1 FROM quotes q WHERE q.rfq_id = p.rfq_id
@@ -249,11 +273,41 @@ def _to_fill(conn: sqlite3.Connection, row: dict) -> dict | None:
     game = ", ".join(str(g.get("game") or g.get("label") or "") for g in games) or "Unknown"
     family = " + ".join(sorted(_leg_family(leg) for leg in detail.get("legs") or []))
     family = family or "Unknown"
-    settlements = _rows(conn, "SELECT symbol, settlement_price FROM rfq_legs WHERE rfq_id = ?",
-                        (row["rfq_id"],))
-    settled = [x for x in settlements if x["settlement_price"] is not None]
-    outcome_yes = float(all(x["settlement_price"] >= 0.5 for x in settlements)) \
-        if settlements and len(settled) == len(settlements) else None
+    settlement_status = row.get("settlement_status")
+    settlement_time = row.get("settlement_time")
+    combo_value = None
+    settlement_legs = []
+    legacy_settlements = []
+    if settlement_status is not None:
+        total_legs = int(row.get("settlement_n_legs") or 0)
+        settled_legs = int(row.get("settlement_n_legs_settled") or 0)
+        try:
+            settlement_legs = json.loads(row.get("settlement_legs_json") or "[]")
+        except (TypeError, ValueError):
+            settlement_legs = []
+        combo_value = (float(row["settlement_combo_value"])
+                       if settlement_status == "SETTLED"
+                       and row.get("settlement_combo_value") is not None else None)
+        outcome_yes = combo_value
+    else:
+        # Legacy fallback for RFQs whose exchange recovery populated raw leg
+        # settlements before quote_settlements existed.
+        settlements = _rows(
+            conn,
+            "SELECT symbol, settlement_price FROM rfq_legs WHERE rfq_id = ?",
+            (row["rfq_id"],),
+        )
+        settled = [x for x in settlements if x["settlement_price"] is not None]
+        total_legs = len(settlements)
+        settled_legs = len(settled)
+        outcome_yes = float(all(x["settlement_price"] >= 0.5 for x in settlements)) \
+            if settlements and settled_legs == total_legs else None
+        legacy_settlements = settlements
+        settlement_legs = [
+            {"position_id": leg["symbol"],
+             "settlement_price": leg["settlement_price"]}
+            for leg in settlements
+        ]
     outcome = (1 - outcome_yes if row["side"] == "NO" else outcome_yes) \
         if outcome_yes is not None else None
     market_keys = tuple(dict.fromkeys(
@@ -261,14 +315,24 @@ def _to_fill(conn: sqlite3.Connection, row: dict) -> dict | None:
         for leg in detail.get("legs") or []
         if leg.get("slug") or leg.get("label") or leg.get("position_id")))
     if not market_keys:
-        market_keys = tuple(dict.fromkeys(str(leg["symbol"]) for leg in settlements))
+        market_keys = tuple(dict.fromkeys(str(leg["symbol"])
+                                          for leg in legacy_settlements))
     if not market_keys:
         market_keys = (str(row["rfq_id"]),)
     team_keys = tuple(dict.fromkeys(
         str(team) for entry in games for team in (entry.get("away"), entry.get("home"))
         if team))
     fair = row["fair"]
+    if settlement_status == "VOID":
+        realized_pnl = 0.0
+    else:
+        realized_pnl = sign * (outcome - price) * qty if outcome is not None else None
     return {"rfq_id": row["rfq_id"], "time": row["priced_at"],
+            "settlement_time": settlement_time,
+            "settlement_status": settlement_status,
+            "settlement_legs": settlement_legs,
+            "combo_value": combo_value,
+            "settlement_value": outcome,
             "after_deadline": bool(row["after_deadline"]),
             "game": game, "family": family, "n_legs": row["n_legs"],
             "requester_side": row.get("direction"),
@@ -284,9 +348,9 @@ def _to_fill(conn: sqlite3.Connection, row: dict) -> dict | None:
             "model_edge": (sign * (fair - market)
                            if fair is not None and market is not None else None),
             "expected_pnl": sign * (float(fair or price) - price) * qty,
-            "realized_pnl": sign * (outcome - price) * qty if outcome is not None else None,
+            "realized_pnl": realized_pnl,
             "net_notional": sign * price * qty,
-            "settled_legs": len(settled), "total_legs": len(settlements)}
+            "settled_legs": settled_legs, "total_legs": total_legs}
 
 
 def _paper_capital_state(conn: sqlite3.Connection,

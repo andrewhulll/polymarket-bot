@@ -93,7 +93,7 @@ function refreshFillsTable(fills) {
     `<td class="num">${fmtEdge(r.quote_edge)}</td>` +
     `<td class="num"><span class="${(r.expected_pnl ?? 0) >= 0 ? "pos" : "neg"}">${fmtMoney(r.expected_pnl)}</span></td>` +
     `<td class="num"><span class="${(r.realized_pnl ?? 0) >= 0 ? "pos" : "neg"}">${fmtMoney(r.realized_pnl)}</span></td>` +
-    `<td class="dim">${r.settled_legs ?? "?"}/${r.total_legs ?? "?"}</td></tr>` +
+    `<td class="dim">${r.settlement_status ? `${esc(r.settlement_status)} · ` : ""}${r.settled_legs ?? "?"}/${r.total_legs ?? "?"}</td></tr>` +
     `<tr class="fill-detail hidden" id="fill-det-${i}"><td colspan="16"></td></tr>`
   ).join(""));
   fills._rows = fills.rows;
@@ -106,6 +106,14 @@ function toggleFillDetail(tr, r) {
   const open = det.classList.toggle("hidden");
   tr.querySelector(".expander").textContent = open ? "▸" : "▾";
   if (open) return;
+  const settlementLegs = (r.settlement_legs || []).map((leg) => {
+    const raw = leg.settlement_price;
+    const side = leg.side || "YES";
+    const won = raw == null ? "—" : ((side === "NO" ? Number(raw) === 0 : Number(raw) === 1) ? "won" : "lost");
+    return `<tr><td class="mono">${esc(leg.position_id || leg.symbol || "—")}</td>` +
+      `<td>${esc(side)}</td><td class="num">${raw == null ? "—" : esc(raw)}</td>` +
+      `<td>${won}</td><td class="mono">${esc(leg.game_id || "—")}</td></tr>`;
+  }).join("");
   det.querySelector("td").innerHTML = `
     <div class="kpis">
       ${kpi("Naive", fmtPrice(r.naive))}
@@ -119,9 +127,14 @@ function toggleFillDetail(tr, r) {
       <dt>Expected P&amp;L</dt><dd>${fmtMoney(r.expected_pnl)}</dd>
       <dt>Realized P&amp;L</dt><dd>${fmtMoney(r.realized_pnl)}</dd>
       <dt>Net notional</dt><dd>${fmtMoney(r.net_notional)}</dd>
-      <dt>Settlement</dt><dd>${r.settled_legs ?? "?"}/${r.total_legs ?? "?"} legs settled</dd>
+      <dt>Settlement</dt><dd>${esc(r.settlement_status || "—")} · ${r.settled_legs ?? "?"}/${r.total_legs ?? "?"} legs settled</dd>
+      <dt>Combo YES value</dt><dd>${fmtPrice(r.combo_value)}</dd>
+      <dt>${esc(r.side || "YES")} payout</dt><dd>${fmtPrice(r.settlement_value)}</dd>
       <dt>Size</dt><dd>${esc(r.size || "")} ${esc(r.size_unit || "")}</dd>
       ${r.capacity_limited ? `<dt>Original size</dt><dd>${esc(r.original_size)} ${esc(r.size_unit || "")} — reduced to stay within equity</dd>` : ""}
     </dl>
+    ${settlementLegs ? `<h3>Leg settlements</h3><div class="table-wrap"><table>
+      <thead><tr><th>Position</th><th>Side</th><th class="num">Settlement</th><th>Result</th><th>Game</th></tr></thead>
+      <tbody>${settlementLegs}</tbody></table></div>` : ""}
     <p><a href="#" onclick="event.preventDefault();openPricingDrawer('${esc(r.rfq_id)}')">Open full decision detail →</a></p>`;
 }
