@@ -139,6 +139,80 @@ def test_live_tabs_reconcile_to_one_database(tmp_path):
     store.close()
 
 
+def test_settlement_ledger_drives_performance_without_rfq_leg_updates(tmp_path):
+    """The settlement button's ledger is the source of realized paper P&L."""
+    path = tmp_path / "capture.db"
+    store = EventStore(str(path))
+    quotes = QuoteSelectionStore(path)
+    posted = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+    raw = {
+        "event_type": "rfq_created", "rfq_id": "rfq-settled",
+        "event_id": "event-rfq-settled", "symbol": "combo",
+        "createdTime": posted.isoformat(), "updatedTime": posted.isoformat(),
+        "status": "RFQ_STATUS_OPEN", "qtyDecimal": "10",
+        "comboLegs": [
+            {"symbol": "leg-1", "side": "YES"},
+            {"symbol": "leg-2", "side": "YES"},
+        ],
+    }
+    assert store.apply(normalize(raw, now=posted))
+    store.upsert_rfq_screen(
+        "rfq-settled", n_legs=2, n_resolved=2, n_nfl_legs=2,
+        screen="QUOTABLE", rank=0, catalog_version=1,
+        checks_json=json.dumps({"known legs": True}),
+    )
+    quotes.record_priced_quote({
+        "rfq_id": "rfq-settled", "priced_at": posted.isoformat(),
+        "status": "QUOTED", "reason_code": "QUOTED_OK",
+        "response_action": "SELL", "response_price": .40,
+        "size": 10, "size_unit": "shares", "fair": .42, "naive": .45,
+        "side": "YES", "games": [{"game": "SEA-ARI"}],
+        "legs": [
+            {"position_id": "leg-1", "canonical": "ML"},
+            {"position_id": "leg-2", "canonical": "SPREAD"},
+        ],
+    }, "auto")
+    store.record_shadow_draft(
+        quote_id="paper:rfq-settled:auto", rfq_id="rfq-settled",
+        buy_price=.35, sell_price=.40, buy_qty="10", sell_qty="10",
+    )
+
+    quotes.record_quote_settlement({
+        "rfq_id": "rfq-settled", "trigger": "auto", "status": "SETTLED",
+        "reason_detail": None, "combo_value": 0.0, "n_legs": 2,
+        "n_legs_settled": 2,
+        "legs": [
+            {"position_id": "leg-1", "settlement_price": "1"},
+            {"position_id": "leg-2", "settlement_price": "0"},
+        ],
+        "fair": .42, "naive": .45, "bid": .35, "ask": .40,
+        "brier": .1764, "naive_brier": .2025,
+        "edge_vs_naive": .0261, "hypo_edge_bid": -.35,
+        "hypo_edge_ask": .40, "scores_vintage": "2026-09-18",
+        "model_version": "joint_v1", "params_version": "nfl_2026_w02",
+    })
+
+    with connect_readonly(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM rfq_legs WHERE settlement_price IS NOT NULL"
+        ).fetchone()[0] == 0
+        perf = performance(conn)
+        ledger = fills(conn)
+        fill = ledger[0]
+    assert perf["realized_pnl"] == pytest.approx(4.0)
+    assert perf["net_notional"] == pytest.approx(0.0)
+    assert fill["realized_pnl"] == pytest.approx(4.0)
+    assert fill["settlement_status"] == "SETTLED"
+    assert fill["settled_legs"] == fill["total_legs"] == 2
+    assert fill["combo_value"] == fill["settlement_value"] == 0.0
+    assert [leg["settlement_price"] for leg in fill["settlement_legs"]] == ["1", "0"]
+    assert perf["realized_pnl"] == pytest.approx(
+        sum(row["realized_pnl"] or 0.0 for row in ledger)
+    )
+    quotes.close()
+    store.close()
+
+
 def test_gateway_wakes_headless_consumer_on_frame():
     adapter = InternationalQuoterGatewayAdapter(GatewayCredentials(
         api_key="k", api_secret="s", api_passphrase="p", wallet_address="0xabc"))

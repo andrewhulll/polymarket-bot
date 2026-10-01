@@ -84,10 +84,20 @@ def replay_paper_capital(conn: sqlite3.Connection, equity: float) -> PaperCapita
     # readable by falling back to the original size/size_unit columns.
     bid_qty = "p.bid_qty" if _has_column(conn, "priced_quotes", "bid_qty") else "NULL"
     ask_qty = "p.ask_qty" if _has_column(conn, "priced_quotes", "ask_qty") else "NULL"
+    if _has_table(conn, "quote_settlements"):
+        settlement_status = "qs.status"
+        settlement_join = (
+            "LEFT JOIN quote_settlements qs "
+            "ON qs.rfq_id=p.rfq_id AND qs.trigger=p.trigger"
+        )
+    else:
+        settlement_status = "NULL"
+        settlement_join = ""
     rows = conn.execute(f"""
         SELECT p.rfq_id, p.priced_at, p.response_action, p.response_price,
                {bid_qty} AS bid_qty, {ask_qty} AS ask_qty, p.size, p.size_unit,
                t.price AS market_price, t.executed_at,
+               {settlement_status} AS settlement_status,
                (SELECT COUNT(*) FROM rfq_legs l
                 WHERE l.rfq_id=p.rfq_id) AS leg_count,
                (SELECT COUNT(*) FROM rfq_legs l
@@ -95,6 +105,7 @@ def replay_paper_capital(conn: sqlite3.Connection, equity: float) -> PaperCapita
                    AS settled_count
         FROM priced_quotes p
         LEFT JOIN live_trades t ON t.rfq_id=p.rfq_id
+        {settlement_join}
         WHERE p.trigger='auto' AND p.status='QUOTED'
           AND EXISTS (SELECT 1 FROM quotes q WHERE q.rfq_id=p.rfq_id
                       AND q.status='shadow')
@@ -106,7 +117,8 @@ def replay_paper_capital(conn: sqlite3.Connection, equity: float) -> PaperCapita
             "rfq_id": raw[0], "priced_at": raw[1], "response_action": raw[2],
             "response_price": raw[3], "bid_qty": raw[4], "ask_qty": raw[5],
             "size": raw[6], "size_unit": raw[7], "market_price": raw[8],
-            "executed_at": raw[9], "leg_count": raw[10], "settled_count": raw[11],
+            "executed_at": raw[9], "settlement_status": raw[10],
+            "leg_count": raw[11], "settled_count": raw[12],
         }
         rfq_id = str(row["rfq_id"])
         if state.exhausted:
@@ -134,7 +146,10 @@ def replay_paper_capital(conn: sqlite3.Connection, equity: float) -> PaperCapita
         if market is not None and ((action == "BUY" and price < float(market)) or
                                    (action == "SELL" and price > float(market))):
             continue
-        if row["leg_count"] and row["leg_count"] == row["settled_count"]:
+        if row["settlement_status"] in ("SETTLED", "VOID"):
+            continue
+        if (row["settlement_status"] is None and row["leg_count"]
+                and row["leg_count"] == row["settled_count"]):
             continue
 
         raw_qty = row["bid_qty"] if action == "BUY" else row["ask_qty"]
