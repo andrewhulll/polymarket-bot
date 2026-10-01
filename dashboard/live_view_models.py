@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,11 +34,14 @@ def _rows(conn: sqlite3.Connection, sql: str, args: tuple = ()) -> list[dict]:
 def rfqs(conn: sqlite3.Connection, *, only_quotable: bool = False,
          screen: str | None = None, status: str | None = None,
          game: str | None = None, search: str | None = None,
+         decision: str | None = None,
          limit: int = 500, offset: int = 0) -> list[dict]:
     rows = _rows(conn, """
         SELECT r.*, s.screen, s.n_legs, s.n_resolved, s.n_nfl_legs, s.checks_json,
                s.direction, s.side, s.submission_deadline,
                t.price AS trade_price, t.executed_at AS trade_executed_at,
+               p.status AS decision, p.reason_code, p.response_price,
+               p.response_action, p.fair, p.naive, p.after_deadline,
                p.detail_json AS pricing_detail_json
         FROM rfq r LEFT JOIN rfq_screen s USING (rfq_id)
         LEFT JOIN live_trades t USING (rfq_id)
@@ -46,11 +49,12 @@ def rfqs(conn: sqlite3.Connection, *, only_quotable: bool = False,
         WHERE (? = 0 OR s.screen = 'QUOTABLE')
           AND (? IS NULL OR s.screen = ?)
           AND (? IS NULL OR r.status = ?)
+          AND (? IS NULL OR p.status = ?)
           AND (? IS NULL OR p.detail_json LIKE ? ESCAPE '\\')
           AND (? IS NULL OR r.rfq_id LIKE ? ESCAPE '\\' OR r.symbol LIKE ? ESCAPE '\\')
         ORDER BY r.rowid DESC LIMIT ? OFFSET ?
-    """, (int(only_quotable), screen, screen, status, status, game,
-          _like_contains(game), search,
+    """, (int(only_quotable), screen, screen, status, status, decision, decision,
+          game, _like_contains(game), search,
           _like_prefix(search), _like_prefix(search), limit, offset))
     for row in rows:
         row["filters"] = json.loads(row["checks_json"]) if row["checks_json"] else {
@@ -65,6 +69,13 @@ def rfqs(conn: sqlite3.Connection, *, only_quotable: bool = False,
                                   for g in games).strip(", ") or None
         row["family"] = " + ".join(sorted(_leg_family(leg)
                                              for leg in detail.get("legs") or [])) or None
+        # Same sign convention as pricing(): a lower ask wins a requester BUY,
+        # a higher bid wins a requester SELL.
+        sign = -1 if row["response_action"] == "SELL" else 1
+        row["edge_vs_market"] = (
+            sign * (row["trade_price"] - row["response_price"])
+            if row["trade_price"] is not None and row["response_price"] is not None
+            else None)
     return rows
 
 
@@ -81,11 +92,12 @@ def _like_contains(value: str | None) -> str | None:
 
 def rfqs_count(conn: sqlite3.Connection, *, only_quotable: bool = False,
                screen: str | None = None, status: str | None = None,
-               game: str | None = None, search: str | None = None) -> int:
+               game: str | None = None, search: str | None = None,
+               decision: str | None = None) -> int:
     # The unfiltered feed is the common polling path. Counting through the
     # screen join scans millions of rows on a live capture and can take longer
     # than the browser's refresh interval, leaving the RFQ table blank.
-    if search is None and status is None and game is None:
+    if search is None and status is None and game is None and decision is None:
         if screen is None and not only_quotable:
             return conn.execute("SELECT COUNT(*) FROM rfq").fetchone()[0]
         if screen is not None and only_quotable and screen != "QUOTABLE":
@@ -106,10 +118,11 @@ def rfqs_count(conn: sqlite3.Connection, *, only_quotable: bool = False,
         WHERE (? = 0 OR s.screen = 'QUOTABLE')
           AND (? IS NULL OR s.screen = ?)
           AND (? IS NULL OR r.status = ?)
+          AND (? IS NULL OR p.status = ?)
           AND (? IS NULL OR p.detail_json LIKE ? ESCAPE '\\')
           AND (? IS NULL OR r.rfq_id LIKE ? ESCAPE '\\' OR r.symbol LIKE ? ESCAPE '\\')
-    """, (int(only_quotable), screen, screen, status, status, game,
-          _like_contains(game), search,
+    """, (int(only_quotable), screen, screen, status, status, decision, decision,
+          game, _like_contains(game), search,
           _like_prefix(search), _like_prefix(search))).fetchone()[0]
 
 
@@ -390,13 +403,21 @@ def _compute_fills(conn: sqlite3.Connection, equity_limit: float | None = None,
     return out
 
 
-def fills(conn: sqlite3.Connection, limit: int = 500, offset: int = 0) -> list[dict]:
-    """Enriched shadow-fill ledger, newest first."""
-    return _compute_fills(conn)[::-1][offset:offset + limit]
+def _fills_for_game(conn: sqlite3.Connection, game: str | None) -> list[dict]:
+    rows = _compute_fills(conn)
+    if game:
+        rows = [fill for fill in rows if game in (fill.get("game") or "")]
+    return rows
 
 
-def fills_count(conn: sqlite3.Connection) -> int:
-    return len(_compute_fills(conn))
+def fills(conn: sqlite3.Connection, limit: int = 500, offset: int = 0,
+          game: str | None = None) -> list[dict]:
+    """Enriched shadow-fill ledger, newest first, optionally for one game."""
+    return _fills_for_game(conn, game)[::-1][offset:offset + limit]
+
+
+def fills_count(conn: sqlite3.Connection, game: str | None = None) -> int:
+    return len(_fills_for_game(conn, game))
 
 
 def performance(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -404,14 +425,15 @@ def performance(conn: sqlite3.Connection) -> dict[str, Any]:
     accepted trade beat."""
     capital = _paper_capital_state(conn)
     fills = _compute_fills(conn, capital=capital)
-    cumulative = exposure = 0.0
+    cumulative = exposure = expected = 0.0
     curve = []
     for fill in fills:
         cumulative += fill["realized_pnl"] or 0
+        expected += fill["expected_pnl"] or 0
         exposure += fill["net_notional"] if fill["realized_pnl"] is None else 0
         exposure = max(-capital.equity, min(capital.equity, exposure))
         curve.append({"time": fill["time"], "realized_pnl": cumulative,
-                      "net_notional": exposure})
+                      "expected_pnl": expected, "net_notional": exposure})
     def breakdown(key: str) -> list[dict]:
         groups = defaultdict(list)
         for fill in fills:
@@ -791,3 +813,97 @@ def inventory_state(conn: sqlite3.Connection) -> dict:
          "action": "capital cap", "reason": "paper fill size reduced to fit equity"}
         for fill in paper_fills if fill.get("capacity_limited"))
     return snap
+
+
+# -- flow summary + global KPIs -------------------------------------------
+
+FLOW_SCAN_ROWS = 50_000   # newest RFQs scanned; keeps the summary cheap on a live capture
+FLOW_WINDOW_MINUTES = 60
+EDGE_BUCKETS = 30
+
+
+def flow_summary(conn: sqlite3.Connection, game: str | None = None,
+                 now: datetime | None = None) -> dict[str, Any]:
+    """Funnel, arrivals per minute and quote-edge histogram for the Flow tab.
+
+    The window is the last hour. The scan is bounded to the newest
+    ``FLOW_SCAN_ROWS`` RFQs. Under a game filter only priced RFQs can be
+    attributed to a game (the game comes from the pricing detail), so the
+    funnel starts at "priced" in that case and ``game_scoped`` is True.
+    """
+    now = now or datetime.now(timezone.utc)
+    since = (now - timedelta(minutes=FLOW_WINDOW_MINUTES)).strftime("%Y-%m-%dT%H:%M:%S")
+    like = _like_contains(game)
+    zero = {"received": 0, "quotable": 0, "priced": 0, "quoted": 0, "accepted": 0}
+    minutes = [(now - timedelta(minutes=FLOW_WINDOW_MINUTES - 1 - i)).strftime("%Y-%m-%dT%H:%M")
+               for i in range(FLOW_WINDOW_MINUTES)]
+    out = {"window_minutes": FLOW_WINDOW_MINUTES, "game": game,
+           "game_scoped": bool(game), "funnel": dict(zero),
+           "arrivals": [{"minute": m, "n": 0} for m in minutes],
+           "edge": {"n": 0, "median": None, "p10": None, "p90": None, "buckets": []}}
+    if not _has_table(conn, "rfq") or not _has_table(conn, "priced_quotes"):
+        return out
+    recent = f"WITH recent AS (SELECT rfq_id, created_time FROM rfq ORDER BY rowid DESC LIMIT {FLOW_SCAN_ROWS})"
+    row = conn.execute(f"""
+        {recent}
+        SELECT COUNT(*), COALESCE(SUM(s.screen = 'QUOTABLE'), 0),
+               COALESCE(SUM(p.rfq_id IS NOT NULL), 0),
+               COALESCE(SUM(p.status = 'QUOTED'), 0), COUNT(DISTINCT t.rfq_id)
+        FROM recent r LEFT JOIN rfq_screen s ON s.rfq_id = r.rfq_id
+        LEFT JOIN priced_quotes p ON p.rfq_id = r.rfq_id AND p.trigger = 'auto'
+        LEFT JOIN live_trades t ON t.rfq_id = r.rfq_id
+        WHERE r.created_time >= ? AND (? IS NULL OR p.detail_json LIKE ? ESCAPE '\\')
+    """, (since, game, like)).fetchone()
+    out["funnel"] = dict(zip(zero, (int(v or 0) for v in row)))
+
+    counts = {r[0]: r[1] for r in conn.execute(f"""
+        {recent}
+        SELECT substr(r.created_time, 1, 16), COUNT(*)
+        FROM recent r LEFT JOIN priced_quotes p ON p.rfq_id = r.rfq_id AND p.trigger = 'auto'
+        WHERE r.created_time >= ? AND (? IS NULL OR p.detail_json LIKE ? ESCAPE '\\')
+        GROUP BY 1
+    """, (since, game, like))}
+    out["arrivals"] = [{"minute": m, "n": int(counts.get(m, 0))} for m in minutes]
+
+    edges = sorted(100 * (sign * (trade - price)) for sign, trade, price in (
+        (-1 if action == "SELL" else 1, trade, price)
+        for action, trade, price in conn.execute("""
+            SELECT p.response_action, t.price, p.response_price
+            FROM priced_quotes p JOIN live_trades t ON t.rfq_id = p.rfq_id
+            WHERE p.trigger = 'auto' AND p.status = 'QUOTED'
+              AND p.response_price IS NOT NULL
+              AND (? IS NULL OR p.detail_json LIKE ? ESCAPE '\\')
+            ORDER BY p.rowid DESC LIMIT 2000
+        """, (game, like))) if trade is not None and price is not None)
+    if edges:
+        n = len(edges)
+        lo, hi = edges[int(n * 0.02)], edges[min(n - 1, int(n * 0.98))]
+        span = max(hi - lo, 1e-9)
+        buckets = [{"lo": lo + span * i / EDGE_BUCKETS, "hi": lo + span * (i + 1) / EDGE_BUCKETS, "n": 0}
+                   for i in range(EDGE_BUCKETS)]
+        for value in edges:
+            index = min(EDGE_BUCKETS - 1, max(0, int((value - lo) / span * EDGE_BUCKETS)))
+            buckets[index]["n"] += 1
+        out["edge"] = {"n": n, "median": edges[n // 2], "p10": edges[int(n * 0.1)],
+                       "p90": edges[min(n - 1, int(n * 0.9))], "buckets": buckets}
+    return out
+
+
+def global_summary(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any]:
+    """The four tiles shown on every tab. Replays the paper ledger, so the
+    server caches this for a few seconds."""
+    now = now or datetime.now(timezone.utc)
+    since = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    quoted_1h = 0
+    if _has_table(conn, "priced_quotes"):
+        quoted_1h = conn.execute(
+            "SELECT COUNT(*) FROM priced_quotes WHERE trigger='auto' AND status='QUOTED' "
+            "AND priced_at >= ?", (since,)).fetchone()[0]
+    perf = performance(conn)
+    inventory = inventory_state(conn)
+    quoted = perf["quoted"]
+    return {"quoted_1h": quoted_1h,
+            "accept_rate": perf["rfqs_executed"] / quoted if quoted else None,
+            "realized_pnl": perf["realized_pnl"], "expected_pnl": perf["expected_pnl"],
+            "wcl": inventory.get("paper_wcl"), "equity": inventory.get("equity"),
+            "kill_switch": inventory.get("kill_switch_event")}

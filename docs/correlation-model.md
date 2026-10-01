@@ -405,4 +405,4 @@ verifies this holds across recent quotes, not just these two.
 | `combo_mm/leg_books.py` | live leg books for combo legs: CLOB via Gamma token ids, Gamma fallback |
 | `combo_mm/nfl/live_pricer.py` | live RFQ -> fair value -> bid/ask, with decline codes and explanations |
 | `combo_mm/live_quoter.py` | prices quotable live RFQs off the feed's thread and logs every quote |
-| `dashboard/nfl_api.py`, `dashboard/static/js/nfl.js` | JSON API and static "NFL correlation" tab |
+| `dashboard/nfl_api.py`, `dashboard/static/js/nfl.js` | JSON API and static "Research" (NFL correlation) tab |

@@ -1,4 +1,5 @@
-/* NFL correlation tab: filter panel + vega charts + tables + combo explorer + research runners. */
+/* Research tab (NFL correlation backtest): filter panel, vega charts, tables, combo explorer,
+   research runners, and the live model check. Backtest data only — not live. */
 "use strict";
 
 const NFL_VIEWS = ["overview", "combo_pricing", "calibration", "structure", "sensitivity", "explorer", "params"];
@@ -17,12 +18,34 @@ function nflMetric(m) {
     `<div class="k">${esc(m.label)}</div><div class="v">${esc(m.value)}${delta}</div></div>`;
 }
 
+async function refreshLiveModel() {
+  const [eng, settle] = await Promise.all([
+    get("/api/engine").catch(() => null), get("/api/settlements?page=1").catch(() => null),
+  ]);
+  const corr = eng?.correlation_lift || {};
+  const bps = (v) => v == null ? "—" : `${Number(v).toFixed(2)} bps`;
+  const row = (label, value, cls = "") => `<tr><td class="w">${label}</td><td class="num ${cls}">${value}</td></tr>`;
+  setRows("corr-table",
+    row("Quotes sampled", fmtInt(corr.n || 0)) +
+    row("Mean |corr adjustment|", bps(corr.mean_abs_bps)) +
+    row("p50 / p95 |corr adj|", `${bps(corr.p50_abs_bps)} / ${bps(corr.p95_abs_bps)}`) +
+    row("Max |corr adjustment|", bps(corr.max_abs_bps)) +
+    row("Brier, model vs naive", settle ? `${fmtScore(settle.model_brier)} / ${fmtScore(settle.naive_brier)}` : "—") +
+    row("Brier lift (naive − model)", settle?.brier_advantage == null ? "—" : fmtEdge(settle.brier_advantage, 4)) +
+    row("Settled quotes", settle ? fmtInt(settle.settled) : "—"));
+  $("corr-alerts").innerHTML = corr.degenerate
+    ? `<div class="alert error">${fmtPct(corr.frac_degenerate)} of recent auto-quotes moved less than ${esc(corr.threshold_bps)} bps from naive. The correlation model is not materially affecting live prices.</div>`
+    : (corr.n ? `<div class="panel-note">Joint-model movement versus the independent-leg product.</div>` : `<div class="panel-note">No quoted rows with a correlation adjustment yet.</div>`);
+}
+
 async function refreshNfl() {
+  refreshLiveModel();
+  setTabKpis(kpi("Source", "backtest", "", "not live"));
   if (!nflMeta) {
     const meta = await get("/api/nfl/meta");
     if (!meta.has_results) {
       $("nfl-charts").innerHTML =
-        `<div class="alert warn">No backtest results found. Point the research pipeline at data and re-run, or use Refresh params / Run backtest once results exist.</div>`;
+        `<div class="panel wide"><div class="alert warn">No backtest results found. Point the research pipeline at data and re-run, or use Refresh params / Run backtest once results exist.</div></div>`;
       return;
     }
     nflMeta = meta;
@@ -104,11 +127,11 @@ function buildNflFilters() {
 async function refreshNflView() {
   if (state.nflView === "explorer") return renderExplorer();
   const q = new URLSearchParams(readNflFilters());
-  $("nfl-charts").innerHTML = `<p class="caption">loading…</p>`;
+  $("nfl-charts").innerHTML = `<div class="panel wide"><div class="panel-note">loading…</div></div>`;
   $("nfl-tables").innerHTML = "";
   const data = await get(`/api/nfl/${state.nflView}?${q}`);
   if (!data.has_results) {
-    $("nfl-charts").innerHTML = `<p class="caption">no results for these filters</p>`;
+    $("nfl-charts").innerHTML = `<div class="panel wide"><div class="panel-note">no results for these filters</div></div>`;
     return;
   }
   const box = $("nfl-charts");
@@ -125,11 +148,11 @@ async function refreshNflView() {
 /* ---- combo explorer ---- */
 function explorerLegRow() {
   const div = document.createElement("div");
-  div.className = "toolbar";
+  div.className = "flt";
   div.innerHTML =
     `<select class="leg-kind"><option value="ml">ML</option><option value="spread">Spread</option><option value="total">Total</option></select>` +
     `<select class="leg-side"><option value="team">team</option><option value="opp">opp</option></select>` +
-    `<button class="leg-remove">✕</button>`;
+    `<button class="leg-remove btn ghost">✕</button>`;
   const kind = div.querySelector(".leg-kind"), side = div.querySelector(".leg-side");
   kind.addEventListener("change", () => {
     side.innerHTML = kind.value === "total"
@@ -148,7 +171,7 @@ async function renderExplorer() {
   const games = nflGames.games || [];
   const box = $("nfl-charts");
   box.innerHTML = `
-    <div class="chart"><h3>Price a same-game combo</h3>
+    <div class="panel wide"><div class="ph"><span class="pt">Price a same-game combo</span><span class="pm">explorer · backtest params</span></div>
       <div class="filterbar">
         <label>Game<select id="exp-game">
           <option value="">hypothetical…</option>
@@ -179,9 +202,9 @@ async function renderExplorer() {
         <label>ρ<input type="number" id="exp-rho" min="-0.5" max="0.5" step="0.01" value="0.05" disabled></label>
       </div>
       <h3>Legs</h3><div id="exp-legs"></div>
-      <div class="toolbar"><button id="exp-add">+ add leg</button><span class="spacer"></span><button id="exp-price">Price combo</button></div>
+      <div class="flt"><button class="btn" id="exp-add">+ add leg</button><span class="spacer"></span><button class="btn" id="exp-price">Price combo</button></div>
     </div>
-    <div id="exp-result"></div>`;
+    <div id="exp-result" style="display:contents"></div>`;
   const legsBox = $("exp-legs");
   legsBox.appendChild(explorerLegRow());
   legsBox.appendChild(explorerLegRow());
@@ -245,27 +268,49 @@ async function renderExplorer() {
       payload.spread_home = parseFloat($("exp-spread").value);
       payload.total = parseFloat($("exp-total").value);
     }
-    $("exp-result").innerHTML = `<p class="caption">pricing…</p>`;
+    $("exp-result").innerHTML = `<div class="panel wide"><div class="panel-note">pricing…</div></div>`;
     try {
       const data = await post("/api/nfl/explorer/price", payload);
-      if (data.error) { $("exp-result").innerHTML = `<div class="alert error">${esc(data.error)}</div>`; return; }
+      if (data.error) { $("exp-result").innerHTML = `<div class="panel wide"><div class="alert error">${esc(data.error)}</div></div>`; return; }
       const target = $("exp-result");
       target.innerHTML = "";
       renderNflPayloadInto(data, target);
     } catch (e) {
-      $("exp-result").innerHTML = `<div class="alert error">failed: ${esc(e.message)}</div>`;
+      $("exp-result").innerHTML = `<div class="panel wide"><div class="alert error">failed: ${esc(e.message)}</div></div>`;
     }
   });
 }
 
+const VEGA_CONFIG = {
+  background: "#000", view: { stroke: "#444" },
+  range: { category: ["#ff9f1c", "#f2f2f2", "#3fd07f", "#ff4d4d", "#9a9a9a", "#4da3ff"] },
+  axis: { labelFont: "IBM Plex Mono, monospace", titleFont: "IBM Plex Mono, monospace", gridColor: "#222", domainColor: "#666", tickColor: "#666", labelColor: "#bdbdbd", titleColor: "#bdbdbd" },
+  legend: { labelFont: "IBM Plex Mono, monospace", titleFont: "IBM Plex Mono, monospace", labelColor: "#bdbdbd", titleColor: "#bdbdbd" },
+  title: { font: "IBM Plex Sans Condensed, sans-serif", color: "#ff9f1c" },
+};
+
+function nflPanel(title, meta = "", wide = false) {
+  const div = document.createElement("div");
+  div.className = "panel" + (wide ? " wide" : "");
+  div.innerHTML = `<div class="ph"><span class="pt">${esc(title)}</span><span class="pm">${esc(meta)}</span></div>`;
+  return div;
+}
+
 function renderNflPayloadInto(data, root) {
-  const notes = document.createElement("div");
-  notes.innerHTML = (data.notes || []).map((n) => `<p class="caption">${esc(n)}</p>`).join("");
-  root.appendChild(notes);
+  const notes = (data.notes || []);
+  if (notes.length) {
+    const p = nflPanel("Notes", "backtest caveats");
+    p.classList.add("span2");
+    p.insertAdjacentHTML("beforeend", notes.map((n) => `<div class="panel-note">${esc(n)}</div>`).join(""));
+    root.appendChild(p);
+  }
   const metrics = data.metrics || [];
   if (metrics.length || data.combo) {
+    const p = nflPanel("Summary", "", true);
     const kpis = document.createElement("div");
     kpis.className = "kpis";
+    kpis.style.margin = "0";
+    kpis.style.border = "0";
     kpis.innerHTML = metrics.map(nflMetric).join("");
     if (data.combo) {
       const c = data.combo;
@@ -273,32 +318,30 @@ function renderNflPayloadInto(data, root) {
         kpi("Corr adj", (c.adj_bps >= 0 ? "+" : "") + Number(c.adj_bps).toFixed(0) + " bps") +
         (c.realized ? kpi("Realized", esc(c.realized).toUpperCase()) : "");
     }
-    root.appendChild(kpis);
+    p.appendChild(kpis);
+    root.appendChild(p);
   }
   (data.specs || []).forEach((s) => {
-    const div = document.createElement("div");
-    div.className = "vega-chart";
-    div.innerHTML = `<h3>${esc(s.title || s.id || "")}</h3>`;
+    const p = nflPanel(s.title || s.id || "", "vega");
     const t = document.createElement("div");
-    div.appendChild(t);
-    root.appendChild(div);
-    vegaEmbed(t, s.spec, { actions: true, theme: "dark" }).catch((e) => {
-      t.innerHTML = `<p class="caption">chart failed: ${esc(e.message)}</p>`;
+    t.className = "vega-chart";
+    p.appendChild(t);
+    root.appendChild(p);
+    vegaEmbed(t, s.spec, { actions: true, theme: "dark", config: VEGA_CONFIG }).catch((e) => {
+      t.innerHTML = `<div class="panel-note">chart failed: ${esc(e.message)}</div>`;
     });
   });
   Object.entries(data.tables || {}).forEach(([name, rows]) => {
     if (!rows || !rows.length) return;
     const cols = Object.keys(rows[0]);
-    const div = document.createElement("div");
-    div.className = "chart";
-    div.innerHTML = `<h3>${esc(name)} (${rows.length})</h3>
-      <div class="table-wrap" style="max-height:none"><table>
+    const p = nflPanel(name, `${rows.length} rows`, cols.length > 6);
+    p.insertAdjacentHTML("beforeend", `<div class="table-wrap" style="max-height:360px"><table>
       <thead><tr>${cols.map((c) => `<th class="${typeof rows[0][c] === "number" ? "num" : ""}">${esc(c)}</th>`).join("")}</tr></thead>
       <tbody>${rows.map((r) => `<tr>${cols.map((c) => {
         const val = r[c];
         return `<td class="${typeof val === "number" ? "num" : ""}">${typeof val === "number" ? val.toFixed(4) : esc(val)}</td>`;
-      }).join("")}</tr>`).join("")}</tbody></table></div>`;
-    root.appendChild(div);
+      }).join("")}</tr>`).join("")}</tbody></table></div>`);
+    root.appendChild(p);
   });
 }
 
@@ -323,7 +366,7 @@ async function nflRun(script, switchToWeek1 = false, options = {}) {
       await switchSource("week1_backtest.db");
       out.textContent += "\n\nswitched the live tabs to the Week 1 backtest database.";
     }
-    if (state.tab === "nfl") await refreshNfl();
+    if (state.tab === "research") await refreshNfl();
   } catch (e) {
     out.textContent = `failed: ${e.message}`;
   }
