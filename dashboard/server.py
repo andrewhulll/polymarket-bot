@@ -30,6 +30,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,17 +49,19 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_FILES = {"index.html": "text/html; charset=utf-8",
                 "style.css": "text/css; charset=utf-8",
                 "js/core.js": "application/javascript; charset=utf-8",
-                "js/rfqs.js": "application/javascript; charset=utf-8",
-                "js/pricing.js": "application/javascript; charset=utf-8",
+                "js/flow.js": "application/javascript; charset=utf-8",
                 "js/performance.js": "application/javascript; charset=utf-8",
+                "js/risk.js": "application/javascript; charset=utf-8",
                 "js/engine.js": "application/javascript; charset=utf-8",
-                "js/inventory.js": "application/javascript; charset=utf-8",
                 "js/nfl.js": "application/javascript; charset=utf-8",
                 "vendor/vega.min.js": "application/javascript; charset=utf-8",
                 "vendor/vega-lite.min.js": "application/javascript; charset=utf-8",
                 "vendor/vega-embed.min.js": "application/javascript; charset=utf-8"}
 PAGE_SIZE = 500
+SUMMARY_TTL_SECONDS = 10.0
 _SETTLEMENT_LOCK = threading.Lock()
+_SUMMARY_CACHE: dict[str, Any] = {"key": None, "at": 0.0, "payload": None}
+_SUMMARY_LOCK = threading.Lock()
 
 
 def _transient(path: str, query: dict | None = None) -> dict | None:
@@ -295,6 +298,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(*_json(_settlements(page)))
             elif path == "/api/performance":
                 self._respond(*self._api_performance())
+            elif path == "/api/flow/summary":
+                self._respond(*self._api_flow_summary(query))
+            elif path == "/api/summary":
+                self._respond(*self._api_summary())
             elif path == "/api/fills":
                 self._respond(*self._api_fills(query))
             elif path == "/api/exposure":
@@ -398,23 +405,24 @@ class Handler(BaseHTTPRequestHandler):
         status = query.get("status", [None])[0] or None
         game = query.get("game", [None])[0] or None
         search = query.get("search", [None])[0] or None
+        decision = query.get("decision", [None])[0] or None
         page = max(1, int(query.get("page", ["1"])[0] or 1))
         end = page * PAGE_SIZE
         try:
             with closing(_connect()) as conn:
                 durable = vm.rfqs(conn, only_quotable=only, screen=screen,
-                                  status=status, game=game,
+                                  status=status, game=game, decision=decision,
                                   search=search, limit=end, offset=0)
                 durable_total = vm.rfqs_count(conn, only_quotable=only,
                                               screen=screen, status=status, game=game,
-                                              search=search)
+                                              search=search, decision=decision)
                 filter_options = vm.rfq_filter_options(conn)
             waiting = None
         except _Waiting as exc:
             durable, durable_total = [], 0
             filter_options = {"statuses": [], "games": []}
             waiting = exc
-        transient = (None if only or _CONFIG["active_db"] != "rfq_capture.db" else _transient("/rfqs", {
+        transient = (None if only or decision or _CONFIG["active_db"] != "rfq_capture.db" else _transient("/rfqs", {
             "limit": end, "screen": screen, "search": search}))
         ephemeral = transient["rows"] if transient else []
         if waiting is not None and not ephemeral:
@@ -474,10 +482,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_fills(self, query: dict) -> tuple[int, str, bytes]:
         page = max(1, int(query.get("page", ["1"])[0] or 1))
+        game = query.get("game", [None])[0] or None
         with closing(_connect()) as conn:
-            rows = vm.fills(conn, limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE)
-            return _json({"total": vm.fills_count(conn), "page": page,
+            rows = vm.fills(conn, limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE,
+                            game=game)
+            return _json({"total": vm.fills_count(conn, game=game), "page": page,
                           "page_size": PAGE_SIZE, "rows": rows})
+
+    def _api_flow_summary(self, query: dict) -> tuple[int, str, bytes]:
+        game = query.get("game", [None])[0] or None
+        with closing(_connect()) as conn:
+            return _json(vm.flow_summary(conn, game=game))
+
+    def _api_summary(self) -> tuple[int, str, bytes]:
+        """Global KPI tiles. Replays the paper ledger, so cache briefly per
+        data source instead of recomputing for every tab on every poll."""
+        key = str(_db_path())
+        with _SUMMARY_LOCK:
+            fresh = (_SUMMARY_CACHE["key"] == key and _SUMMARY_CACHE["payload"] is not None
+                     and time.monotonic() - _SUMMARY_CACHE["at"] < SUMMARY_TTL_SECONDS)
+            if fresh:
+                return _json(_SUMMARY_CACHE["payload"])
+            with closing(_connect()) as conn:
+                payload = vm.global_summary(conn)
+            _SUMMARY_CACHE.update(key=key, at=time.monotonic(), payload=payload)
+            return _json(payload)
 
     def _api_exposure(self) -> tuple[int, str, bytes]:
         with closing(_connect()) as conn:

@@ -459,12 +459,31 @@ def test_kill_switch_post_rejects_bad_input(server):
     assert status == 400
 
 
-def test_inventory_tab_present(server):
+def test_terminal_shell_and_tabs_present(server):
     status, body = get(server, "/")
     assert status == 200
-    assert b'data-tab="inventory"' in body and b"/static/js/inventory.js" in body
-    status, _ = get(server, "/static/js/inventory.js")
+    for tab in (b"flow", b"performance", b"risk", b"engine", b"research"):
+        assert b'data-tab="' + tab + b'"' in body
+        assert b'id="tab-' + tab + b'"' in body
+    assert b'data-tab="inventory"' not in body and b'data-tab="pricing"' not in body
+    for script in ("core", "flow", "performance", "risk", "engine", "nfl"):
+        assert f"/static/js/{script}.js".encode() in body
+        status, _ = get(server, f"/static/js/{script}.js")
+        assert status == 200
+    for gone in ("rfqs", "pricing", "inventory"):
+        with pytest.raises(urllib.error.HTTPError) as err:
+            get(server, f"/static/js/{gone}.js")
+        assert err.value.code == 404
+
+
+def test_header_controls_present(server):
+    status, body = get(server, "/")
     assert status == 200
+    # kill switch and game filter live in the header on every tab
+    assert b'id="ks-open"' in body and b'id="ks-popover"' in body and b'id="ks-confirm"' in body
+    assert b'id="game-chip"' in body
+    assert b'id="kpi-global"' in body and b'id="kpi-tab"' in body
+    assert b'id="drawer"' in body and b'id="poll-toggle"' in body
 
 
 def test_settlement_button_present(server):
@@ -472,11 +491,85 @@ def test_settlement_button_present(server):
     assert status == 200
     assert b'id="settlement-run"' in body
     assert b"Check settlement for all priced RFQs" in body
-    assert b'id="poll-toggle"' in body
-    assert b'id="corr-kpis"' in body
+    assert b'id="fills-table"' in body and b'id="chart-brier"' in body
+    assert b'id="corr-table"' in body            # live model check moved to Research
     assert b'id="chart-wcl"' in body
     assert b'id="game-filter"' in body and b'id="status-filter"' in body
-    assert b'id="settlement-table"' in body
+    assert b'id="decision-filter"' in body and b'id="rfq-table"' in body
+
+
+def test_rfqs_rows_carry_pricing_decision(server):
+    rows = {r["rfq_id"]: r for r in get_json(server, "/api/rfqs")["rows"]}
+    r1, r2 = rows["R1"], rows["R2"]
+    assert r1["decision"] == "QUOTED" and r1["reason_code"] == "OK"
+    assert r1["response_price"] == 0.60 and r1["response_action"] == "SELL"
+    assert r1["fair"] == 0.58 and r1["naive"] == 0.65
+    # SELL at 0.60 against an accepted trade at 0.62 is a -0.02 quote edge, as on the pricing view
+    assert abs(r1["edge_vs_market"] - (-0.02)) < 1e-9
+    assert rows["R3"]["edge_vs_market"] is None          # priced, but no trade observed
+    assert r2["decision"] is None and r2["response_price"] is None   # never priced
+
+
+def test_rfqs_decision_filter(server):
+    quoted = get_json(server, "/api/rfqs?decision=QUOTED")
+    assert quoted["total"] == 2 and {r["rfq_id"] for r in quoted["rows"]} == {"R1", "R3"}
+    assert get_json(server, "/api/rfqs?decision=DECLINED")["total"] == 0
+
+
+def test_fills_game_filter(server):
+    assert get_json(server, "/api/fills?game=KC%40BUF")["total"] == 2
+    none = get_json(server, "/api/fills?game=DAL%40PHI")
+    assert none["total"] == 0 and none["rows"] == []
+
+
+def test_performance_curve_tracks_expected_pnl(server):
+    curve = get_json(server, "/api/performance")["curve"]
+    assert curve and all("expected_pnl" in point for point in curve)
+    assert abs(curve[-1]["expected_pnl"] - 0.7) < 1e-9     # 0.5 (R1) + 0.2 (R3)
+
+
+def test_flow_summary_funnel_arrivals_and_edge(repo_path, tmp_path):
+    from datetime import datetime, timezone
+    from dashboard import live_view_models as vm
+    make_db(tmp_path / "rfq_capture.db")
+    conn = sqlite3.connect(tmp_path / "rfq_capture.db")
+    conn.row_factory = sqlite3.Row
+    now = datetime(2026, 9, 17, 12, 10, tzinfo=timezone.utc)
+    s = vm.flow_summary(conn, now=now)
+    assert s["funnel"] == {"received": 3, "quotable": 2, "priced": 2, "quoted": 2, "accepted": 1}
+    assert len(s["arrivals"]) == 60 and s["arrivals"][-1]["minute"] == "2026-09-17T12:10"
+    assert sum(a["n"] for a in s["arrivals"]) == 3
+    assert s["edge"]["n"] == 1 and abs(s["edge"]["median"] - (-2.0)) < 1e-9   # -0.02 in cents
+    assert sum(b["n"] for b in s["edge"]["buckets"]) == 1
+    scoped = vm.flow_summary(conn, game="KC@BUF", now=now)
+    assert scoped["game_scoped"] is True
+    assert scoped["funnel"]["received"] == 2            # only priced RFQs carry a game
+    empty = vm.flow_summary(conn, game="DAL@PHI", now=now)
+    assert empty["funnel"]["received"] == 0 and empty["edge"]["n"] == 0
+    stale = vm.flow_summary(conn, now=datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc))
+    assert stale["funnel"]["received"] == 0             # nothing in the last hour
+
+
+def test_flow_summary_endpoint_shape(server):
+    s = get_json(server, "/api/flow/summary")
+    assert set(s) >= {"funnel", "arrivals", "edge", "window_minutes", "game_scoped"}
+    assert len(s["arrivals"]) == 60
+    assert get_json(server, "/api/flow/summary?game=KC%40BUF")["game"] == "KC@BUF"
+
+
+def test_global_summary_endpoint_and_cache(server, monkeypatch):
+    from dashboard import server as srv
+    calls = []
+    real = srv.vm.global_summary
+    monkeypatch.setattr(srv.vm, "global_summary", lambda conn: calls.append(1) or real(conn))
+    srv._SUMMARY_CACHE.update(key=None, at=0.0, payload=None)
+    first = get_json(server, "/api/summary")
+    assert set(first) >= {"quoted_1h", "accept_rate", "realized_pnl", "expected_pnl",
+                          "wcl", "equity", "kill_switch"}
+    assert abs(first["realized_pnl"] - (-4.0)) < 1e-9       # +6.0 (R3) - 10.0 (R1)
+    assert first["kill_switch"]["state"] == "tripped"
+    assert get_json(server, "/api/summary") == first
+    assert len(calls) == 1                                  # second call served from the cache
 
 
 def test_nfl_meta_without_results(server, tmp_path, monkeypatch):

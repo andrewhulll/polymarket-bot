@@ -4,152 +4,163 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Combo RFQ bot — live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header>
   <div class="brand">
     <span class="dot" id="health-dot" title="capture database"></span>
-    <h1>Combo RFQ bot <span class="sub">live · paper only</span></h1>
+    <h1>COMBO·MM</h1><span class="sub">LIVE · PAPER ONLY</span>
   </div>
   <nav id="tabs">
-    <button data-tab="rfqs" class="active" title="RFQs (press 1)">RFQs</button>
-    <button data-tab="pricing" title="Pricing (press 2)">Pricing</button>
-    <button data-tab="performance" title="Performance (press 3)">Performance</button>
-    <button data-tab="engine" title="Engine (press 4)">Engine</button>
-    <button data-tab="inventory" title="Inventory (press 5)">Inventory</button>
-    <button data-tab="nfl" title="NFL correlation (press 6)">NFL correlation</button>
+    <button data-tab="flow" class="active" title="Flow (press 1)"><i>1</i>Flow</button>
+    <button data-tab="performance" title="Performance (press 2)"><i>2</i>Performance</button>
+    <button data-tab="risk" title="Risk (press 3)"><i>3</i>Risk</button>
+    <button data-tab="engine" title="Engine (press 4)"><i>4</i>Engine</button>
+    <button data-tab="research" title="Research (press 5)"><i>5</i>Research</button>
   </nav>
-  <div class="meta"><span id="killswitch-badge" class="hidden">KILL SWITCH</span><label class="caption" style="margin:0">source <select id="data-source" title="data behind the live tabs"></select></label><button id="poll-toggle" title="pause or resume dashboard polling">Pause</button><span id="updated">—</span><span id="paused" class="hidden">paused</span></div>
+  <div class="meta">
+    <span class="chip" id="game-chip" title="click any game to filter every tab">GAME: ALL</span>
+    <label class="caption" style="margin:0">source <select id="data-source" title="data behind the live tabs"></select></label>
+    <button id="poll-toggle" class="btn ghost" title="pause or resume dashboard polling (P)">Pause</button>
+    <span id="updated">—</span><span id="paused" class="hidden">paused</span>
+    <div class="ks" id="ks" title="manual kill switch: halts paper quoting">
+      <span class="ks-state">Kill switch <b id="ks-state">…</b></span>
+      <button id="ks-open" disabled>Trip</button>
+    </div>
+  </div>
 </header>
-<main>
-  <section id="tab-rfqs" class="tab active">
-    <div class="toolbar">
-      <label class="toggle"><input type="checkbox" id="only-quotable"> quotable only</label>
-      <select id="screen-filter"><option value="">all screens</option><option value="QUOTABLE">QUOTABLE</option><option value="UNRESOLVED">UNRESOLVED</option><option value="OTHER_SAME_GAME">OTHER_SAME_GAME</option><option value="NO_NFL_SAME_GAME">NO_NFL_SAME_GAME</option></select>
-      <select id="status-filter"><option value="">all statuses</option></select>
-      <select id="game-filter"><option value="">all games</option></select>
-      <input type="search" id="rfq-search" placeholder="search id / symbol…  ( / )">
-      <span class="spacer"></span>
-      <button id="rfq-prev">‹</button><span id="rfq-page-label" class="page-label"></span><button id="rfq-next">›</button>
-    </div>
-    <p class="caption" id="rfq-count"></p>
-    <p class="caption">Rejected and pending RFQs are shown from logger memory for this session only. Only paper-quoted RFQs are saved.</p>
-    <div class="table-wrap"><table id="rfq-table">
-      <thead><tr><th>RFQ</th><th class="num">Age</th><th>Screen</th><th class="num">Legs</th><th>Game</th><th>Side</th><th>Size</th><th>Deadline</th><th>Status</th><th class="num">Trade</th><th>Posted</th></tr></thead>
-      <tbody></tbody>
-    </table></div>
-  </section>
 
-  <section id="tab-pricing" class="tab">
-    <h2>Settlement check <span class="h-sub">after the final whistle</span></h2>
-    <div class="toolbar">
-      <button id="settlement-run" title="Refresh final NFL scores, then settle every eligible priced quote">Check settlement for all priced RFQs</button>
-      <span class="caption" id="settlement-last"></span>
+<div id="ks-popover" class="popover hidden" role="dialog" aria-labelledby="ks-title">
+  <div class="ph"><span class="pt" id="ks-title">Trip kill switch</span><span class="pm" style="color:#000">esc</span></div>
+  <div class="bd">
+    <p id="ks-copy"></p>
+    <input type="text" id="ks-reason" placeholder="reason (optional)" maxlength="200">
+    <div class="row"><button class="btn solid danger" id="ks-confirm">Trip kill switch</button><button class="btn ghost" id="ks-cancel">Cancel</button></div>
+    <span class="caption" id="ks-last"></span>
+    <span class="caption neg" id="ks-error"></span>
+  </div>
+</div>
+
+<div id="kpis">
+  <div id="kpi-global"></div>
+  <div id="kpi-tab"></div>
+</div>
+
+<div id="work">
+<main>
+  <section id="tab-flow" class="tab active">
+    <div class="strip">
+      <div class="panel"><div class="ph"><span class="pt">RFQ funnel</span><span class="pm" id="funnel-meta">last hour</span></div>
+        <div class="pb" id="flow-funnel"></div></div>
+      <div class="panel"><div class="ph"><span class="pt">Arrivals</span><span class="pm">RFQs per minute</span></div>
+        <div class="ch"><svg id="flow-arrivals" viewBox="0 0 400 100" preserveAspectRatio="none"></svg></div></div>
+      <div class="panel last"><div class="ph"><span class="pt">Quote edge</span><span class="pm" id="edge-meta">vs accepted trades, cents</span></div>
+        <div class="ch"><svg id="flow-edge" viewBox="0 0 400 100" preserveAspectRatio="none"></svg></div></div>
     </div>
-    <div id="settlement-result"></div>
-    <div class="kpis" id="settlement-kpis"></div>
-    <p class="caption">Only QUOTED decisions are eligible. Final-score checks are idempotent; pending games can be checked again later.</p>
-    <div class="toolbar"><span class="spacer"></span><button id="settlement-prev">‹</button><span id="settlement-page-label" class="page-label"></span><button id="settlement-next">›</button></div>
-    <div class="table-wrap"><table id="settlement-table">
-      <thead><tr><th>RFQ</th><th>Game</th><th>Status</th><th class="num">Value</th><th class="num">Fair</th><th class="num">Naive</th><th class="num">Model Brier</th><th class="num">Naive Brier</th><th class="num">Hypo bid</th><th class="num">Hypo ask</th><th class="num">Accepted P&amp;L</th></tr></thead><tbody></tbody>
-    </table></div>
-    <h2>Pricing decisions</h2>
-    <div class="kpis" id="pricing-kpis"></div>
-    <div class="toolbar">
-      <span class="spacer"></span>
-      <button id="pricing-prev">‹</button><span id="pricing-page-label" class="page-label"></span><button id="pricing-next">›</button>
+    <div class="flow-main">
+      <div class="ph"><span class="pt">RFQ flow · screen → decision → trade</span><span class="pm" id="rfq-count"></span></div>
+      <div class="flt">
+        <label class="toggle"><input type="checkbox" id="only-quotable"> quotable only</label>
+        <select id="screen-filter"><option value="">all screens</option><option value="QUOTABLE">QUOTABLE</option><option value="UNRESOLVED">UNRESOLVED</option><option value="OTHER_SAME_GAME">OTHER_SAME_GAME</option><option value="NO_NFL_SAME_GAME">NO_NFL_SAME_GAME</option></select>
+        <select id="decision-filter"><option value="">all decisions</option><option value="QUOTED">QUOTED</option><option value="DECLINED">DECLINED</option><option value="SKIPPED">SKIPPED</option></select>
+        <select id="status-filter"><option value="">all statuses</option></select>
+        <select id="game-filter"><option value="">all games</option></select>
+        <input type="search" id="rfq-search" placeholder="search id / symbol…  ( / )">
+        <span class="spacer"></span>
+        <span class="caption" id="rfq-session-note">Rejected and pending RFQs come from logger memory for this session; only paper-quoted RFQs are saved.</span>
+        <span class="pager"><button id="rfq-prev">‹</button><span id="rfq-page-label" class="page-label"></span><button id="rfq-next">›</button></span>
+      </div>
+      <div class="table-wrap"><table id="rfq-table">
+        <thead><tr><th>RFQ</th><th class="num">Age</th><th>Screen</th><th class="num">Legs</th><th>Game</th><th>Side</th><th class="num">Size</th><th>Deadline</th><th>Decision</th><th>Reason</th><th class="num">Naive</th><th class="num">Fair</th><th class="num">Our</th><th class="num">Q edge</th><th>Status</th><th class="num">Trade</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
     </div>
-    <p class="caption" id="pricing-count"></p>
-    <div class="table-wrap"><table id="pricing-table">
-      <thead><tr><th>RFQ</th><th>Priced</th><th>Decision</th><th>Reason</th><th class="num">Our</th><th class="num">Fair</th><th class="num">Naive</th><th class="num">Trade</th><th class="num">Q edge</th><th class="num">M edge</th><th class="num">Wait</th><th class="num">Compute</th></tr></thead>
-      <tbody></tbody>
-    </table></div>
   </section>
 
   <section id="tab-performance" class="tab">
-    <p class="caption" id="source-meta"></p>
-    <div class="kpis" id="perf-kpis"></div>
-    <h2>Shadow fills <span class="h-sub">every booked quote, all four prices</span></h2>
-    <div class="toolbar"><span class="spacer"></span>
-      <button id="fills-prev">‹</button><span id="fills-page-label" class="page-label"></span><button id="fills-next">›</button>
+    <div class="bar">
+      <button id="settlement-run" title="Refresh final NFL scores, then settle every eligible priced quote">Check settlement for all priced RFQs</button>
+      <span class="caption" id="settlement-last"></span>
+      <span class="spacer"></span>
+      <span class="caption" id="source-meta"></span>
     </div>
-    <div class="table-wrap"><table id="fills-table">
-      <thead><tr><th></th><th>Time</th><th>RFQ</th><th>Game</th><th>Family</th><th>Side</th><th class="num">Size</th><th class="num">Naive</th><th class="num">Fair</th><th class="num">Our</th><th class="num">Market</th><th class="num">Q edge</th><th class="num">Exp P&amp;L</th><th class="num">Real P&amp;L</th><th>Settled</th></tr></thead>
-      <tbody></tbody>
-    </table></div>
-    <div class="charts">
-      <div class="chart"><h3>Cumulative realized P&amp;L</h3><svg id="chart-realized" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
-      <div class="chart"><h3>Assumed paper net notional</h3><svg id="chart-equity" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
+    <div id="settlement-result"></div>
+    <div class="grid perf">
+      <div class="panel"><div class="ph"><span class="pt">Realized vs expected P&amp;L</span><span class="pm">USD · paper fills</span></div>
+        <div class="ch"><svg id="chart-realized" viewBox="0 0 400 100" preserveAspectRatio="none"></svg></div>
+        <div class="cf" id="pnl-foot"></div></div>
+      <div class="panel"><div class="ph"><span class="pt">Cumulative Brier</span><span class="pm">settled quotes · lower wins</span></div>
+        <div class="ch"><svg id="chart-brier" viewBox="0 0 400 100" preserveAspectRatio="none"></svg></div>
+        <div class="cf" id="brier-foot"></div></div>
+      <div class="panel last"><div class="ph"><span class="pt">P&amp;L by family</span><span class="pm">realized</span></div>
+        <div class="pb" id="perf-family"></div></div>
+      <div class="panel span2"><div class="ph"><span class="pt">Fills &amp; settlement</span>
+          <span class="pm" id="fills-meta">every booked quote · prices at fill · outcome after final whistle</span>
+          <span class="pager"><button id="fills-prev">‹</button><span id="fills-page-label" class="page-label"></span><button id="fills-next">›</button></span></div>
+        <div class="table-wrap"><table id="fills-table">
+          <thead><tr><th></th><th>Time</th><th>RFQ</th><th>Game</th><th>Side</th><th class="num">Size</th><th class="num">Naive</th><th class="num">Fair</th><th class="num">Our</th><th class="num">Market</th><th class="num">Exp P&amp;L</th><th>Outcome</th><th class="num">Model Brier</th><th class="num">Naive Brier</th><th class="num">Real P&amp;L</th></tr></thead>
+          <tbody></tbody>
+        </table></div></div>
+      <div class="panel last"><div class="ph"><span class="pt">By game</span><span class="pm">click to filter</span></div>
+        <div class="table-wrap"><table id="perf-games">
+          <thead><tr><th>Game</th><th class="num">Fills</th><th class="num">Exp</th><th class="num">Real</th></tr></thead><tbody></tbody>
+        </table></div></div>
     </div>
-    <div class="breakdowns" id="perf-breakdowns"></div>
+  </section>
+
+  <section id="tab-risk" class="tab">
+    <div id="inv-alerts"></div>
+    <div class="grid risk">
+      <div class="panel span2"><div class="ph"><span class="pt">Worst-case-loss exposure</span><span class="pm">over time · pending / executed / total</span></div>
+        <div class="ch"><svg id="chart-wcl" viewBox="0 0 400 100" preserveAspectRatio="none"></svg></div>
+        <div class="cf" id="wcl-foot"></div></div>
+      <div class="panel last"><div class="ph"><span class="pt">Exposure by market</span><span class="pm">WCL $</span></div>
+        <div class="pb" id="risk-markets"></div></div>
+      <div class="panel"><div class="ph"><span class="pt">Exposure by game</span><span class="pm">click to filter</span></div>
+        <div class="table-wrap"><table id="inv-games">
+          <thead><tr><th>Game</th><th class="num">Pending</th><th class="num">Executed</th><th class="num">Total WCL</th><th class="num">Net pos</th></tr></thead><tbody></tbody>
+        </table></div></div>
+      <div class="panel"><div class="ph"><span class="pt">Exposure by team</span><span class="pm">WCL $ · overlaps markets</span></div>
+        <div class="pb" id="risk-teams"></div></div>
+      <div class="panel last"><div class="ph"><span class="pt">Risk &amp; paper events</span><span class="pm">blocks, reductions, kill switch</span></div>
+        <div class="table-wrap"><table id="inv-risk">
+          <thead><tr><th>Time</th><th>RFQ</th><th>Game</th><th>Action</th><th>Reason</th></tr></thead><tbody></tbody>
+        </table></div></div>
+    </div>
   </section>
 
   <section id="tab-engine" class="tab">
-    <div class="kpis" id="engine-kpis"></div>
     <div id="engine-alerts"></div>
-    <h2>Quote latency <span class="h-sub" id="latency-budget"></span></h2>
-    <div class="charts">
-      <div class="chart"><h3>Wait: posted → engine started</h3><svg id="hist-wait" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
-      <div class="chart"><h3>Compute: engine started → decision</h3><svg id="hist-compute" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
+    <div class="grid eng">
+      <div class="panel"><div class="ph"><span class="pt">Wait · posted → engine</span><span class="pm" id="wait-meta"></span></div>
+        <div class="ch"><svg id="hist-wait" viewBox="0 0 400 100" preserveAspectRatio="none"></svg></div>
+        <div class="cf" id="wait-foot"></div></div>
+      <div class="panel"><div class="ph"><span class="pt">Compute · engine → decision</span><span class="pm" id="latency-budget"></span></div>
+        <div class="ch"><svg id="hist-compute" viewBox="0 0 400 100" preserveAspectRatio="none"></svg></div>
+        <div class="cf" id="compute-foot"></div></div>
+      <div class="panel last"><div class="ph"><span class="pt">Quote latency</span><span class="pm">by stage</span></div>
+        <div class="table-wrap"><table id="latency-table">
+          <thead><tr><th>Stage</th><th class="num">p50</th><th class="num">p95</th><th class="num">max</th></tr></thead><tbody></tbody>
+        </table></div></div>
+      <div class="panel"><div class="ph"><span class="pt">Decline &amp; skip reasons</span><span class="pm" id="reasons-meta"></span></div>
+        <div class="pb" id="reasons-list"></div></div>
+      <div class="panel"><div class="ph"><span class="pt">Feed health</span><span class="pm">RFQs per minute · last hour</span></div>
+        <div class="ch"><svg id="feed-chart" viewBox="0 0 400 100" preserveAspectRatio="none"></svg></div>
+        <div class="cf" id="feed-foot"></div></div>
+      <div class="panel last"><div class="ph"><span class="pt">Stored draft quotes</span><span class="pm">paper</span></div>
+        <div class="table-wrap"><table id="drafts-table">
+          <thead><tr><th>Quote</th><th>RFQ</th><th class="num">Buy</th><th class="num">Sell</th><th class="num">Qty</th><th>Created</th></tr></thead><tbody></tbody>
+        </table></div></div>
     </div>
-    <div class="table-wrap"><table id="latency-table">
-      <thead><tr><th>Stage</th><th class="num">p50</th><th class="num">p95</th><th class="num">max</th></tr></thead><tbody></tbody>
-    </table></div>
-    <h2>Decline &amp; skip reasons</h2>
-    <div class="table-wrap"><table id="reasons-table">
-      <thead><tr><th>Reason</th><th class="num">n</th><th class="num">share</th><th></th></tr></thead><tbody></tbody>
-    </table></div>
-    <h2>Correlation model lift</h2>
-    <div class="kpis" id="corr-kpis"></div>
-    <div id="corr-alerts"></div>
-    <h2>Risk events</h2>
-    <div class="table-wrap"><table id="risk-table">
-      <thead><tr><th>Time</th><th>RFQ</th><th>Game</th><th>Action</th><th>Reason</th></tr></thead><tbody></tbody>
-    </table></div>
-    <h2>Stored draft quotes</h2>
-    <div class="table-wrap"><table id="drafts-table">
-      <thead><tr><th>Quote</th><th>RFQ</th><th class="num">Buy</th><th class="num">Sell</th><th>Qty</th><th>Created</th></tr></thead><tbody></tbody>
-    </table></div>
   </section>
 
-  <section id="tab-inventory" class="tab">
-    <div class="kpis" id="inv-kpis"></div>
-    <div id="inv-alerts"></div>
-    <div class="kpis" id="inv-activity-kpis"></div>
-    <h2>Recent paper quote decisions</h2>
-    <div class="table-wrap"><table id="inv-quotes">
-      <thead><tr><th>RFQ</th><th>Created</th><th>Status</th><th class="num">Buy</th><th class="num">Sell</th><th class="num">Buy qty</th><th class="num">Sell qty</th></tr></thead><tbody></tbody>
-    </table></div>
-    <div class="toolbar">
-      <input type="text" id="ks-reason" placeholder="reason (optional)" style="max-width:260px">
-      <button id="ks-trip" class="danger">Trip kill switch</button>
-      <button id="ks-reset">Reset</button>
-      <span class="spacer"></span>
-      <span class="caption">additive worst-case-loss exposure · recorded and estimated paper fills</span>
-    </div>
-    <h2>Exposure by game</h2>
-    <div class="table-wrap"><table id="inv-games">
-      <thead><tr><th>Game</th><th class="num">Pending</th><th class="num">Executed</th><th class="num">Total WCL</th><th class="num">Net pos</th></tr></thead><tbody></tbody>
-    </table></div>
-    <h2>Worst-case-loss exposure over time</h2>
-    <div class="chart"><svg id="chart-wcl" viewBox="0 0 600 180" preserveAspectRatio="none"></svg></div>
-    <h2>Exposure by market</h2>
-    <div class="table-wrap"><table id="inv-markets">
-      <thead><tr><th>Market</th><th class="num">WCL</th></tr></thead><tbody></tbody>
-    </table></div>
-    <h2>Exposure by team</h2>
-    <div class="table-wrap"><table id="inv-teams">
-      <thead><tr><th>Team</th><th class="num">WCL</th></tr></thead><tbody></tbody>
-    </table></div>
-    <h2>Risk &amp; paper events</h2>
-    <div class="table-wrap"><table id="inv-risk">
-      <thead><tr><th>Time</th><th>RFQ</th><th>Game</th><th>Action</th><th>Reason</th></tr></thead><tbody></tbody>
-    </table></div>
-  </section>
-
-  <section id="tab-nfl" class="tab">
-    <div class="toolbar">
+  <section id="tab-research" class="tab">
+    <div class="bar">
+      <span class="banner">RESEARCH · BACKTEST DATA · NOT LIVE</span>
       <div id="nfl-subtabs" class="subtabs"></div>
       <span class="spacer"></span>
       <button id="nfl-run-params">Refresh params</button>
@@ -157,32 +168,36 @@
       <button id="nfl-run-backtest">Run backtest</button>
       <button id="nfl-run-week1" title="replay the backtest week's combos as RFQs into a separate database">Run Week 1 backtest</button>
     </div>
-    <div class="toolbar compact-run-options">
-      <label>Backtest seasons <input type="number" id="nfl-first-season" value="2006" min="1999" max="2100"></label>
-      <span>to</span><input type="number" id="nfl-last-season" value="2025" min="1999" max="2100">
+    <div class="bar compact-run-options">
+      <label class="caption">Backtest seasons <input type="number" id="nfl-first-season" value="2006" min="1999" max="2100"></label>
+      <span class="caption">to</span><input type="number" id="nfl-last-season" value="2025" min="1999" max="2100">
     </div>
     <div id="nfl-filters" class="filterbar"></div>
-    <div id="nfl-notes"></div>
-    <div id="nfl-charts"></div>
-    <div id="nfl-tables"></div>
     <pre id="nfl-run-output" class="hidden"></pre>
+    <div class="research-body">
+      <div class="panel" id="research-live"><div class="ph"><span class="pt">Live model check</span><span class="pm">mean_linear · from the live quote log</span></div>
+        <div class="pb"><table id="corr-table"><thead><tr><th>Metric</th><th class="num">Value</th></tr></thead><tbody></tbody></table>
+          <div id="corr-alerts"></div></div></div>
+      <div id="nfl-notes" style="display:contents"></div>
+      <div id="nfl-charts" style="display:contents"></div>
+      <div id="nfl-tables" style="display:contents"></div>
+    </div>
   </section>
 
   <div id="waiting" class="waiting hidden">Waiting for the headless capture database…</div>
 </main>
 
 <aside id="drawer" class="hidden">
-  <div class="drawer-head"><h2 id="drawer-title"></h2><button id="drawer-close">✕</button></div>
+  <div class="drawer-head"><h2 id="drawer-title"></h2><button id="drawer-close" title="close (Esc)">✕</button></div>
   <div id="drawer-body"></div>
 </aside>
-<div id="drawer-scrim" class="hidden"></div>
+</div>
 
 <script src="/static/js/core.js"></script>
-<script src="/static/js/rfqs.js"></script>
-<script src="/static/js/pricing.js"></script>
+<script src="/static/js/flow.js"></script>
 <script src="/static/js/performance.js"></script>
+<script src="/static/js/risk.js"></script>
 <script src="/static/js/engine.js"></script>
-<script src="/static/js/inventory.js"></script>
 <script src="/static/js/nfl.js"></script>
 </body>
 </html>
