@@ -43,7 +43,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -148,6 +148,19 @@ class RfqCapture:
 
     def start(self) -> None:
         self.catalog.start()
+
+    def wants_rfq(self, leg_position_ids: Sequence[str]) -> bool:
+        """Cheap socket-thread pre-filter: keep RFQs with at least one NFL leg.
+
+        Quoting needs two legs in one NFL game (:func:`screen_legs`), so an
+        RFQ with no NFL leg can never be priced. Unknown legs are not NFL by
+        definition here: an unresolved RFQ is never quoted by this capture.
+        Fails open while the catalog is still empty.
+        """
+        if not len(self.catalog):
+            return True
+        return any(leg is not None and leg.is_nfl
+                   for leg in self.catalog.resolve(leg_position_ids))
 
     def stop(self) -> None:
         if self.quoter is not None:
@@ -505,6 +518,7 @@ def main(argv: Optional[list] = None) -> int:
                                            Path(args.data_dir), args.screen_port)
         screen_server.start()
         capture.start()
+        adapter.request_filter = capture.wants_rfq
         adapter.start()
     except BaseException:
         if screen_server is not None:
@@ -538,13 +552,13 @@ def main(argv: Optional[list] = None) -> int:
                 log.info(
                     "rfqs=%d nfl=%d trades=%d catalog=%d gateway_connected=%s "
                     "quoter_submitted=%d quoter_priced=%d quoter_queued=%d "
-                    "quoter_dropped=%d gateway_buffer_drops=%d "
+                    "quoter_dropped=%d gateway_buffer_drops=%d gateway_non_nfl_filtered=%d "
                     "clob_fetches=%s gamma_fetches=%s book_last_error=%s",
                     capture.rfqs_seen, capture.nfl_rfqs_seen,
                     capture.trades_seen, len(capture.catalog), adapter.connected,
                     quoter_stats.get("submitted", 0), quoter_stats.get("priced", 0),
                     quoter_stats.get("queued", 0), quoter_stats.get("dropped", 0),
-                    adapter.stats()["buffer_drops"],
+                    adapter.stats()["buffer_drops"], adapter.stats()["rfqs_filtered"],
                     quoter_stats.get("clob_fetches"), quoter_stats.get("gamma_fetches"),
                     quoter_stats.get("book_last_error"))
                 last_log = time.monotonic()

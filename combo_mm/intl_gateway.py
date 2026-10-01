@@ -70,7 +70,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Mapping, Optional
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence
 
 from combo_mm.sources import EventSource
 
@@ -149,19 +149,51 @@ def _load_dotenv_values(path: Path) -> Dict[str, str]:
     return values
 
 
+#: Optional identity overrides for proxy-wallet accounts. Email / Google
+#: sign-ins trade from a POLY_PROXY wallet (signature type 1): the maker is
+#: the profile (proxy) address in ``POLYMARKET_ADDRESS`` while orders are
+#: signed -- and CLOB API keys derived -- by a separate EOA signer.
+GATEWAY_OPTIONAL_ENV_VARS = (
+    "POLYMARKET_SIGNER_ADDRESS",
+    "POLYMARKET_SIGNATURE_TYPE",
+)
+
+#: 0 = EOA, 1 = POLY_PROXY, 2 = GNOSIS_SAFE, 3 = POLY_1271.
+SIGNATURE_TYPES = (0, 1, 2, 3)
+
+
 @dataclass(frozen=True)
 class GatewayCredentials:
-    """International quoter-gateway credentials (API triple + wallet)."""
+    """International quoter-gateway credentials (API triple + wallet identity).
+
+    ``wallet_address`` is the maker (funder) address. ``signer_address``
+    defaults to it, which is right for a plain EOA (``signature_type`` 0);
+    proxy-wallet accounts set both explicitly.
+    """
 
     api_key: str
     api_secret: str
     api_passphrase: str
     wallet_address: str
+    signer_address: Optional[str] = None
+    signature_type: int = 0
+
+    def __post_init__(self) -> None:
+        if self.signature_type not in SIGNATURE_TYPES:
+            raise ValueError(
+                f"POLYMARKET_SIGNATURE_TYPE must be one of {SIGNATURE_TYPES}, "
+                f"got {self.signature_type!r}")
+
+    @property
+    def signer(self) -> str:
+        """The address that signs orders and owns the CLOB API key."""
+        return self.signer_address or self.wallet_address
 
     def __repr__(self) -> str:  # never leak secrets into logs/tracebacks
         return (
             "GatewayCredentials(api_key=<redacted>, api_secret=<redacted>, "
-            f"api_passphrase=<redacted>, wallet_address={self.wallet_address!r})"
+            f"api_passphrase=<redacted>, wallet_address={self.wallet_address!r}, "
+            f"signer_address={self.signer!r}, signature_type={self.signature_type})"
         )
 
     @classmethod
@@ -179,7 +211,11 @@ class GatewayCredentials:
         """
         source: Mapping[str, str] = env if env is not None else os.environ
         missing = [v for v in GATEWAY_ENV_VARS if not source.get(v)]
-        if missing:
+        # The optional identity overrides may live only in .env, so consult
+        # it for real-environment loads even when the required four are set.
+        wants_optional = env is None and not all(
+            source.get(v) for v in GATEWAY_OPTIONAL_ENV_VARS)
+        if missing or wants_optional or dotenv_path is not None:
             if dotenv_path is None:
                 # Resolve relative to the repo root (this file lives in
                 # <root>/combo_mm/), not the process working directory, so
@@ -196,7 +232,8 @@ class GatewayCredentials:
                 if not missing:
                     merged = dict(file_values)
                     merged.update(
-                        {k: v for k, v in source.items() if k in GATEWAY_ENV_VARS}
+                        {k: v for k, v in source.items()
+                         if k in GATEWAY_ENV_VARS + GATEWAY_OPTIONAL_ENV_VARS and v}
                     )
                     source = merged
         if missing:
@@ -211,7 +248,19 @@ class GatewayCredentials:
             api_secret=str(source["POLYMARKET_SECRET"]),
             api_passphrase=str(source["POLYMARKET_PASSPHRASE"]),
             wallet_address=str(source["POLYMARKET_ADDRESS"]),
+            signer_address=str(source.get("POLYMARKET_SIGNER_ADDRESS") or "") or None,
+            signature_type=_signature_type(source.get("POLYMARKET_SIGNATURE_TYPE")),
         )
+
+
+def _signature_type(value: Any) -> int:
+    if value in (None, ""):
+        return 0
+    try:
+        return int(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(
+            f"POLYMARKET_SIGNATURE_TYPE must be an integer 0-3, got {value!r}") from exc
 
 
 def map_rfq_request(
@@ -369,8 +418,15 @@ class InternationalQuoterGatewayAdapter(EventSource):
         max_buffer: int = 10_000,
         recent_max: int = 200,
         rng: Optional[random.Random] = None,
+        request_filter: Optional[Callable[[Sequence[str]], bool]] = None,
     ) -> None:
         self._creds = credentials or GatewayCredentials.from_env()
+        # Optional cheap pre-filter on an RFQ_REQUEST's leg position ids, run
+        # on the socket thread before mapping/buffering. The authenticated
+        # feed carries hundreds of RFQs/s across every league; dropping the
+        # ones the consumer could never quote keeps the buffer from evicting
+        # the ones it can. Trades are never filtered.
+        self.request_filter = request_filter
         self._url = url
         self._backoff_initial = backoff_initial_s
         self._backoff_max = backoff_max_s
@@ -381,6 +437,10 @@ class InternationalQuoterGatewayAdapter(EventSource):
         self._max_buffer = max_buffer
         self._rng = rng or random.Random()
         self._buf: Deque[Dict[str, Any]] = collections.deque()
+        # Trades carry the accepted price we score our quotes against. The
+        # authenticated feed can outrun the consumer (hundreds of RFQs/s), so
+        # trades get their own buffer and are never evicted for RFQ requests.
+        self._trade_buf: Deque[Dict[str, Any]] = collections.deque()
         self._recent: Deque[Dict[str, Any]] = collections.deque(maxlen=recent_max)
         self._lock = threading.Lock()
         self._items_ready = threading.Event()
@@ -394,6 +454,7 @@ class InternationalQuoterGatewayAdapter(EventSource):
             "connects": 0,
             "reconnects": 0,
             "rfqs_seen": 0,
+            "rfqs_filtered": 0,
             "trades_seen": 0,
             "frames_dropped": 0,
             "buffer_drops": 0,
@@ -409,9 +470,10 @@ class InternationalQuoterGatewayAdapter(EventSource):
     def poll(self, now: datetime) -> List[Dict[str, Any]]:
         """Drain buffered raw events into the pipeline item envelope."""
         with self._lock:
+            # Requests first: a trade must not overtake the RFQ it closes.
             raws = [self._buf.popleft() for _ in range(len(self._buf))]
-            if not self._buf:
-                self._items_ready.clear()
+            raws += [self._trade_buf.popleft() for _ in range(len(self._trade_buf))]
+            self._items_ready.clear()
         return [{"kind": "event", "raw": raw} for raw in raws]
 
     def wait_for_items(self, timeout: float = 1.0) -> bool:
@@ -469,7 +531,7 @@ class InternationalQuoterGatewayAdapter(EventSource):
         """Snapshot of adapter counters (safe to call from any thread)."""
         with self._lock:
             snap = dict(self._stats)
-            snap["buffered"] = len(self._buf)
+            snap["buffered"] = len(self._buf) + len(self._trade_buf)
         return snap
 
     def recent(self, n: int = 25) -> List[Dict[str, Any]]:
@@ -490,9 +552,9 @@ class InternationalQuoterGatewayAdapter(EventSource):
                 "secret": self._creds.api_secret,
             },
             "identity": {
-                "signer_address": self._creds.wallet_address,
+                "signer_address": self._creds.signer,
                 "maker_address": self._creds.wallet_address,
-                "signature_type": 0,
+                "signature_type": self._creds.signature_type,
             },
         }
 
@@ -609,7 +671,8 @@ class InternationalQuoterGatewayAdapter(EventSource):
         if accepted:
             log.info("quoter gateway auth accepted")
         else:
-            log.warning("quoter gateway auth rejected; continuing on the public RFQ broadcast")
+            log.warning("quoter gateway auth rejected (%s); continuing on the public RFQ "
+                        "broadcast -- accepted-trade prices (RFQ_TRADE) need auth", error)
 
     def _on_frame(self, raw: str) -> None:
         try:
@@ -623,6 +686,8 @@ class InternationalQuoterGatewayAdapter(EventSource):
         with self._lock:
             self._stats["last_frame_at"] = time.time()
         if mtype == "RFQ_REQUEST":
+            if not self._wanted(msg):
+                return
             try:
                 mapped = map_rfq_request(msg)
             except MappingError as exc:
@@ -645,6 +710,21 @@ class InternationalQuoterGatewayAdapter(EventSource):
         else:
             log.debug("ignoring gateway frame type %r", mtype)
 
+    def _wanted(self, msg: Dict[str, Any]) -> bool:
+        """Apply :attr:`request_filter`; a failing filter lets the RFQ through."""
+        keep = self.request_filter
+        if keep is None:
+            return True
+        try:
+            wanted = bool(keep([str(pid) for pid in msg.get("leg_position_ids") or []]))
+        except Exception:
+            log.debug("request filter failed; keeping RFQ", exc_info=True)
+            return True
+        if not wanted:
+            with self._lock:
+                self._stats["rfqs_filtered"] += 1
+        return wanted
+
     def _emit(self, raw: Dict[str, Any], kind: str) -> None:
         size = raw.get("cashOrderQty", raw.get("qtyDecimal", "?"))
         summary = {
@@ -657,10 +737,13 @@ class InternationalQuoterGatewayAdapter(EventSource):
             "size": str(size),
         }
         with self._lock:
-            if len(self._buf) >= self._max_buffer:
-                self._buf.popleft()
-                self._stats["buffer_drops"] += 1
-            self._buf.append(raw)
+            if kind == "trade":
+                self._trade_buf.append(raw)
+            else:
+                if len(self._buf) >= self._max_buffer:
+                    self._buf.popleft()
+                    self._stats["buffer_drops"] += 1
+                self._buf.append(raw)
             self._items_ready.set()
             self._recent.append(summary)
             if kind == "rfq":
