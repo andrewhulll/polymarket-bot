@@ -253,3 +253,51 @@ def test_stop_joins_every_worker_thread():
 def test_workers_must_be_positive():
     with pytest.raises(ValueError):
         LiveQuoter(None, None, workers=0)
+
+
+class CountingPricer:
+    """Stands in for NflLivePricer: records what it was asked to price."""
+
+    def __init__(self):
+        self.priced = []
+
+    def warmup(self):
+        pass
+
+    def price(self, rfq, now=None):
+        from combo_mm.nfl.live_pricer import LiveQuote
+        self.priced.append(rfq.rfq_id)
+        return LiveQuote(rfq_id=rfq.rfq_id, priced_at=now.isoformat(), status="DECLINED",
+                         reason_code="UNSUPPORTED_LEG")
+
+
+def _rfq(rfq_id, deadline_ms):
+    return LiveRfq(rfq_id=rfq_id, leg_position_ids=("a", "b"), qty_decimal="25",
+                   submission_deadline_ms=deadline_ms)
+
+
+def test_auto_rfq_past_its_deadline_is_skipped_without_pricing():
+    pricer, decisions = CountingPricer(), []
+    quoter = LiveQuoter(pricer, QuoteSelectionStore(), start_worker=False, clock=lambda: NOW,
+                        on_decision=lambda rfq, quote, started, decided: decisions.append(quote))
+    quoter.submit(_rfq("STALE", NOW_MS - 1))        # deadline passed while it sat in the queue
+    quoter.submit(_rfq("EDGE", NOW_MS))             # at the deadline counts as expired
+    quoter.submit(_rfq("LIVE", NOW_MS + 3000))
+    quoter.submit(_rfq("NODEADLINE", None))
+    assert quoter.drain() == 4
+
+    assert pricer.priced == ["LIVE", "NODEADLINE"]
+    by_id = {q.rfq_id: q for q in decisions}
+    assert by_id["STALE"].reason_code == "QUOTE_DEADLINE_EXCEEDED" and by_id["STALE"].after_deadline
+    assert by_id["EDGE"].reason_code == "QUOTE_DEADLINE_EXCEEDED"
+    assert not by_id["STALE"].quoted
+    stats = quoter.stats()
+    assert stats["expired"] == 2 and stats["priced"] == 4 and stats["declined"] == 4
+
+
+def test_manual_pricing_ignores_the_deadline():
+    pricer = CountingPricer()
+    quoter = LiveQuoter(pricer, QuoteSelectionStore(), start_worker=False, clock=lambda: NOW)
+    quote = quoter.price_now(_rfq("MANUAL", NOW_MS - 60_000))
+    assert pricer.priced == ["MANUAL"] and quote.reason_code == "UNSUPPORTED_LEG"
+    assert quoter.stats()["expired"] == 0

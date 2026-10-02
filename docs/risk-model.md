@@ -26,7 +26,8 @@ average entry price. Duplicate fill IDs have no effect.
 For an open long position, maximum loss is `quantity * average_price`.
 For an open short, it is `quantity * (1 - average_price)`. Game, team, leg
 market, and portfolio exposure are conservative sums of these losses and
-pending reservations. Equity starts at $50,000 plus realized closing P&L;
+pending reservations. Equity starts at $50,000 (the live paper account uses `LIVE_PAPER_CAPITAL`,
+$100,000) plus realized closing P&L;
 buying power is equity less reserved loss. `exposure_snapshots` and
 `risk_events` preserve the history shown in the dashboard Inventory tab.
 

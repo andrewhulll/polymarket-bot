@@ -6,6 +6,8 @@ fills use their actual side and price. No order is sent from this module.
 """
 from __future__ import annotations
 
+import inspect
+import math
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -40,10 +42,25 @@ class InventoryProvider:
         self.store = store
         self.capital = capital
         self.game_resolver = game_resolver
+        # Stores that can skip already-expired RFQs at the SQL level take the
+        # snapshot time; anything else (fakes, adapters) loads everything.
+        try:
+            self._prunes_expired = ("deadline_after_ms" in
+                                    inspect.signature(store.inventory_rows).parameters)
+        except (TypeError, ValueError, AttributeError):
+            self._prunes_expired = False
 
     def __call__(self, as_of: str = "", *,
                  exclude_pending_rfqs: Optional[set[str]] = None) -> InventoryState:
-        rfqs, quotes, fills, halted = self.store.inventory_rows()
+        snapshot_time = (datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+                         if as_of else datetime.now(timezone.utc))
+        if snapshot_time.tzinfo is None:
+            snapshot_time = snapshot_time.replace(tzinfo=timezone.utc)
+        if self._prunes_expired:
+            rfqs, quotes, fills, halted = self.store.inventory_rows(
+                deadline_after_ms=math.floor(snapshot_time.timestamp() * 1000))
+        else:
+            rfqs, quotes, fills, halted = self.store.inventory_rows()
         pending = defaultdict(float)
         executed = defaultdict(float)
         markets = defaultdict(float)
@@ -54,10 +71,6 @@ class InventoryProvider:
         realized_pnl = 0.0
         rfq_map = {r["rfq_id"]: r for r in rfqs}
         latest = {}
-        snapshot_time = (datetime.fromisoformat(as_of.replace("Z", "+00:00"))
-                         if as_of else datetime.now(timezone.utc))
-        if snapshot_time.tzinfo is None:
-            snapshot_time = snapshot_time.replace(tzinfo=timezone.utc)
         for quote in quotes:
             if quote["origin"] != "shadow":
                 continue

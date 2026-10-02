@@ -28,7 +28,8 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
-from combo_mm.nfl.live_pricer import LiveQuote, LiveRfq, NflLivePricer
+from combo_mm.nfl.live_pricer import (QUOTE_DEADLINE_EXCEEDED, LiveQuote, LiveRfq,
+                                      NflLivePricer)
 from combo_mm.quote_selections import QuoteSelectionStore
 
 log = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ class LiveQuoter:
         self.quoted = 0
         self.declined = 0
         self.dropped = 0
+        self.expired = 0      # skipped unpriced: deadline passed while queued
         self.errors = 0
         self.last_error: Optional[str] = None
         self.last_quote: Optional[LiveQuote] = None
@@ -161,9 +163,29 @@ class LiveQuoter:
             finally:
                 self._queue.task_done()
 
+    @staticmethod
+    def _expired(rfq: LiveRfq, now: datetime) -> bool:
+        """True once the RFQ's submission deadline has passed at ``now``."""
+        deadline = rfq.submission_deadline_ms
+        return deadline is not None and now.timestamp() * 1000 >= deadline
+
     def _handle(self, rfq: LiveRfq, trigger: str) -> LiveQuote:
         started = self._clock()
-        quote = self.pricer.price(rfq, now=started)
+        # A backlog leaves RFQs queued past their quote window. Pricing one
+        # costs book fetches and a lock for a quote that cannot be sent, and
+        # starves the live ones behind it, so skip it. Manual requests are
+        # still priced: the dashboard user asked for the number.
+        expired = trigger == "auto" and self._expired(rfq, started)
+        if expired:
+            quote = LiveQuote(
+                rfq_id=rfq.rfq_id,
+                priced_at=started.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                status="DECLINED", reason_code=QUOTE_DEADLINE_EXCEEDED,
+                reason_detail="submission deadline passed while queued",
+                side=rfq.side, direction=rfq.direction, size=rfq.size,
+                size_unit=rfq.size_unit, after_deadline=True)
+        else:
+            quote = self.pricer.price(rfq, now=started)
         # Stamp the decision the instant pricing returns, before the durable
         # writes below. Otherwise "compute" latency would fold in SQLite write
         # time and cross-worker lock contention, not just the pricing itself.
@@ -187,6 +209,8 @@ class LiveQuoter:
                 self.quoted += 1
             else:
                 self.declined += 1
+                if expired:
+                    self.expired += 1
                 if quote.reason_code == "PRICER_ERROR":
                     self.errors += 1
                     self.last_error = quote.reason_detail
@@ -213,7 +237,8 @@ class LiveQuoter:
     def stats(self) -> Dict[str, Any]:
         with self._lock:
             out = {"submitted": self.submitted, "priced": self.priced, "quoted": self.quoted,
-                   "declined": self.declined, "dropped": self.dropped, "errors": self.errors,
+                   "declined": self.declined, "dropped": self.dropped,
+                   "expired": self.expired, "errors": self.errors,
                    "queued": self.queued, "last_error": self.last_error}
         # Book-source counters live on the pricer; surface them so a slow or
         # failing CLOB/Gamma fetch is visible without opening the pricer.
