@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from combo_mm.backtest.metrics import swings as _swings
-from combo_mm.paper_capital import PaperCapitalState, replay_paper_capital
+from combo_mm.paper_capital import (LIVE_PAPER_CAPITAL, PaperCapitalState,
+                                    replay_paper_capital)
 
 
 def connect_readonly(path: str | Path) -> sqlite3.Connection:
@@ -370,7 +371,8 @@ def _paper_capital_state(conn: sqlite3.Connection,
                          equity_limit: float | None = None) -> PaperCapitalState:
     if equity_limit is None:
         from combo_mm.inventory import InventoryProvider
-        equity_limit = InventoryProvider(_InventoryStore(conn))().equity
+        equity_limit = InventoryProvider(_InventoryStore(conn),
+                                         capital=LIVE_PAPER_CAPITAL)().equity
     return replay_paper_capital(conn, equity_limit)
 
 
@@ -642,30 +644,14 @@ class _InventoryStore:
     """Read-only adapter exposing ``EventStore.inventory_rows()`` over a raw
     connection, so the dashboard can rebuild the live inventory snapshot
     without opening a writable handle on the capture database. The SELECTs
-    mirror ``combo_mm.store.EventStore.inventory_rows`` exactly."""
+    share ``combo_mm.store.read_inventory_rows`` with it."""
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def inventory_rows(self):
-        rfqs = [dict(r) for r in self._conn.execute(
-            "SELECT r.rfq_id, r.symbol, r.status, r.updated_time, "
-            "s.submission_deadline FROM rfq r LEFT JOIN rfq_screen s "
-            "ON s.rfq_id=r.rfq_id ORDER BY r.rfq_id")]
-        for rfq in rfqs:
-            rfq["legs"] = [dict(r) for r in self._conn.execute(
-                "SELECT symbol, side, settlement_price FROM rfq_legs "
-                "WHERE rfq_id=? ORDER BY rowid", (rfq["rfq_id"],))]
-        quotes = [dict(r) for r in self._conn.execute(
-            "SELECT quote_id, rfq_id, symbol, status, origin, buy_price, "
-            "sell_price, buy_qty_decimal, sell_qty_decimal, created_time "
-            "FROM quotes ORDER BY rowid")]
-        fills = [dict(r) for r in self._conn.execute(
-            "SELECT fill_id, rfq_id, quote_id, symbol, side, price, qty, "
-            "executed_time FROM fills ORDER BY fill_id")]
-        last = self._conn.execute(
-            "SELECT state FROM kill_switch_events ORDER BY id DESC LIMIT 1").fetchone()
-        return rfqs, quotes, fills, bool(last and last["state"] == "tripped")
+    def inventory_rows(self, *, deadline_after_ms=None):
+        from combo_mm.store import read_inventory_rows
+        return read_inventory_rows(self._conn, deadline_after_ms=deadline_after_ms)
 
 
 def _quote_game_resolver(conn: sqlite3.Connection):
@@ -692,7 +678,7 @@ def inventory_state(conn: sqlite3.Connection) -> dict:
     kill-switch event. Backs the dashboard Inventory tab.
     """
     from combo_mm.inventory import InventoryProvider
-    provider = InventoryProvider(_InventoryStore(conn),
+    provider = InventoryProvider(_InventoryStore(conn), capital=LIVE_PAPER_CAPITAL,
                                  game_resolver=_quote_game_resolver(conn))
     recorded_state = provider()
     capital = _paper_capital_state(conn, recorded_state.equity)

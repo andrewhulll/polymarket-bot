@@ -13,6 +13,11 @@ import sqlite3
 
 EPSILON = 1e-9
 
+# Equity bound for the live paper account. The capture and the dashboard must
+# agree on it: both rebuild the same latch from the stored quote history.
+# (PipelineConfig.initial_capital stays $50,000 for the backtest and engine.)
+LIVE_PAPER_CAPITAL = 100_000.0
+
 
 @dataclass
 class PaperCapitalState:

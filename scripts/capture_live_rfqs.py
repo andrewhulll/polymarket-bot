@@ -55,19 +55,30 @@ from combo_mm.store import EventStore
 from combo_mm.config import PipelineConfig
 from combo_mm.leg_books import LiveLegBooks
 from combo_mm.live_quoter import LiveQuoter
-from combo_mm.nfl.live_pricer import NflLivePricer, NflLivePricerConfig, LiveRfq
+from combo_mm.nfl.live_pricer import (NflLivePricer, NflLivePricerConfig, LiveRfq,
+                                      QUOTE_DEADLINE_EXCEEDED)
 from combo_mm.nfl.params_provider import ParamsProvider
 from combo_mm.nfl.tuning import SELECTION_PATH, load_selection
 from combo_mm.quote_selections import QuoteSelectionStore
 from combo_mm.capture_process import CaptureLock
 from combo_mm.inventory import InventoryProvider
-from combo_mm.paper_capital import PaperCapitalState, replay_paper_capital
+from combo_mm.paper_capital import (LIVE_PAPER_CAPITAL, PaperCapitalState,
+                                    replay_paper_capital)
 from combo_mm.risk import RISK_CAPITAL
 from combo_mm.risk_config import RiskConfig
 from combo_mm.risk_policy import InventoryRiskCheck
 from combo_mm.transient_rfqs import TransientRfqs, TransientRfqServer
+from combo_mm.wal_maintenance import WalCheckpointer
 
 log = logging.getLogger("capture_live_rfqs")
+
+def _deadline_passed(value: Any) -> bool:
+    """True when a gateway ``submission_deadline`` (epoch ms) is in the past."""
+    try:
+        return time.time() * 1000 >= int(float(value))
+    except (TypeError, ValueError):
+        return False
+
 
 def _live_pricer_config(repo: Path) -> NflLivePricerConfig:
     """``corr_scale`` from the frozen train-only tuning selection, default 1.0.
@@ -109,7 +120,8 @@ class RfqCapture:
         self._quoted: set[str] = set()
         self._lock = threading.RLock()
         self.transient_rfqs = TransientRfqs()
-        self._risk_config = PipelineConfig(risk=RiskConfig(policy="inventory"))
+        self._risk_config = PipelineConfig(initial_capital=LIVE_PAPER_CAPITAL,
+                                           risk=RiskConfig(policy="inventory"))
         self._risk = InventoryRiskCheck(self._risk_config.risk)
         self._inventory = InventoryProvider(self.store,
                                             capital=self._risk_config.initial_capital,
@@ -433,6 +445,12 @@ class RfqCapture:
             }
             self.transient_rfqs.put(row, detail)
         if eligible and self.quoter is not None:
+            if _deadline_passed(raw.get("submission_deadline")):
+                # Stale on arrival (we were behind): queueing it would only
+                # delay RFQs that can still be quoted.
+                self.transient_rfqs.change(rfq_id, status="DECLINED",
+                                           reason_code=QUOTE_DEADLINE_EXCEEDED)
+                return
             with self._lock:
                 if rfq_id in self._quoted or rfq_id in self._pending:
                     return
@@ -511,6 +529,7 @@ def main(argv: Optional[list] = None) -> int:
 
     capture = None
     screen_server = None
+    checkpointer = None
     try:
         capture = RfqCapture(Path(args.data_dir), price_live=True,
                              quoter_workers=args.quoter_workers)
@@ -518,9 +537,12 @@ def main(argv: Optional[list] = None) -> int:
                                            Path(args.data_dir), args.screen_port)
         screen_server.start()
         capture.start()
+        checkpointer = WalCheckpointer(capture.store).start()
         adapter.request_filter = capture.wants_rfq
         adapter.start()
     except BaseException:
+        if checkpointer is not None:
+            checkpointer.stop()
         if screen_server is not None:
             screen_server.stop()
         if capture is not None:
@@ -552,21 +574,25 @@ def main(argv: Optional[list] = None) -> int:
                 log.info(
                     "rfqs=%d nfl=%d trades=%d catalog=%d gateway_connected=%s "
                     "quoter_submitted=%d quoter_priced=%d quoter_queued=%d "
-                    "quoter_dropped=%d gateway_buffer_drops=%d gateway_non_nfl_filtered=%d "
-                    "clob_fetches=%s gamma_fetches=%s book_last_error=%s",
+                    "quoter_dropped=%d quoter_expired=%d gateway_buffer_drops=%d "
+                    "gateway_non_nfl_filtered=%d clob_fetches=%s gamma_fetches=%s "
+                    "book_last_error=%s wal_mb=%.0f",
                     capture.rfqs_seen, capture.nfl_rfqs_seen,
                     capture.trades_seen, len(capture.catalog), adapter.connected,
                     quoter_stats.get("submitted", 0), quoter_stats.get("priced", 0),
                     quoter_stats.get("queued", 0), quoter_stats.get("dropped", 0),
+                    quoter_stats.get("expired", 0),
                     adapter.stats()["buffer_drops"], adapter.stats()["rfqs_filtered"],
                     quoter_stats.get("clob_fetches"), quoter_stats.get("gamma_fetches"),
-                    quoter_stats.get("book_last_error"))
+                    quoter_stats.get("book_last_error"),
+                    capture.store.wal_bytes() / 1e6)
                 last_log = time.monotonic()
             if args.duration is not None and time.monotonic() - start_time >= args.duration:
                 break
             adapter.wait_for_items(args.poll_interval)
     finally:
         adapter.stop()
+        checkpointer.stop()
         screen_server.stop()
         capture.stop()
         reader_lock.release()

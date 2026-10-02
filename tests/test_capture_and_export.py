@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -252,3 +253,37 @@ def test_build_rows_date_filter_excludes_out_of_range(tmp_path):
     later = datetime(2026, 9, 20, tzinfo=timezone.utc)
     rows = build_rows(tmp_path, since=later)
     assert rows == []
+
+
+def test_rfq_already_past_its_deadline_is_not_queued(tmp_path):
+    capture = _build_capture(tmp_path)
+    submitted = []
+
+    class Quoter:
+        def submit(self, rfq):
+            submitted.append(rfq.rfq_id)
+            return True
+
+        def stop(self):
+            pass
+
+    capture.quoter = Quoter()
+    stale = _rfq_request("stale", ["100", "101"])
+    stale["submission_deadline"] = str(int(NOW.timestamp() * 1000))      # long past
+    fresh = _rfq_request("fresh", ["100", "101"])
+    fresh["submission_deadline"] = str(int(time.time() * 1000) + 60_000)
+    capture.handle({"kind": "event", "raw": stale}, NOW)
+    capture.handle({"kind": "event", "raw": fresh}, NOW)
+
+    assert submitted == ["fresh"]
+    assert "stale" not in capture._pending and "fresh" in capture._pending
+    row = capture.transient_rfqs.detail("stale")
+    assert row is not None
+    capture.stop()
+
+
+def test_deadline_passed_parses_gateway_values():
+    from capture_live_rfqs import _deadline_passed
+    assert _deadline_passed("1000") and _deadline_passed(1000.0)
+    assert not _deadline_passed(str(int(time.time() * 1000) + 60_000))
+    assert not _deadline_passed(None) and not _deadline_passed("") and not _deadline_passed("soon")

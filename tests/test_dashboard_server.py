@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from combo_mm.paper_capital import LIVE_PAPER_CAPITAL
+
 REPO = Path(__file__).resolve().parents[1]
 
 
@@ -418,10 +420,10 @@ def test_engine_endpoint(server):
 def test_inventory_endpoint(server):
     inv = get_json(server, "/api/inventory")
     # Q1 (sell 25 filled @0.60, buy 25 @0.55 still pending) + Q3 (10/10 pending).
-    assert inv["equity"] == 50000.0
+    assert inv["equity"] == LIVE_PAPER_CAPITAL
     # Q1: our offer 25 @0.55 filled (we sold 25 @0.60); buy 25 @0.55 still pending.
     # Q3: 10/10 pending. Pending WCL = 15.0 + 6.2; executed WCL = 10.0.
-    assert inv["buying_power"] == pytest.approx(50000.0 - 15.0 - 10.0 - 6.2)
+    assert inv["buying_power"] == pytest.approx(LIVE_PAPER_CAPITAL - 15.0 - 10.0 - 6.2)
     assert inv["realized_pnl"] == 0.0
     assert inv["kill_switch"] is True
     assert inv["kill_switch_event"]["state"] == "tripped"

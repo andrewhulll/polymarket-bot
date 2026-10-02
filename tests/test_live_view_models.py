@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from combo_mm.normalize import normalize
+from combo_mm.paper_capital import LIVE_PAPER_CAPITAL as CAP
 from combo_mm.intl_gateway import GatewayCredentials, InternationalQuoterGatewayAdapter
 from combo_mm.quote_selections import QuoteSelectionStore
 from combo_mm.store import EventStore
@@ -34,25 +35,25 @@ def test_paper_notional_stays_within_inventory_equity_and_reduces_buying_power(t
             "rfq_id": rfq_id, "priced_at": f"2026-09-18T00:00:0{index}Z",
             "status": "QUOTED", "reason_code": "QUOTED_OK",
             "response_action": action, "response_price": .5,
-            "size": 60000 if index < 3 else 20000, "size_unit": "shares",
+            "size": CAP * 1.2 if index < 3 else CAP * 0.4, "size_unit": "shares",
             "fair": .5, "naive": .5, "side": "YES",
             "games": [{"game": "KC@BUF", "away": "KC", "home": "BUF"}],
             "legs": [{"slug": "kc-buf-moneyline"}, {"slug": "kc-buf-total"}]}, "auto")
         store.record_shadow_draft(quote_id=f"Q{index}", rfq_id=rfq_id,
                                   buy_price=.5, sell_price=.5,
-                                  buy_qty="60000", sell_qty="60000")
+                                  buy_qty=str(int(CAP * 1.2)), sell_qty=str(int(CAP * 1.2)))
     with connect_readonly(path) as conn:
         perf = performance(conn)
         inventory = inventory_state(conn)
         ledger = fills(conn)
     assert max(abs(point["net_notional"]) for point in perf["curve"]) <= inventory["equity"]
-    assert perf["net_notional"] == inventory["paper_net_notional"] == 50000.0
+    assert perf["net_notional"] == inventory["paper_net_notional"] == CAP
     assert inventory["buying_power"] == 0.0
     assert inventory["pending"] == {}
-    assert inventory["executed"]["KC@BUF"] == inventory["paper_wcl"] == 50000.0
-    assert inventory["exposures"]["KC@BUF"] == 50000.0
-    assert inventory["markets"]["kc-buf-moneyline"] == 50000.0
-    assert inventory["teams"]["KC"] == inventory["teams"]["BUF"] == 50000.0
+    assert inventory["executed"]["KC@BUF"] == inventory["paper_wcl"] == CAP
+    assert inventory["exposures"]["KC@BUF"] == CAP
+    assert inventory["markets"]["kc-buf-moneyline"] == CAP
+    assert inventory["teams"]["KC"] == inventory["teams"]["BUF"] == CAP
     assert perf["quoted"] == perf["shadow_fills"] == 2
     assert perf["rfqs_declined"] == 1
     with connect_readonly(path) as conn:

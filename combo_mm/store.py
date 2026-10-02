@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -49,7 +50,85 @@ from combo_mm.normalize import NormalizeError  # noqa: F401  (re-exported)
 
 log = logging.getLogger(__name__)
 
-__all__ = ["EventStore"]
+__all__ = ["EventStore", "read_inventory_rows"]
+
+# Cap on the -wal file kept after a checkpoint. Without it SQLite never gives
+# disk back, and a long reader can leave the WAL growing into the gigabytes.
+WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+_ID_CHUNK = 500   # rfq ids per IN (...) -- well under SQLite's variable limit
+
+_LIVE_DEADLINE_SQL = (
+    # A superset of "not yet expired": non-numeric deadlines are kept so the
+    # caller's own parser stays the single authority on them.
+    "(s.submission_deadline IS NULL OR s.submission_deadline = '' "
+    "OR s.submission_deadline GLOB '*[^0-9]*' "
+    "OR CAST(s.submission_deadline AS INTEGER) > :deadline_after_ms)")
+
+
+def read_inventory_rows(conn: sqlite3.Connection, *,
+                        deadline_after_ms: Optional[float] = None,
+                        ) -> tuple[list[dict], list[dict], list[dict], bool]:
+    """Inputs for :class:`combo_mm.inventory.InventoryProvider`, loaded cheaply.
+
+    Inventory only ever reads RFQs that carry a shadow quote or a fill, so
+    nothing else is loaded (the capture store is mostly RFQs we never quoted).
+    With ``deadline_after_ms`` the RFQs whose submission deadline has passed
+    are dropped too -- the provider skips their pending quotes anyway --
+    except RFQs with fills, whose positions never expire. Legs come from one
+    query per id chunk rather than one query per RFQ. Pruning is a superset
+    of what the provider keeps, so its output is unchanged.
+    """
+    cur = conn.cursor()
+    cur.row_factory = sqlite3.Row
+    params: Dict[str, Any] = {}
+    # Candidates come from the cheap deadline scan first, so the per-RFQ quote
+    # lookup only runs for RFQs that are still live (an RFQ with no screen row
+    # has no deadline, so it stays a candidate).
+    if deadline_after_ms is None:
+        candidates = "SELECT rfq_id FROM rfq"
+    else:
+        params["deadline_after_ms"] = int(deadline_after_ms)
+        candidates = (f"SELECT s.rfq_id FROM rfq_screen s WHERE {_LIVE_DEADLINE_SQL} "
+                      "UNION ALL SELECT r.rfq_id FROM rfq r WHERE NOT EXISTS "
+                      "(SELECT 1 FROM rfq_screen s2 WHERE s2.rfq_id=r.rfq_id)")
+    rfqs = [dict(r) for r in cur.execute(
+        f"WITH cand AS MATERIALIZED ({candidates}), "
+        "want AS (SELECT rfq_id FROM cand WHERE EXISTS "
+        "(SELECT 1 FROM quotes q WHERE q.rfq_id=cand.rfq_id AND q.origin='shadow') "
+        "UNION SELECT rfq_id FROM fills) "
+        "SELECT r.rfq_id, r.symbol, r.status, r.updated_time, "
+        "s.submission_deadline FROM want JOIN rfq r ON r.rfq_id=want.rfq_id "
+        "LEFT JOIN rfq_screen s ON s.rfq_id=r.rfq_id "
+        "ORDER BY r.rfq_id", params)]
+    legs: Dict[str, list] = {r["rfq_id"]: [] for r in rfqs}
+    quotes: list[dict] = []
+    ids = list(legs)
+    for i in range(0, len(ids), _ID_CHUNK):
+        chunk = ids[i:i + _ID_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        for row in cur.execute(
+                "SELECT rfq_id, symbol, side, settlement_price FROM rfq_legs "
+                f"WHERE rfq_id IN ({marks}) ORDER BY rowid", chunk):
+            legs[row["rfq_id"]].append(
+                {"symbol": row["symbol"], "side": row["side"],
+                 "settlement_price": row["settlement_price"]})
+        quotes += [dict(r) for r in cur.execute(
+            "SELECT rowid AS _rowid, quote_id, rfq_id, symbol, status, origin, "
+            "buy_price, sell_price, buy_qty_decimal, sell_qty_decimal, "
+            f"created_time FROM quotes WHERE origin='shadow' "
+            f"AND rfq_id IN ({marks})", chunk)]
+    for rfq in rfqs:
+        rfq["legs"] = legs[rfq["rfq_id"]]
+    # Chunks interleave rfqs; restore insertion order so sums are bit-stable.
+    quotes.sort(key=lambda q: q["_rowid"])
+    for q in quotes:
+        del q["_rowid"]
+    fills = [dict(r) for r in cur.execute(
+        "SELECT fill_id, rfq_id, quote_id, symbol, side, price, qty, "
+        "executed_time FROM fills ORDER BY fill_id")]
+    last = cur.execute(
+        "SELECT state FROM kill_switch_events ORDER BY id DESC LIMIT 1").fetchone()
+    return rfqs, quotes, fills, bool(last and last["state"] == "tripped")
 
 
 def _utcnow_iso() -> str:
@@ -112,6 +191,7 @@ class EventStore:
         self._lock = threading.RLock()
         self._init_schema()
         self._conn.execute(f"PRAGMA synchronous={synchronous}")
+        self._conn.execute(f"PRAGMA journal_size_limit={WAL_SIZE_LIMIT_BYTES}")
 
     # -- schema -------------------------------------------------------------
     def _init_schema(self) -> None:
@@ -1425,28 +1505,40 @@ class EventStore:
                 (limit,)).fetchall()
             return [dict(r) for r in rows]
 
-    def inventory_rows(self) -> tuple[list[dict], list[dict], list[dict], bool]:
-        """Consistent inputs for a rebuildable inventory snapshot."""
+    def inventory_rows(self, *, deadline_after_ms: Optional[float] = None,
+                       ) -> tuple[list[dict], list[dict], list[dict], bool]:
+        """Consistent inputs for a rebuildable inventory snapshot.
+
+        See :func:`read_inventory_rows`; ``deadline_after_ms`` skips RFQs whose
+        submission deadline has already passed.
+        """
         with self._lock:
-            rfqs = [dict(r) for r in self._conn.execute(
-                "SELECT r.rfq_id, r.symbol, r.status, r.updated_time, "
-                "s.submission_deadline FROM rfq r LEFT JOIN rfq_screen s "
-                "ON s.rfq_id=r.rfq_id ORDER BY r.rfq_id")]
-            for rfq in rfqs:
-                rfq["legs"] = [dict(r) for r in self._conn.execute(
-                    "SELECT symbol, side, settlement_price FROM rfq_legs "
-                    "WHERE rfq_id=? ORDER BY rowid",
-                    (rfq["rfq_id"],))]
-            quotes = [dict(r) for r in self._conn.execute(
-                "SELECT quote_id, rfq_id, symbol, status, origin, buy_price, "
-                "sell_price, buy_qty_decimal, sell_qty_decimal, created_time "
-                "FROM quotes ORDER BY rowid")]
-            fills = [dict(r) for r in self._conn.execute(
-                "SELECT fill_id, rfq_id, quote_id, symbol, side, price, qty, "
-                "executed_time FROM fills ORDER BY fill_id")]
-            last = self._conn.execute(
-                "SELECT state FROM kill_switch_events ORDER BY id DESC LIMIT 1").fetchone()
-            return rfqs, quotes, fills, bool(last and last["state"] == "tripped")
+            return read_inventory_rows(self._conn, deadline_after_ms=deadline_after_ms)
+
+    def checkpoint(self, mode: str = "PASSIVE", *, busy_timeout_ms: int = 250
+                   ) -> tuple[int, int, int]:
+        """Run ``PRAGMA wal_checkpoint`` and return ``(busy, wal_pages, moved)``.
+
+        PASSIVE never waits on readers; TRUNCATE also resets the file but
+        returns busy=1 when a reader pins the WAL. The busy wait is capped so
+        a stuck reader cannot stall every store user behind this lock.
+        """
+        if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            raise ValueError(f"unknown checkpoint mode {mode!r}")
+        with self._lock:
+            self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+            try:
+                row = self._conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+            finally:
+                self._conn.execute("PRAGMA busy_timeout=5000")
+            return int(row[0]), int(row[1]), int(row[2])
+
+    def wal_bytes(self) -> int:
+        """Current size of the ``-wal`` file (0 for in-memory or missing)."""
+        try:
+            return os.path.getsize(f"{self._path}-wal")
+        except OSError:
+            return 0
 
     def record_risk_event(self, *, ts: str, rfq_id: str, quote_id: str,
                           game_id: str, verdict) -> None:
